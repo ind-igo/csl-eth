@@ -1,0 +1,17 @@
+[package]
+name = "csl-eth-store"
+description = "The Ethereum profile's bucket layout: snapshot manifests, the four tables as csl-run files, code blobs, and the producer that writes them from sorted leaves"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+csl-run.workspace = true
+csl-eth-trie = { path = "../trie" }
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-trie = { workspace = true, features = ["ethereum"] }
+blake3.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true

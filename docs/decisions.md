@@ -1,0 +1,35 @@
+# Decisions
+
+Reasoning that is not in the code. Newest last.
+
+## 2026-10-30: a repo beside cinder, format crates by path
+
+The plan's prerequisite was a second workspace inside the cinder repo sharing its `crates/`. This is a separate repo instead, with `csl-run` and `pgm` as path dependencies on `../cinder/crates/`. The format stays one implementation, which is what the prerequisite was for; the repos stay separate because cinder is a closed PoC with its own chain, harness and results, and the Ethereum work should not churn its history. Cinder has no remote today, so a path dependency is also the only one possible; when either repo gets a remote the dependency becomes a git revision, and a published crate is the end state. `cargo fmt --all` here reaches into the path dependencies and reformats them in rustfmt's default width, which is not cinder's style: run it, then `git -C ../cinder checkout -- .`, or format single files.
+
+## 2026-10-30: the trie crate, before anything else
+
+The profile's claim that needed testing first was "absence from the trie alone, for every shape of miss", and it depends on a builder that emits every node at its position and a walk that returns the shape. `csl-eth-trie` is that, with no file format in it. The builder streams sorted leaves with a stack of open branches; a node is emitted when it closes if its RLP is 32 bytes or longer (or it is the root), and embedded in its parent otherwise, exactly where alloy's `RlpNode::from_rlp` embeds it, so the roots agree with `HashBuilder` on uniform tries from 2 to 5,000 leaves and on crowded tries where leaves, extensions and branches fall under 32 bytes. The walk fetches hashed children by `NodeKey::prefix(path, depth)` and checks keccak before decoding; embedded children are decoded in place under the parent's hash. Every emitted node is on some leaf's walk and every walk touches only emitted nodes, checked in `tests/roundtrip.rs`. A node deeper than 62 nibbles cannot be keyed (`TooDeep`), which the producer treats as an abort; real keccak paths never get there and the synthetic tests had to be told so.
+
+## 2026-10-30: `csl-run` grew the variable layout, in cinder
+
+Core §3.2's variable layout and `inline_proofs = false` are implemented in cinder's `csl-run` (its `docs/decisions.md`, same date), additively: `Format { layout, inline_proofs }`, `with_format` constructors, `Page::encode_with` / `decode_with`, `Layout::try_new_with`, `Reader::get_entry`; `pgm` gained `Grouper::push_at` and `Fitter::finish_with` because a variable run knows its page count only when the last page closes. v1-min's signatures and `Lookup` are unchanged and cinder's chain passes. A variable layout with inline proofs is refused by the writer: a record's size would depend on the page count. The run's identity is `blake3` of the file, computed by a read-back pass at `finish`. Conformance vectors and the TypeScript harness do not cover the variable layout yet; they are this repo's to add once the format settles on mainnet shapes.
+
+## 2026-10-30: blob threshold 3,968, not the profile's 4,096
+
+A tag 0 value alone on a page can be at most `4096 − 66 − 2 − 32 − 1 − 2 = 3,993` bytes (`csl_run::MAX_INLINE_VALUE`). Core §3.2 says blobs start above 3,968; the profile's "4,096" cannot fit a page. `CODE_BLOB_THRESHOLD = 3968`. The profile text should be corrected to core's figure.
+
+## 2026-10-30: the manifest is JSON and nothing signs it
+
+Cinder's `Manifest` and `ColdRoot` carry base, delta and rebuild semantics and a sealer signature, none of which applies: nothing anchors a run root on Ethereum and the client's single trust input is the `state_root` it verified. The snapshot manifest (`snapshots/<block_hash>/manifest.json`) names the execution block hash, number, timestamp, `state_root`, the covered prefix, and one `RunRef` per non-empty table (`csl_run::RunRef` with `block_lo = block_hi = block_number`). `snapshots/latest` holds the newest block hash. `Snapshot::open` takes the caller's verified `state_root` and refuses a manifest that claims another, rather than walking files that cannot verify and reporting them `Insufficient` one key at a time. An empty table has no run (csl-run's rule), so a slice without code or storage has three files, not four; the client answers `NoTable` for it.
+
+## 2026-10-30: the producer sorts in memory
+
+Nodes are collected in vectors and sorted before writing: a 1/256 mainnet slice is a few million nodes, a few GB at most, and the milestone 1 machine has 64 GB. Milestone 4's full export (about 1.5 × 10^9 nodes) needs the external sort cinder's sealer already has, behind the same `produce` call. The producer checks every storage root against its account's leaf, the account root against the header's `state_root`, every `codeHash` against its bytecode, and writes nothing until all three hold; an account with no storage stream must carry the empty root. The content-addressed fourth table (`keccak(node) → node`) is written from the same nodes, deduplicated, for the serial baseline of profile §9, but no client reads it yet.
+
+## 2026-10-30: what the first end-to-end run measured
+
+`crates/client/tests/e2e.rs` on 3,000 synthetic accounts (leaves at depth 3, so speculation to depth 9 wastes six lookups per read; mainnet leaves sit at 7 or 8 and waste two).
+
+- **Every shape.** 3,000 present accounts verified; 1,000 random absent keys split 608 `EmptySlot` and 384 `LeafMismatch`, plus a crafted 60-nibble extension giving `ExtensionMismatch`, `EmptySlot` under its branch and `LeafMismatch` at its leaf; 19,968 present storage slots and an absent slot per trie; empty storage answered without a storage request; code inline (375) and as blobs (375); `KECCAK_EMPTY` with no fetch; an unknown `codeHash` is `Insufficient(Missing)`.
+- **Faults.** 40 random bit flips per table in six rounds, a truncated table, a dropped page served as a short read, a table from a different trie under the real `state_root`: every read was the right answer or `Insufficient`, none was a false absence or a wrong value. A table the manifest names but the bucket lacks fails `open`.
+- **ε against requests.** The reader's walk after a prediction is sequential: each page the prediction is off is a dependent request. With the same 170-page account table, ε = 1 (model 172 B) gave a mean 14.2 requests and 58 KB per present account read over ten speculated depths, 1.42 per lookup, every walk one page; ε = 2 and ε = 4 both fit one segment (28 B) and gave 16.5 requests and 68 KB, 1.65 per lookup, with walks of up to 4 pages. The profile's "about nine page requests, 40 KB, one round" assumed a direct hit per depth. Consequences: `produce` takes ε as an option and the default stays the profile's 4 until mainnet shapes are measured; the client should learn the leaf depth from its first reads and stop speculating past it; and for the deepest depths a two-page range (`p`, `p + 1`) buys subtree contiguity for one request. The 50 KB budget is not asserted by the tests; it is milestone 1's exit on real shapes.

@@ -1,0 +1,20 @@
+[package]
+name = "csl-eth-client"
+description = "The Ethereum profile's client: speculative round, trie walk, repair, storage and code reads over byte-range sources, every answer verified to state_root"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+csl-run.workspace = true
+csl-eth-trie = { path = "../trie" }
+csl-eth-store = { path = "../store" }
+alloy-primitives.workspace = true
+alloy-trie = { workspace = true, features = ["ethereum"] }
+blake3.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+rand_chacha.workspace = true
