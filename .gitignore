@@ -1,0 +1,4 @@
+/target
+.DS_Store
+/results/*.json
+!/results/*.md

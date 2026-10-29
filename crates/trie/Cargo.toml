@@ -1,0 +1,16 @@
+[package]
+name = "csl-eth-trie"
+description = "Ethereum profile for the cold state layer: path-keyed trie-node tables built from sorted leaves, and the verifier that walks them to state_root"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+alloy-trie = { workspace = true, features = ["ethereum"] }
+
+[dev-dependencies]
+rand.workspace = true
+rand_chacha.workspace = true
