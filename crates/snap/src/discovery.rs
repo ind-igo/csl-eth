@@ -24,7 +24,9 @@ pub const MAINNET_DNS_TREE: &str = "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPO
 /// that fails to start is logged and skipped; with none the receiver ends.
 pub async fn start(key: SecretKey, udp_port: u16, fork_filter: ForkFilter, use_dns: bool, use_discv4: bool) -> mpsc::Receiver<NodeRecord> {
     let (tx, rx) = mpsc::channel::<NodeRecord>(4096);
-    let seen: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
+    // By node id and by socket address: crawlers answer from one address
+    // under fresh keys, and one address is one node.
+    let seen: Arc<Mutex<(HashSet<PeerId>, HashSet<SocketAddr>)>> = Arc::new(Mutex::new((HashSet::new(), HashSet::new())));
 
     if use_dns {
         match DnsResolver::from_system_conf() {
@@ -46,7 +48,7 @@ pub async fn start(key: SecretKey, udp_port: u16, fork_filter: ForkFilter, use_d
                                     continue;
                                 }
                             }
-                            if seen.lock().unwrap().insert(u.node_record.id) {
+                            if first_sight(&seen, &u.node_record) {
                                 n += 1;
                                 if n.is_multiple_of(200) {
                                     info!(n, "dns candidates");
@@ -86,7 +88,7 @@ pub async fn start(key: SecretKey, udp_port: u16, fork_filter: ForkFilter, use_d
                             if record.tcp_port == 0 {
                                 continue;
                             }
-                            if seen.lock().unwrap().insert(record.id) {
+                            if first_sight(&seen, &record) {
                                 n += 1;
                                 if n.is_multiple_of(200) {
                                     info!(n, "discv4 candidates");
@@ -123,4 +125,12 @@ fn collect(u: DiscoveryUpdate, fork_filter: &ForkFilter, out: &mut Vec<NodeRecor
             }
         }
     }
+}
+
+fn first_sight(seen: &Mutex<(HashSet<PeerId>, HashSet<SocketAddr>)>, r: &NodeRecord) -> bool {
+    let mut g = seen.lock().unwrap();
+    let addr = SocketAddr::new(r.address, r.tcp_port);
+    let new_id = g.0.insert(r.id);
+    let new_addr = g.1.insert(addr);
+    new_id && new_addr
 }

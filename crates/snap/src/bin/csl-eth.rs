@@ -3,9 +3,11 @@
 
 use alloy_primitives::B256;
 use clap::{Parser, Subcommand};
+use csl_eth_client::{DirBucket, Read, Reason, Snapshot};
 use csl_eth_snap::{fetch, probe, FetchConfig, Slice};
 use csl_eth_store::{produce_with, ProduceOptions};
 use csl_eth_trie::Nibbles;
+use csl_eth_trie::KECCAK_EMPTY;
 use std::{path::PathBuf, time::Duration};
 
 #[derive(Parser)]
@@ -51,8 +53,25 @@ enum Cmd {
         slice: PathBuf,
         #[arg(long)]
         out: PathBuf,
-        #[arg(long, default_value_t = 4)]
+        /// Learned-index error bound in pages; 1 measured best on mainnet.
+        #[arg(long, default_value_t = 1)]
         epsilon: u16,
+    },
+    /// Read a bucket built from a slice with the client: sampled accounts,
+    /// slots and code verify, absent keys inside the prefix are proven,
+    /// keys outside end Insufficient; cost per read.
+    Check {
+        #[arg(long)]
+        slice: PathBuf,
+        #[arg(long)]
+        bucket: PathBuf,
+        #[arg(long, default_value_t = 500)]
+        samples: usize,
+        /// Speculated account depth (profile: 9) and storage depth (7).
+        #[arg(long)]
+        d_account: Option<usize>,
+        #[arg(long)]
+        d_storage: Option<usize>,
     },
     /// Dial peers and report client, snap version and head.
     Peers {
@@ -118,6 +137,103 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             );
         }
+        Cmd::Check { slice, bucket, samples, d_account, d_storage } => {
+            let s = Slice::read(&slice)?;
+            let mut snap = Snapshot::open(DirBucket::new(&bucket), None, s.head.state_root)?;
+            if let Some(d) = d_account {
+                snap.d_account = d;
+            }
+            if let Some(d) = d_storage {
+                snap.d_storage = d;
+            }
+            let prefix_nibbles = parse_prefix(&s.head.prefix)?;
+            let in_prefix = |h: &B256| csl_eth_trie::path_of(h).starts_with(&prefix_nibbles);
+            let stride = (s.accounts.len() / samples.max(1)).max(1);
+            let mut acc = Series::default();
+            let mut slot = Series::default();
+            let mut code = Series::default();
+            let mut absent = Series::default();
+            let mut outside = Series::default();
+            let (mut wrong, mut unexpected) = (0usize, 0usize);
+            for (i, (h, a)) in s.accounts.iter().enumerate().step_by(stride) {
+                let (r, c) = snap.account(h);
+                match r {
+                    Read::Verified(got) if got == *a => acc.push(&c),
+                    Read::Verified(_) => wrong += 1,
+                    other => {
+                        unexpected += 1;
+                        eprintln!("account {h}: {other:?}");
+                    }
+                }
+                if let Some(slots) = s.storage.get(&a.storage_root) {
+                    if let Some((k, v)) = slots.get(i % slots.len()) {
+                        let (r, c) = snap.storage(h, k);
+                        match r {
+                            Read::Verified(got) if got == *v => slot.push(&c),
+                            Read::Verified(_) => wrong += 1,
+                            other => {
+                                unexpected += 1;
+                                eprintln!("slot {h}/{k}: {other:?}");
+                            }
+                        }
+                    }
+                }
+                if a.code_hash != KECCAK_EMPTY {
+                    let (r, c) = snap.code(&a.code_hash);
+                    match r {
+                        Read::Verified(bytes) if alloy_primitives::keccak256(&bytes) == a.code_hash => code.push(&c),
+                        Read::Verified(_) => wrong += 1,
+                        other => {
+                            unexpected += 1;
+                            eprintln!("code {}: {other:?}", a.code_hash);
+                        }
+                    }
+                }
+                // An absent key inside the prefix: this account's hash with
+                // the last byte changed (same prefix, almost surely no leaf).
+                let mut k = *h;
+                k.0[31] ^= 0x5a;
+                if s.accounts.binary_search_by(|(x, _)| x.cmp(&k)).is_err() {
+                    let (r, c) = snap.account(&k);
+                    match r {
+                        Read::VerifiedAbsent(_) => absent.push(&c),
+                        other => {
+                            unexpected += 1;
+                            eprintln!("absent {k}: {other:?}");
+                        }
+                    }
+                }
+                // Outside the prefix: first nibble flipped.
+                let mut k = *h;
+                k.0[0] ^= 0x10;
+                if !in_prefix(&k) {
+                    let (r, c) = snap.account(&k);
+                    match r {
+                        Read::Insufficient(Reason::Missing { .. }) => outside.push(&c),
+                        other => {
+                            unexpected += 1;
+                            eprintln!("outside {k}: {other:?}");
+                        }
+                    }
+                }
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "block_number": s.head.block_number,
+                    "prefix": s.head.prefix,
+                    "d_account": snap.d_account,
+                    "d_storage": snap.d_storage,
+                    "wrong_values": wrong,
+                    "unexpected_reads": unexpected,
+                    "account": acc.summary(),
+                    "storage_slot": slot.summary(),
+                    "code": code.summary(),
+                    "absent_inside": absent.summary(),
+                    "outside_prefix": outside.summary(),
+                })
+            );
+        }
         Cmd::Peers { count, timeout_secs, udp_port } => {
             let rows = probe(count, Duration::from_secs(timeout_secs), udp_port).await;
             for (record, client, snap, head) in &rows {
@@ -127,4 +243,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Costs of one kind of read.
+#[derive(Default)]
+struct Series {
+    requests: Vec<u64>,
+    bytes: Vec<u64>,
+    rounds: Vec<u64>,
+    nodes: Vec<u64>,
+}
+
+impl Series {
+    fn push(&mut self, c: &csl_eth_client::Cost) {
+        self.requests.push(c.requests);
+        self.bytes.push(c.bytes);
+        self.rounds.push(c.rounds as u64);
+        self.nodes.push(c.nodes as u64);
+    }
+
+    fn summary(&self) -> serde_json::Value {
+        fn stats(v: &[u64]) -> serde_json::Value {
+            if v.is_empty() {
+                return serde_json::Value::Null;
+            }
+            let mut s = v.to_vec();
+            s.sort_unstable();
+            let mean = s.iter().sum::<u64>() as f64 / s.len() as f64;
+            serde_json::json!({
+                "mean": (mean * 10.0).round() / 10.0,
+                "p50": s[s.len() / 2],
+                "p95": s[(s.len() * 95 / 100).min(s.len() - 1)],
+                "max": s[s.len() - 1],
+            })
+        }
+        serde_json::json!({
+            "n": self.requests.len(),
+            "requests": stats(&self.requests),
+            "bytes": stats(&self.bytes),
+            "rounds": stats(&self.rounds),
+            "nodes_walked": stats(&self.nodes),
+        })
+    }
 }

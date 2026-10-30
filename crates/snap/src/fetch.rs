@@ -56,8 +56,10 @@ pub struct Config {
     pub dial_parallel: usize,
     /// Soft response size asked of peers (geth caps at 2 MiB).
     pub response_bytes: u64,
-    /// Per handshake step and per request.
+    /// Per request.
     pub timeout: Duration,
+    /// Per dial (TCP, ECIES, hello, status together).
+    pub dial_timeout: Duration,
     pub storage_batch: usize,
     pub code_batch: usize,
     pub udp_port: u16,
@@ -74,9 +76,10 @@ impl Default for Config {
         Config {
             prefix: Nibbles::from_nibbles([0]),
             peers: 8,
-            dial_parallel: 48,
+            dial_parallel: 192,
             response_bytes: 2 * 1024 * 1024,
             timeout: Duration::from_secs(20),
+            dial_timeout: Duration::from_secs(10),
             storage_batch: 48,
             code_batch: 48,
             udp_port: 30399,
@@ -245,8 +248,9 @@ pub async fn fetch(cfg: Config) -> Result<Slice, FetchError> {
                 tokio::spawn(async move {
                     let _permit = permit;
                     let n = tried.fetch_add(1, Ordering::Relaxed) + 1;
-                    match Peer::connect(record, &key, status, fork_filter, shared.cfg.timeout).await {
-                        Ok(peer) => {
+                    match Peer::connect(record, &key, status, fork_filter, shared.cfg.dial_timeout).await {
+                        Ok(mut peer) => {
+                            peer.timeout = shared.cfg.timeout;
                             let k = ok.fetch_add(1, Ordering::Relaxed) + 1;
                             if shared.connected.fetch_add(1, Ordering::Relaxed) >= shared.cfg.peers {
                                 shared.connected.fetch_sub(1, Ordering::Relaxed);
@@ -455,9 +459,7 @@ impl Coordinator {
                         header.number >= peer::FORK_HEAD_NUMBER && header.timestamp + MAX_PIVOT_AGE_SECS >= now
                     }
                 };
-                if !wanted && self.waiting_for_head {
-                    debug!(peer = %peer, number = header.number, "head not usable as a pivot");
-                }
+                info!(peer = %peer, number = header.number, usable = wanted, "peer head");
                 if self.waiting_for_head && wanted {
                     self.set_pivot(&header).await;
                 } else if let Some(p) = self.pivot {
@@ -569,7 +571,7 @@ impl Coordinator {
             Done::PeerGone { peer, err } => {
                 job_finished = false;
                 if let Some(e) = err {
-                    debug!(peer = %peer, error = %e, "peer gone");
+                    info!(peer = %peer, error = %e, "peer gone");
                 }
             }
         }
@@ -651,7 +653,12 @@ async fn peer_task(mut peer: Peer, shared: Arc<Shared>, tx: mpsc::Sender<Done>) 
             let Some(job) = job else {
                 tokio::select! {
                     _ = shared.notify.notified() => {}
-                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    r = peer.idle(Duration::from_millis(500)) => {
+                        if let Err(e) = r {
+                            err = Some(e.to_string());
+                            break;
+                        }
+                    }
                 }
                 continue;
             };
@@ -802,11 +809,14 @@ pub async fn probe(count: usize, timeout: Duration, udp_port: u16) -> Vec<(NodeR
             let (status, fork_filter) = (status, fork_filter.clone());
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Ok(mut peer) = Peer::connect(record, &key, status, fork_filter, timeout).await {
-                    let head = peer.own_head().await.ok().flatten().map(|h| h.number);
-                    let row = (record, peer.client.clone(), peer.snap_version, head);
-                    peer.close().await;
-                    let _ = tx.send(row).await;
+                match Peer::connect(record, &key, status, fork_filter, timeout).await {
+                    Ok(mut peer) => {
+                        let head = peer.own_head().await.ok().flatten().map(|h| h.number);
+                        let row = (record, peer.client.clone(), peer.snap_version, head);
+                        peer.close().await;
+                        let _ = tx.send(row).await;
+                    }
+                    Err(e) => debug!(addr = %record.address, error = %e, "dial failed"),
                 }
             });
         }

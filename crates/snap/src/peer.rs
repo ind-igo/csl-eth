@@ -283,6 +283,28 @@ impl Peer {
         Ok(())
     }
 
+    /// Keep the connection alive while there is nothing to ask: read for
+    /// `for_` servicing the peer's pings and requests. `P2PStream` answers
+    /// pings only when polled, so an idle peer that is not read drops us
+    /// with "ping timeout".
+    pub async fn idle(&mut self, for_: Duration) -> Result<(), PeerError> {
+        let deadline = Instant::now() + for_;
+        loop {
+            match self.next_before(deadline).await {
+                Ok(Inbound::Eth(m)) => self.service_eth(m).await?,
+                Ok(Inbound::Snap(m)) => self.service_snap(m).await?,
+                Ok(Inbound::Ignored) => {}
+                Err(PeerError::Timeout) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// The negotiated `eth` version.
+    pub fn eth_version(&self) -> u8 {
+        self.eth_version as u8
+    }
+
     async fn next_before(&mut self, deadline: Instant) -> Result<Inbound, PeerError> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {

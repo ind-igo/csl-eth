@@ -1370,6 +1370,7 @@ dependencies = [
  "alloy-trie",
  "bytes",
  "clap",
+ "csl-eth-client",
  "csl-eth-store",
  "csl-eth-trie",
  "futures",

@@ -12,6 +12,7 @@ path = "src/bin/csl-eth.rs"
 [dependencies]
 csl-eth-trie = { path = "../trie" }
 csl-eth-store = { path = "../store" }
+csl-eth-client = { path = "../client" }
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-rlp.workspace = true
 alloy-trie.workspace = true

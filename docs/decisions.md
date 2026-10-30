@@ -53,3 +53,21 @@ snap peers serve roots from about the last 128 blocks. A 1/256 slice at today's 
 ## 2026-10-30: the slice on disk is separate from the bucket
 
 `csl-eth fetch` writes a slice (`head.json`, RLP files of accounts, storage by root, code, and the boundary) and `csl-eth build` turns it into a bucket. Two steps because fetching takes minutes to hours and depends on the network while building is deterministic and seconds; a slice can be rebuilt with another ε or table layout without re-fetching, and the measurements of milestone 1 compare builds of one slice.
+
+## 2026-10-30: the first mainnet slice, and what it cost to read
+
+`csl-eth fetch --prefix 1a7` (1/4096 of state) at block 26,305,903, state root `0xe8e6…5800`, from one Nethermind peer: 104,361 accounts, 3,362 distinct storage tries (6,878 by account; proxies share roots) with 129,555 slots, 2,168 bytecodes, 17.9 MB over 133 requests, no re-pivot. Transfer took about two minutes; the other two were spent finding a peer. Getting peers is the slow part: of 355 dials in a 100 s probe, 155 answered "too many peers", 81 timed out, 58 reset, 21 had no snap, and 3 handshook. Dials now run 192 wide with a 10 s dial timeout, candidates are deduplicated by address as well as node id (a crawler answers from one address under fresh keys), and an idle peer is kept polled so its pings are answered; before that, geth dropped us for "ping timeout" while we waited for a pivot. A syncing peer announces genesis as its head and is not a pivot candidate.
+
+`csl-eth build` turned the slice into a bucket in 0.4 s with 102 sealed subtrees in the boundary and the account root equal to the header's `state_root`: the slice is the network's state at that block, proven. 144,964 account nodes in 5,557 pages (22.8 MB), 180,808 storage nodes (20.3 MB), code 1.4 MB plus 407 blobs, the content-addressed table 42 MB. Mainnet account leaves sit at depth 8 (9 nodes walked, p95 10), storage leaves 10 to 12 nodes deep under the account.
+
+`csl-eth check` reads the bucket with the client, 300 sampled accounts with their slots and code, absent keys inside the prefix, keys outside. Every value verified, every inside absence was proven by the trie, every outside key ended `Insufficient(Missing)` after a repair round at the sealed slot, at every ε. The cost, mean per account read, speculating depths `0..=8`:
+
+| ε | model | requests | KB | slot read requests / KB |
+|---|---|---|---|---|
+| 1 | 3,076 B | 13.4 (p95 16) | 53.5 | 25.4 / 101 |
+| 2 | 748 B | 18.7 | 74.6 | 32.5 / 130 |
+| 4 | 220 B | 27.0 | 108 | 46.3 / 185 |
+| 8 | 52 B | 41.0 | 164 | 78.1 / 312 |
+| 16 | 52 B | 61.5 | 246 | 111.5 / 446 |
+
+Speculating to depth 9 instead of 8 adds about 1.4 requests and 5 KB. The profile's "about nine page requests, 40 KB, one round" is not met by any ε: the rounds are right (1.0 to 1.1), the requests are not, because each page of model error is a dependent request on the sequential reader, as the synthetic run already showed. ε = 1 is now the default: its model is 3 KB for 145,000 nodes, which is nothing. The remaining gap to the profile's figure is the lookups themselves, nine per read, and that is where the next client work is: the top levels of the trie are the same nodes for every key (one root and one node per depth along the prefix here; 1 + 16 + 256 + 4,096 nodes for the top four levels of full state), so a client that keeps them after its first reads speculates from depth 4 and pays five lookups, and a `(p, p + 1)` range for the deep depths buys a prediction miss for one request. Both are measurements for the next stage, not changes to the format.

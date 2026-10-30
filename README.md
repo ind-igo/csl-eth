@@ -42,9 +42,19 @@ snapshot claiming a different `state_root` refuses to open. A path-prefix
 slice built from range-proof boundaries verifies inside, proves absence
 inside, and ends `Insufficient` outside (`tests/slice.rs`).
 
-The snap fetcher handshakes with live mainnet peers (geth 1.16, Nethermind
-2.2, snap/1). The first real slice fetch is in progress; its measurements
-go in `docs/decisions.md` when it lands.
+The first mainnet slice is in: 1/4096 of state at block 26,305,903 fetched
+over snap from one peer in two minutes (104,361 accounts, 129,555 slots,
+2,168 bytecodes, 17.9 MB), built into a bucket that proves to the header's
+`state_root`, and read back with the client: every sampled value verified,
+absence proven inside the prefix, `Insufficient` outside. An account read
+costs 13.4 requests and 54 KB at ε = 1 (now the default), one round; the
+profile's nine requests need the client to keep the trie's top levels.
+Numbers and reasoning in `docs/decisions.md`. Finding peers is the slow
+part: about one dial in a hundred is accepted.
+
+```
+./target/release/csl-eth check --slice data/slice-1a7 --bucket data/bucket-1a7
+```
 
 Not yet built, in order: the head verifier over bucket files
 (`helios-consensus-core`), an HTTP range `Bucket` and the remote-host
