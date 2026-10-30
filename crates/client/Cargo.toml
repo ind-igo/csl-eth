@@ -14,6 +14,10 @@ alloy-primitives.workspace = true
 alloy-trie = { workspace = true, features = ["ethereum"] }
 blake3.workspace = true
 hex.workspace = true
+ureq = { version = "3", optional = true, features = ["socks-proxy"] }
+
+[features]
+http = ["dep:ureq"]
 
 [dev-dependencies]
 rand.workspace = true

@@ -27,14 +27,44 @@ use std::{
     fmt,
     fs::File,
     path::{Path, PathBuf},
+    sync::Arc,
 };
+
+#[cfg(feature = "http")]
+pub mod http;
+#[cfg(feature = "http")]
+pub use http::HttpBucket;
 
 /// Where the files are. Runs are read by byte range through
 /// [`csl_run::Source`]; manifests, `latest` and blobs are read whole.
 pub trait Bucket {
-    type Run: Source;
+    type Run: Source + Prefetch;
     fn open_run(&self, rel: &str) -> Result<Self::Run, String>;
     fn read_file(&self, rel: &str) -> Result<Vec<u8>, String>;
+}
+
+/// A hint a source may act on: these byte ranges are about to be read, in
+/// no particular order, so a remote source fetches them now in parallel
+/// and serves the reads that follow from what came back. One speculative
+/// round is one `prefetch` call. A local source ignores it.
+pub trait Prefetch {
+    fn prefetch(&self, _ranges: &[(u64, usize)]) {}
+    /// A read is starting: drop whatever the last one fetched. What a
+    /// source keeps is one read's pages, never a cache across reads, so
+    /// every read is measured and verified on its own.
+    fn forget(&self) {}
+}
+
+impl Prefetch for File {}
+
+/// A source the snapshot and its reader both hold: the reader reads
+/// through it, the snapshot hands it prefetch hints.
+pub struct Shared<S>(pub Arc<S>);
+
+impl<S: Source> Source for Shared<S> {
+    fn read_at(&self, off: u64, len: usize) -> Result<Vec<u8>, csl_run::Error> {
+        self.0.read_at(off, len)
+    }
 }
 
 /// A directory on disk (the producer's output, or a mirror).
@@ -157,9 +187,14 @@ pub const MAX_REPAIRS: u32 = csl_eth_trie::MAX_WALK_NODES as u32;
 pub struct Snapshot<B: Bucket> {
     bucket: B,
     manifest: Manifest,
-    tables: Vec<Option<Reader<B::Run>>>,
+    tables: Vec<Option<Reader<Shared<B::Run>>>>,
+    sources: Vec<Option<Arc<B::Run>>>,
     pub d_account: usize,
     pub d_storage: usize,
+    /// Before a speculative round, hint the table's source with the
+    /// predicted page of every depth, widened by this many pages each
+    /// side (`Some(0)`: the prediction only; `None`: no hint).
+    pub prefetch: Option<u64>,
 }
 
 impl<B: Bucket> Snapshot<B> {
@@ -194,29 +229,32 @@ impl<B: Bucket> Snapshot<B> {
             ));
         }
         let mut tables = Vec::with_capacity(TABLE_COUNT);
+        let mut sources = Vec::with_capacity(TABLE_COUNT);
         for t in 0..TABLE_COUNT as u16 {
-            let r = match manifest.table(t) {
+            let (r, src) = match manifest.table(t) {
                 Some(tr) => {
-                    let src = bucket.open_run(&table_path(&hash, t))?;
-                    Some(
-                        Reader::try_with_format(
-                            src,
-                            tr.run_ref(manifest.block_number),
-                            Format::variable(),
-                        )
-                        .map_err(|e| format!("table {t}: {e}"))?,
+                    let src = Arc::new(bucket.open_run(&table_path(&hash, t))?);
+                    let reader = Reader::try_with_format(
+                        Shared(src.clone()),
+                        tr.run_ref(manifest.block_number),
+                        Format::variable(),
                     )
+                    .map_err(|e| format!("table {t}: {e}"))?;
+                    (Some(reader), Some(src))
                 }
-                None => None,
+                None => (None, None),
             };
             tables.push(r);
+            sources.push(src);
         }
         Ok(Snapshot {
             bucket,
             manifest,
             tables,
+            sources,
             d_account: D_ACCOUNT,
             d_storage: D_STORAGE,
+            prefetch: None,
         })
     }
 
@@ -263,6 +301,45 @@ impl<B: Bucket> Snapshot<B> {
         }
     }
 
+    /// One read's pages are kept by a remote source for that read only.
+    fn begin_read(&self) {
+        for src in self.sources.iter().flatten() {
+            src.forget();
+        }
+    }
+
+    /// Hand the table's source the byte ranges of the pages the model
+    /// predicts for `keys`, `span` pages each side. Errors here are not
+    /// errors: the reads that follow report them.
+    fn hint(&mut self, table: u16, keys: &[[u8; 32]], span: u64) {
+        let (Some(reader), Some(src)) = (
+            self.tables[table as usize].as_mut(),
+            self.sources[table as usize].as_ref(),
+        ) else {
+            return;
+        };
+        let Some(layout) = reader.layout().copied() else {
+            return;
+        };
+        let Ok(model) = reader.load_model() else {
+            return;
+        };
+        let mut ranges = Vec::with_capacity(keys.len() * (2 * span as usize + 1));
+        for k in keys {
+            let p = model.predict(csl_run::k64(k));
+            let lo = p.saturating_sub(span).max(1);
+            let hi = (p + span).min(layout.page_count);
+            for q in lo..=hi {
+                if let Some(off) = layout.checked_record_off(q) {
+                    ranges.push((off, layout.record_bytes as usize));
+                }
+            }
+        }
+        ranges.sort_unstable();
+        ranges.dedup();
+        src.prefetch(&ranges);
+    }
+
     /// The walk of profile §2 over `table`: speculate `0..=max_depth`,
     /// walk, repair until the trie answers.
     fn walk_table(
@@ -277,6 +354,7 @@ impl<B: Bucket> Snapshot<B> {
         if root == EMPTY_ROOT_HASH {
             return (Read::VerifiedAbsent(AbsentBy::EmptyTrie), cost);
         }
+        self.begin_read();
         let (r0, b0) = self.requests_so_far();
         let mut nodes: Nodes<_> = Nodes {
             map: HashMap::new(),
@@ -285,6 +363,12 @@ impl<B: Bucket> Snapshot<B> {
         // Speculative round: every depth, errors deferred to the repair
         // that would need the node.
         cost.rounds = 1;
+        if let Some(span) = self.prefetch {
+            let keys: Vec<[u8; 32]> = (0..=max_depth)
+                .map(|d| key_of(&NodeKey::prefix(path, d)))
+                .collect();
+            self.hint(table, &keys, span);
+        }
         for d in 0..=max_depth {
             let nk = NodeKey::prefix(path, d);
             let tk = key_of(&nk);
@@ -401,6 +485,7 @@ impl<B: Bucket> Snapshot<B> {
     /// Bytecode under a `codeHash` the caller verified. `KECCAK_EMPTY` is
     /// empty code with no fetch.
     pub fn code(&mut self, code_hash: &B256) -> (Read<Vec<u8>>, Cost) {
+        self.begin_read();
         let mut cost = Cost::default();
         if *code_hash == KECCAK_EMPTY {
             return (Read::Verified(Vec::new()), cost);

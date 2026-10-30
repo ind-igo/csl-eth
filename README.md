@@ -46,14 +46,17 @@ The first mainnet slice is in: 1/4096 of state at block 26,305,903 fetched
 over snap from one peer in two minutes (104,361 accounts, 129,555 slots,
 2,168 bytecodes, 17.9 MB), built into a bucket that proves to the header's
 `state_root`, and read back with the client: every sampled value verified,
-absence proven inside the prefix, `Insufficient` outside. An account read
-costs 13.4 requests and 54 KB at ε = 1 (now the default), one round; the
-profile's nine requests need the client to keep the trie's top levels.
-Numbers and reasoning in `docs/decisions.md`. Finding peers is the slow
-part: about one dial in a hundred is accepted.
+absence proven inside the prefix, `Insufficient` outside. On the wire
+(`check --url`, a bucket behind HTTP) an account read at ε = 1 is 6.7
+range requests and 27 KB, or one round of 12 requests and 48 KB with the
+predicted page and its neighbours prefetched; the table's pre-order puts a
+path's deeper nodes on the same pages. Measured on loopback so far; the
+remote host is next. Numbers and reasoning in `docs/decisions.md`. Finding
+peers is the slow part: about one dial in a hundred is accepted.
 
 ```
 ./target/release/csl-eth check --slice data/slice-1a7 --bucket data/bucket-1a7
+./target/release/csl-eth check --slice data/slice-1a7 --url http://host/bucket --prefetch 1
 ```
 
 Not yet built, in order: the head verifier over bucket files

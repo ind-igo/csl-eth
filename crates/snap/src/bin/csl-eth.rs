@@ -8,7 +8,14 @@ use csl_eth_snap::{fetch, probe, FetchConfig, Slice};
 use csl_eth_store::{produce_with, ProduceOptions};
 use csl_eth_trie::Nibbles;
 use csl_eth_trie::KECCAK_EMPTY;
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 #[derive(Parser)]
 #[command(name = "csl-eth", about = "Ethereum state as static files: acquisition and build")]
@@ -63,8 +70,15 @@ enum Cmd {
     Check {
         #[arg(long)]
         slice: PathBuf,
+        /// A bucket directory on disk.
+        #[arg(long, conflicts_with = "url")]
+        bucket: Option<PathBuf>,
+        /// A bucket behind HTTP (the directory's base URL).
         #[arg(long)]
-        bucket: PathBuf,
+        url: Option<String>,
+        /// Proxy for the URL, e.g. socks5h://localhost:1055.
+        #[arg(long)]
+        proxy: Option<String>,
         #[arg(long, default_value_t = 500)]
         samples: usize,
         /// Speculated account depth (profile: 9) and storage depth (7).
@@ -72,6 +86,10 @@ enum Cmd {
         d_account: Option<usize>,
         #[arg(long)]
         d_storage: Option<usize>,
+        /// Fetch the speculative round in parallel: the predicted page per
+        /// depth plus this many pages each side. Off when absent.
+        #[arg(long)]
+        prefetch: Option<u64>,
     },
     /// Dial peers and report client, snap version and head.
     Peers {
@@ -137,102 +155,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             );
         }
-        Cmd::Check { slice, bucket, samples, d_account, d_storage } => {
+        Cmd::Check { slice, bucket, url, proxy, samples, d_account, d_storage, prefetch } => {
             let s = Slice::read(&slice)?;
-            let mut snap = Snapshot::open(DirBucket::new(&bucket), None, s.head.state_root)?;
-            if let Some(d) = d_account {
-                snap.d_account = d;
-            }
-            if let Some(d) = d_storage {
-                snap.d_storage = d;
-            }
-            let prefix_nibbles = parse_prefix(&s.head.prefix)?;
-            let in_prefix = |h: &B256| csl_eth_trie::path_of(h).starts_with(&prefix_nibbles);
-            let stride = (s.accounts.len() / samples.max(1)).max(1);
-            let mut acc = Series::default();
-            let mut slot = Series::default();
-            let mut code = Series::default();
-            let mut absent = Series::default();
-            let mut outside = Series::default();
-            let (mut wrong, mut unexpected) = (0usize, 0usize);
-            for (i, (h, a)) in s.accounts.iter().enumerate().step_by(stride) {
-                let (r, c) = snap.account(h);
-                match r {
-                    Read::Verified(got) if got == *a => acc.push(&c),
-                    Read::Verified(_) => wrong += 1,
-                    other => {
-                        unexpected += 1;
-                        eprintln!("account {h}: {other:?}");
-                    }
+            let mut opts = CheckOpts { samples, d_account, d_storage, prefetch, http: None };
+            let out = match (bucket, url) {
+                (Some(dir), None) => check(&s, Snapshot::open(DirBucket::new(&dir), None, s.head.state_root)?, &opts),
+                (None, Some(base)) => {
+                    let b = csl_eth_client::HttpBucket::new(&base, proxy.as_deref())?;
+                    let (req, bytes, hinted) = (b.requests.clone(), b.bytes.clone(), b.hinted.clone());
+                    opts.http = Some([req.clone(), bytes.clone(), hinted.clone()]);
+                    let mut out = check(&s, Snapshot::open(b, None, s.head.state_root)?, &opts);
+                    out["http"] = serde_json::json!({
+                        "requests": req.load(std::sync::atomic::Ordering::Relaxed),
+                        "bytes": bytes.load(std::sync::atomic::Ordering::Relaxed),
+                        "hinted_pages": hinted.load(std::sync::atomic::Ordering::Relaxed),
+                    });
+                    out
                 }
-                if let Some(slots) = s.storage.get(&a.storage_root) {
-                    if let Some((k, v)) = slots.get(i % slots.len()) {
-                        let (r, c) = snap.storage(h, k);
-                        match r {
-                            Read::Verified(got) if got == *v => slot.push(&c),
-                            Read::Verified(_) => wrong += 1,
-                            other => {
-                                unexpected += 1;
-                                eprintln!("slot {h}/{k}: {other:?}");
-                            }
-                        }
-                    }
-                }
-                if a.code_hash != KECCAK_EMPTY {
-                    let (r, c) = snap.code(&a.code_hash);
-                    match r {
-                        Read::Verified(bytes) if alloy_primitives::keccak256(&bytes) == a.code_hash => code.push(&c),
-                        Read::Verified(_) => wrong += 1,
-                        other => {
-                            unexpected += 1;
-                            eprintln!("code {}: {other:?}", a.code_hash);
-                        }
-                    }
-                }
-                // An absent key inside the prefix: this account's hash with
-                // the last byte changed (same prefix, almost surely no leaf).
-                let mut k = *h;
-                k.0[31] ^= 0x5a;
-                if s.accounts.binary_search_by(|(x, _)| x.cmp(&k)).is_err() {
-                    let (r, c) = snap.account(&k);
-                    match r {
-                        Read::VerifiedAbsent(_) => absent.push(&c),
-                        other => {
-                            unexpected += 1;
-                            eprintln!("absent {k}: {other:?}");
-                        }
-                    }
-                }
-                // Outside the prefix: first nibble flipped.
-                let mut k = *h;
-                k.0[0] ^= 0x10;
-                if !in_prefix(&k) {
-                    let (r, c) = snap.account(&k);
-                    match r {
-                        Read::Insufficient(Reason::Missing { .. }) => outside.push(&c),
-                        other => {
-                            unexpected += 1;
-                            eprintln!("outside {k}: {other:?}");
-                        }
-                    }
-                }
-            }
-            println!(
-                "{}",
-                serde_json::json!({
-                    "block_number": s.head.block_number,
-                    "prefix": s.head.prefix,
-                    "d_account": snap.d_account,
-                    "d_storage": snap.d_storage,
-                    "wrong_values": wrong,
-                    "unexpected_reads": unexpected,
-                    "account": acc.summary(),
-                    "storage_slot": slot.summary(),
-                    "code": code.summary(),
-                    "absent_inside": absent.summary(),
-                    "outside_prefix": outside.summary(),
-                })
-            );
+                _ => return Err("give --bucket <dir> or --url <base>".into()),
+            };
+            println!("{}", out);
         }
         Cmd::Peers { count, timeout_secs, udp_port } => {
             let rows = probe(count, Duration::from_secs(timeout_secs), udp_port).await;
@@ -252,14 +194,24 @@ struct Series {
     bytes: Vec<u64>,
     rounds: Vec<u64>,
     nodes: Vec<u64>,
+    micros: Vec<u64>,
+    http_requests: Vec<u64>,
+    http_bytes: Vec<u64>,
+    http_dependent: Vec<u64>,
 }
 
 impl Series {
-    fn push(&mut self, c: &csl_eth_client::Cost) {
+    fn push(&mut self, c: &csl_eth_client::Cost, wall: Duration, http: Option<(u64, u64, u64)>) {
         self.requests.push(c.requests);
         self.bytes.push(c.bytes);
         self.rounds.push(c.rounds as u64);
         self.nodes.push(c.nodes as u64);
+        self.micros.push(wall.as_micros() as u64);
+        if let Some((r, b, d)) = http {
+            self.http_requests.push(r);
+            self.http_bytes.push(b);
+            self.http_dependent.push(d);
+        }
     }
 
     fn summary(&self) -> serde_json::Value {
@@ -283,6 +235,140 @@ impl Series {
             "bytes": stats(&self.bytes),
             "rounds": stats(&self.rounds),
             "nodes_walked": stats(&self.nodes),
+            "ms": stats(&self.micros.iter().map(|u| u / 1000).collect::<Vec<_>>()),
+            "http_requests": stats(&self.http_requests),
+            "http_bytes": stats(&self.http_bytes),
+            "http_dependent_requests": stats(&self.http_dependent),
         })
     }
+}
+
+struct CheckOpts {
+    samples: usize,
+    d_account: Option<usize>,
+    d_storage: Option<usize>,
+    prefetch: Option<u64>,
+    /// HTTP requests, bytes and hinted pages, when the bucket is remote.
+    http: Option<[Arc<AtomicU64>; 3]>,
+}
+
+/// A read's HTTP cost: requests and bytes actually on the wire, and how
+/// many of the requests were dependent (not in the prefetch hint).
+fn http_delta(o: &CheckOpts, before: [u64; 3]) -> Option<(u64, u64, u64)> {
+    let c = o.http.as_ref()?;
+    let now = [c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed), c[2].load(Ordering::Relaxed)];
+    let (req, bytes, hinted) = (now[0] - before[0], now[1] - before[1], now[2] - before[2]);
+    Some((req, bytes, req.saturating_sub(hinted)))
+}
+
+fn http_now(o: &CheckOpts) -> [u64; 3] {
+    match &o.http {
+        Some(c) => [c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed), c[2].load(Ordering::Relaxed)],
+        None => [0; 3],
+    }
+}
+
+/// Sampled accounts, their slots and code, absent keys inside the prefix
+/// and keys outside it, through the client; cost and wall time per read.
+fn check<B: csl_eth_client::Bucket>(s: &Slice, mut snap: Snapshot<B>, o: &CheckOpts) -> serde_json::Value {
+    if let Some(d) = o.d_account {
+        snap.d_account = d;
+    }
+    if let Some(d) = o.d_storage {
+        snap.d_storage = d;
+    }
+    snap.prefetch = o.prefetch;
+    let prefix_nibbles = parse_prefix(&s.head.prefix).expect("slice prefix");
+    let in_prefix = |h: &B256| csl_eth_trie::path_of(h).starts_with(&prefix_nibbles);
+    let stride = (s.accounts.len() / o.samples.max(1)).max(1);
+    let mut acc = Series::default();
+    let mut slot = Series::default();
+    let mut code = Series::default();
+    let mut absent = Series::default();
+    let mut outside = Series::default();
+    let (mut wrong, mut unexpected) = (0usize, 0usize);
+    let t_all = std::time::Instant::now();
+    for (i, (h, a)) in s.accounts.iter().enumerate().step_by(stride) {
+        let (t, h0) = (std::time::Instant::now(), http_now(o));
+        let (r, c) = snap.account(h);
+        match r {
+            Read::Verified(got) if got == *a => acc.push(&c, t.elapsed(), http_delta(o, h0)),
+            Read::Verified(_) => wrong += 1,
+            other => {
+                unexpected += 1;
+                eprintln!("account {h}: {other:?}");
+            }
+        }
+        if let Some(slots) = s.storage.get(&a.storage_root) {
+            if let Some((k, v)) = slots.get(i % slots.len()) {
+                let (t, h0) = (std::time::Instant::now(), http_now(o));
+                let (r, c) = snap.storage(h, k);
+                match r {
+                    Read::Verified(got) if got == *v => slot.push(&c, t.elapsed(), http_delta(o, h0)),
+                    Read::Verified(_) => wrong += 1,
+                    other => {
+                        unexpected += 1;
+                        eprintln!("slot {h}/{k}: {other:?}");
+                    }
+                }
+            }
+        }
+        if a.code_hash != KECCAK_EMPTY {
+            let (t, h0) = (std::time::Instant::now(), http_now(o));
+            let (r, c) = snap.code(&a.code_hash);
+            match r {
+                Read::Verified(bytes) if alloy_primitives::keccak256(&bytes) == a.code_hash => code.push(&c, t.elapsed(), http_delta(o, h0)),
+                Read::Verified(_) => wrong += 1,
+                other => {
+                    unexpected += 1;
+                    eprintln!("code {}: {other:?}", a.code_hash);
+                }
+            }
+        }
+        // An absent key inside the prefix: this account's hash with the
+        // last byte changed (same prefix, almost surely no leaf).
+        let mut k = *h;
+        k.0[31] ^= 0x5a;
+        if s.accounts.binary_search_by(|(x, _)| x.cmp(&k)).is_err() {
+            let (t, h0) = (std::time::Instant::now(), http_now(o));
+            let (r, c) = snap.account(&k);
+            match r {
+                Read::VerifiedAbsent(_) => absent.push(&c, t.elapsed(), http_delta(o, h0)),
+                other => {
+                    unexpected += 1;
+                    eprintln!("absent {k}: {other:?}");
+                }
+            }
+        }
+        // Outside the prefix: first nibble flipped.
+        let mut k = *h;
+        k.0[0] ^= 0x10;
+        if !in_prefix(&k) {
+            let (t, h0) = (std::time::Instant::now(), http_now(o));
+            let (r, c) = snap.account(&k);
+            match r {
+                Read::Insufficient(Reason::Missing { .. }) => outside.push(&c, t.elapsed(), http_delta(o, h0)),
+                other => {
+                    unexpected += 1;
+                    eprintln!("outside {k}: {other:?}");
+                }
+            }
+        }
+    }
+    serde_json::json!({
+        "block_number": s.head.block_number,
+        "prefix": s.head.prefix,
+        "d_account": snap.d_account,
+        "d_storage": snap.d_storage,
+        "prefetch": o.prefetch,
+        "wrong_values": wrong,
+        "unexpected_reads": unexpected,
+        "wall_ms": t_all.elapsed().as_millis() as u64,
+        "reads": acc.requests.len() + slot.requests.len() + code.requests.len() + absent.requests.len() + outside.requests.len(),
+        "account": acc.summary(),
+        "storage_slot": slot.summary(),
+        "code": code.summary(),
+        "absent_inside": absent.summary(),
+        "outside_prefix": outside.summary(),
+    })
 }

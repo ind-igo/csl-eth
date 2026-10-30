@@ -389,6 +389,7 @@ fn faults_never_become_false_answers() {
     // of one page.
     struct DropPage(DirBucket, u64);
     struct Dropping(std::fs::File, u64);
+    impl csl_eth_client::Prefetch for Dropping {}
     impl csl_run::Source for Dropping {
         fn read_at(&self, off: u64, len: usize) -> Result<Vec<u8>, csl_run::Error> {
             if self
