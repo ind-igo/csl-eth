@@ -1,0 +1,43 @@
+[package]
+name = "csl-eth-snap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "State acquisition over devp2p snap from mainnet peers, with no node: the milestone 1 producer input"
+
+[[bin]]
+name = "csl-eth"
+path = "src/bin/csl-eth.rs"
+
+[dependencies]
+csl-eth-trie = { path = "../trie" }
+csl-eth-store = { path = "../store" }
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-rlp.workspace = true
+alloy-trie.workspace = true
+alloy-consensus = { version = "2.5", default-features = false, features = ["std"] }
+
+# reth's wire crates, pinned to a release tag (the plan: libraries, not clients).
+reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", tag = "v2.9.0" }
+reth-eth-wire-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.9.0" }
+reth-ecies = { git = "https://github.com/paradigmxyz/reth", tag = "v2.9.0" }
+reth-discv4 = { git = "https://github.com/paradigmxyz/reth", tag = "v2.9.0" }
+reth-dns-discovery = { git = "https://github.com/paradigmxyz/reth", tag = "v2.9.0" }
+reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v2.9.0", features = ["secp256k1", "net"] }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.9.0" }
+reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth", tag = "v2.9.0" }
+
+secp256k1 = { version = "0.30", features = ["global-context", "std"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-stream = "0.1"
+futures = "0.3"
+bytes = "1"
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+hex.workspace = true
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"

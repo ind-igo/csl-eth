@@ -14,16 +14,13 @@
 //! behind the same `produce` call.
 
 use crate::{
-    blob_path, manifest_path, profile_id, snapshot_dir, Manifest, TableRef, CODE_BLOB_THRESHOLD,
-    EPSILON, FORMAT_VERSION, LATEST_FILE, TABLE_ACCOUNT_NODES, TABLE_CODE, TABLE_COUNT,
-    TABLE_FILES, TABLE_NODES_BY_HASH, TABLE_STORAGE_NODES,
+    blob_path, manifest_path, profile_id, snapshot_dir, Manifest, TableRef, CODE_BLOB_THRESHOLD, EPSILON, FORMAT_VERSION, LATEST_FILE, TABLE_ACCOUNT_NODES,
+    TABLE_CODE, TABLE_COUNT, TABLE_FILES, TABLE_NODES_BY_HASH, TABLE_STORAGE_NODES,
 };
 use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{Nibbles, KECCAK_EMPTY};
-use csl_eth_trie::{
-    code_key, encode_word, path_of, Account, BuildError, Builder, NodeKey, TooDeep, EMPTY_ROOT,
-    MAX_NODE_BYTES,
-};
+use csl_eth_trie::Sealed;
+use csl_eth_trie::{code_key, encode_word, path_of, Account, BuildError, Builder, NodeKey, TooDeep, EMPTY_ROOT, MAX_NODE_BYTES};
 use csl_run::{Config, Entry, Format, Writer};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -54,6 +51,8 @@ pub struct AccountLeaf {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
+    /// Subtrees outside a slice taken from its boundary proof.
+    pub sealed: u64,
     pub accounts: u64,
     pub storage_slots: u64,
     pub storage_tries: u64,
@@ -76,6 +75,7 @@ pub struct TableStats {
     pub file_bytes: u64,
 }
 
+#[derive(Clone, Debug)]
 pub struct Produced {
     pub manifest: Manifest,
     pub stats: Stats,
@@ -125,14 +125,7 @@ impl fmt::Display for ProduceError {
             }
             ProduceError::Build(e) => write!(f, "trie build: {e}"),
             ProduceError::TooDeep(e) => write!(f, "{e}"),
-            ProduceError::StorageRoot {
-                owner,
-                expected,
-                got,
-            } => write!(
-                f,
-                "storage root of {owner}: leaf says {expected}, slots build {got}"
-            ),
+            ProduceError::StorageRoot { owner, expected, got } => write!(f, "storage root of {owner}: leaf says {expected}, slots build {got}"),
             ProduceError::StateRoot { expected, got } => {
                 write!(f, "state root: header says {expected}, leaves build {got}")
             }
@@ -196,10 +189,7 @@ impl csl_eth_trie::Sink for Collect<'_> {
             }
         };
         if rlp.len() > MAX_NODE_BYTES {
-            self.err = Some(ProduceError::NodeTooLarge {
-                key: k,
-                len: rlp.len(),
-            });
+            self.err = Some(ProduceError::NodeTooLarge { key: k, len: rlp.len() });
             return;
         }
         self.keyed.push((k, rlp.to_vec()));
@@ -208,43 +198,35 @@ impl csl_eth_trie::Sink for Collect<'_> {
 }
 
 /// What the producer may vary per snapshot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
     /// The learned index bound for every table. Each page the prediction
     /// is off costs the client one dependent request, so this trades model
     /// bytes against requests per lookup; `EPSILON` is the profile's default.
     pub epsilon: u16,
+    /// For a path-prefix slice: the subtrees outside the slice as a snap
+    /// range proof seals them ([`csl_eth_trie::verify_range`]), so the
+    /// slice's leaves build up through their ancestors to `state_root`.
+    /// Empty for a full export. Any order; sorted here.
+    pub boundary: Vec<Sealed>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { epsilon: EPSILON }
+        Options { epsilon: EPSILON, boundary: Vec::new() }
     }
 }
 
 /// Write the snapshot of `head` under `root` (`snapshots/<hash>/`, `blobs/`)
 /// from `accounts` in ascending hashed-address order and `code` by hash.
-pub fn produce<I>(
-    root: &Path,
-    head: &Head,
-    prefix: &str,
-    accounts: I,
-    code: &HashMap<B256, Vec<u8>>,
-) -> Result<Produced, ProduceError>
+pub fn produce<I>(root: &Path, head: &Head, prefix: &str, accounts: I, code: &HashMap<B256, Vec<u8>>) -> Result<Produced, ProduceError>
 where
     I: IntoIterator<Item = AccountLeaf>,
 {
     produce_with(root, head, prefix, accounts, code, Options::default())
 }
 
-pub fn produce_with<I>(
-    root: &Path,
-    head: &Head,
-    prefix: &str,
-    accounts: I,
-    code: &HashMap<B256, Vec<u8>>,
-    opts: Options,
-) -> Result<Produced, ProduceError>
+pub fn produce_with<I>(root: &Path, head: &Head, prefix: &str, accounts: I, code: &HashMap<B256, Vec<u8>>, opts: Options) -> Result<Produced, ProduceError>
 where
     I: IntoIterator<Item = AccountLeaf>,
 {
@@ -257,22 +239,17 @@ where
 
     // Account trie, with every storage trie built and checked as its
     // account streams past.
-    let mut account_builder = Builder::new(Collect {
-        keyed: &mut account_rows,
-        by_hash: &mut by_hash,
-        owner: None,
-        err: None,
-    });
+    let mut account_builder = Builder::new(Collect { keyed: &mut account_rows, by_hash: &mut by_hash, owner: None, err: None });
+    let mut boundary = opts.boundary;
+    boundary.sort_by_key(|a| a.0);
+    let mut next_sealed = 0usize;
     let mut prev: Option<B256> = None;
     let mut storage_sink_rows: Rows = Vec::new();
     let mut storage_by_hash: Rows = Vec::new();
     for leaf in accounts {
         if let Some(p) = prev {
             if leaf.hashed <= p {
-                return Err(ProduceError::Unsorted {
-                    prev: p,
-                    next: leaf.hashed,
-                });
+                return Err(ProduceError::Unsorted { prev: p, next: leaf.hashed });
             }
         }
         prev = Some(leaf.hashed);
@@ -281,19 +258,10 @@ where
         // Storage.
         if leaf.storage.is_empty() {
             if leaf.account.storage_root != EMPTY_ROOT {
-                return Err(ProduceError::StorageRoot {
-                    owner: leaf.hashed,
-                    expected: leaf.account.storage_root,
-                    got: EMPTY_ROOT,
-                });
+                return Err(ProduceError::StorageRoot { owner: leaf.hashed, expected: leaf.account.storage_root, got: EMPTY_ROOT });
             }
         } else {
-            let mut b = Builder::new(Collect {
-                keyed: &mut storage_sink_rows,
-                by_hash: &mut storage_by_hash,
-                owner: Some(leaf.hashed),
-                err: None,
-            });
+            let mut b = Builder::new(Collect { keyed: &mut storage_sink_rows, by_hash: &mut storage_by_hash, owner: Some(leaf.hashed), err: None });
             for (slot, word) in &leaf.storage {
                 b.push(path_of(slot), encode_word(word))?;
             }
@@ -302,11 +270,7 @@ where
                 return Err(e);
             }
             if built.root != leaf.account.storage_root {
-                return Err(ProduceError::StorageRoot {
-                    owner: leaf.hashed,
-                    expected: leaf.account.storage_root,
-                    got: built.root,
-                });
+                return Err(ProduceError::StorageRoot { owner: leaf.hashed, expected: leaf.account.storage_root, got: built.root });
             }
             stats.storage_slots += built.leaves;
             stats.storage_tries += 1;
@@ -319,48 +283,46 @@ where
         let ch = leaf.account.code_hash;
         if ch != KECCAK_EMPTY && !code_rows.contains_key(&ch.0) {
             let Some(bytes) = code.get(&ch) else {
-                return Err(ProduceError::Code {
-                    hash: ch,
-                    what: "no bytecode",
-                });
+                return Err(ProduceError::Code { hash: ch, what: "no bytecode" });
             };
             if code_key(bytes) != ch.0 {
-                return Err(ProduceError::Code {
-                    hash: ch,
-                    what: "bytecode hashes differently",
-                });
+                return Err(ProduceError::Code { hash: ch, what: "bytecode hashes differently" });
             }
             if bytes.is_empty() {
-                return Err(ProduceError::Code {
-                    hash: ch,
-                    what: "empty bytecode under a non-empty hash",
-                });
+                return Err(ProduceError::Code { hash: ch, what: "empty bytecode under a non-empty hash" });
             }
             code_rows.insert(ch.0, bytes.clone());
         }
 
-        account_builder.push(path_of(&leaf.hashed), leaf.account.encode())?;
+        let path = path_of(&leaf.hashed);
+        while next_sealed < boundary.len() && boundary[next_sealed].0 < path {
+            let (p, node) = &boundary[next_sealed];
+            account_builder.push_sealed(*p, node.clone())?;
+            next_sealed += 1;
+        }
+        account_builder.push(path, leaf.account.encode())?;
+    }
+    for (p, node) in &boundary[next_sealed..] {
+        account_builder.push_sealed(*p, node.clone())?;
     }
     let (built, sink) = account_builder.finish();
     if let Some(e) = sink.err {
         return Err(e);
     }
     if built.root != head.state_root {
-        return Err(ProduceError::StateRoot {
-            expected: head.state_root,
-            got: built.root,
-        });
+        return Err(ProduceError::StateRoot { expected: head.state_root, got: built.root });
     }
     stats.account_nodes = built.nodes;
+    stats.sealed = built.sealed;
     stats.embedded += built.embedded;
     by_hash.append(&mut storage_by_hash);
     stats.code_entries = code_rows.len() as u64;
 
     // Key order. Positions are unique within a trie and owners separate
     // storage tries; the by-hash table deduplicates identical nodes.
-    account_rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    storage_rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    by_hash.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    account_rows.sort_unstable_by_key(|a| a.0);
+    storage_rows.sort_unstable_by_key(|a| a.0);
+    by_hash.sort_unstable_by_key(|a| a.0);
     by_hash.dedup_by(|a, b| a.0 == b.0);
     debug_assert!(account_rows.windows(2).all(|w| w[0].0 < w[1].0));
     debug_assert!(storage_rows.windows(2).all(|w| w[0].0 < w[1].0));
@@ -370,48 +332,32 @@ where
     fs::create_dir_all(&dir)?;
     fs::create_dir_all(root.join("blobs"))?;
     let mut tables = Vec::new();
-    let cfg = |table_id: u16| Config {
-        profile_id: profile_id(),
-        table_id,
-        value_size: 0,
-        epsilon,
-    };
+    let cfg = |table_id: u16| Config { profile_id: profile_id(), table_id, value_size: 0, epsilon };
 
-    let mut write_rows =
-        |table_id: u16, rows: &Rows, stats: &mut Stats| -> Result<(), ProduceError> {
-            if rows.is_empty() {
-                return Ok(());
-            }
-            let path = dir.join(TABLE_FILES[table_id as usize]);
-            let file = File::options()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&path)?;
-            let mut w =
-                Writer::with_format(file, cfg(table_id), Format::variable(), rows.len() as u64)?;
-            for (k, v) in rows {
-                w.push(Entry::value(*k, v.clone()))?;
-            }
-            let built = w.finish()?;
-            tables.push(TableRef {
-                table_id,
-                root: built.root,
-                page_count: built.page_count,
-                entry_count: built.entry_count,
-                epsilon_pages: epsilon,
-                model_bytes: built.layout.model_bytes as u32,
-                model_root: built.model_root,
-            });
-            stats.tables[table_id as usize] = Some(TableStats {
-                entries: built.entry_count,
-                pages: built.page_count,
-                model_bytes: built.layout.model_bytes,
-                file_bytes: built.layout.total_len,
-            });
-            Ok(())
-        };
+    let mut write_rows = |table_id: u16, rows: &Rows, stats: &mut Stats| -> Result<(), ProduceError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let path = dir.join(TABLE_FILES[table_id as usize]);
+        let file = File::options().read(true).write(true).create(true).truncate(true).open(&path)?;
+        let mut w = Writer::with_format(file, cfg(table_id), Format::variable(), rows.len() as u64)?;
+        for (k, v) in rows {
+            w.push(Entry::value(*k, v.clone()))?;
+        }
+        let built = w.finish()?;
+        tables.push(TableRef {
+            table_id,
+            root: built.root,
+            page_count: built.page_count,
+            entry_count: built.entry_count,
+            epsilon_pages: epsilon,
+            model_bytes: built.layout.model_bytes as u32,
+            model_root: built.model_root,
+        });
+        stats.tables[table_id as usize] =
+            Some(TableStats { entries: built.entry_count, pages: built.page_count, model_bytes: built.layout.model_bytes, file_bytes: built.layout.total_len });
+        Ok(())
+    };
     write_rows(TABLE_ACCOUNT_NODES, &account_rows, &mut stats)?;
     write_rows(TABLE_STORAGE_NODES, &storage_rows, &mut stats)?;
     write_rows(TABLE_NODES_BY_HASH, &by_hash, &mut stats)?;
@@ -419,18 +365,8 @@ where
     // Code: inline up to the threshold, a blob file above it.
     if !code_rows.is_empty() {
         let path = dir.join(TABLE_FILES[TABLE_CODE as usize]);
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
-        let mut w = Writer::with_format(
-            file,
-            cfg(TABLE_CODE),
-            Format::variable(),
-            code_rows.len() as u64,
-        )?;
+        let file = File::options().read(true).write(true).create(true).truncate(true).open(&path)?;
+        let mut w = Writer::with_format(file, cfg(TABLE_CODE), Format::variable(), code_rows.len() as u64)?;
         for (k, v) in &code_rows {
             if v.len() > CODE_BLOB_THRESHOLD {
                 let h = *blake3::hash(v).as_bytes();
@@ -451,12 +387,8 @@ where
             model_bytes: built.layout.model_bytes as u32,
             model_root: built.model_root,
         });
-        stats.tables[TABLE_CODE as usize] = Some(TableStats {
-            entries: built.entry_count,
-            pages: built.page_count,
-            model_bytes: built.layout.model_bytes,
-            file_bytes: built.layout.total_len,
-        });
+        stats.tables[TABLE_CODE as usize] =
+            Some(TableStats { entries: built.entry_count, pages: built.page_count, model_bytes: built.layout.model_bytes, file_bytes: built.layout.total_len });
     }
     tables.sort_by_key(|t| t.table_id);
 
@@ -470,19 +402,9 @@ where
         prefix: prefix.to_string(),
         tables,
     };
-    write_atomic(
-        &root.join(manifest_path(&head.block_hash)),
-        manifest.to_json().as_bytes(),
-    )?;
-    write_atomic(
-        &root.join(LATEST_FILE),
-        hex::encode(head.block_hash).as_bytes(),
-    )?;
-    Ok(Produced {
-        manifest,
-        stats,
-        dir,
-    })
+    write_atomic(&root.join(manifest_path(&head.block_hash)), manifest.to_json().as_bytes())?;
+    write_atomic(&root.join(LATEST_FILE), hex::encode(head.block_hash).as_bytes())?;
+    Ok(Produced { manifest, stats, dir })
 }
 
 /// Write to a temporary name and rename, so a reader never sees a partial

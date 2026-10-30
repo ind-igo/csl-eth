@@ -60,7 +60,7 @@ fn world(n: usize, seed: u64) -> World {
         }
         let hashed = B256::from(h);
         let mut storage: Vec<(B256, U256)> = Vec::new();
-        if i % 3 == 0 {
+        if i.is_multiple_of(3) {
             let slots = if i == 3 || i == 6 {
                 3000
             } else {
@@ -540,7 +540,10 @@ fn epsilon_against_requests_per_read() {
             "",
             w.accounts.iter().cloned(),
             &w.code,
-            csl_eth_store::ProduceOptions { epsilon: eps },
+            csl_eth_store::ProduceOptions {
+                epsilon: eps,
+                ..Default::default()
+            },
         )
         .unwrap();
         let mut snap = Snapshot::open(DirBucket::new(&dir), None, w.head.state_root).unwrap();

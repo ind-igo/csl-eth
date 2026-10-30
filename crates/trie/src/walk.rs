@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn empty_root_is_absent_without_a_fetch() {
-        let w = walk(EMPTY_ROOT_HASH, &Nibbles::unpack([0; 32]), &HashMap::new());
+        let w = walk(EMPTY_ROOT_HASH, &Nibbles::unpack([0; 32]), HashMap::new());
         assert_eq!(w.outcome, Outcome::Absent(AbsentBy::EmptyTrie));
         assert!(w.fetched.is_empty());
     }
@@ -206,7 +206,7 @@ mod tests {
             w.outcome,
             Outcome::Invalid(NodeKey::ROOT, Invalid::HashMismatch)
         );
-        let w = walk(b.root, &k, &HashMap::new());
+        let w = walk(b.root, &k, HashMap::new());
         assert_eq!(w.outcome, Outcome::Missing(NodeKey::ROOT));
     }
 }

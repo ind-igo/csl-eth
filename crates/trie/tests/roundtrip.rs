@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 type Leaves = Vec<(Nibbles, Vec<u8>)>;
 
 fn sorted(mut leaves: Leaves) -> Leaves {
-    leaves.sort_by(|a, b| a.0.cmp(&b.0));
+    leaves.sort_by_key(|a| a.0);
     leaves.dedup_by(|a, b| a.0 == b.0);
     leaves
 }

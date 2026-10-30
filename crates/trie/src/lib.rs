@@ -12,6 +12,8 @@
 //! - [`build`]: a streaming builder from sorted leaves that emits every
 //!   node the trie has (§5), not only the root. Embedded nodes (RLP shorter
 //!   than 32 bytes) live inside their parent and are not emitted.
+//! - [`range`]: snap range proofs checked by rebuilding, and the sealed
+//!   subtrees they yield so a slice builds up to `state_root`.
 //! - [`walk`]: the one verifier (§2). Hash nodes from `state_root` down to
 //!   a leaf or an empty branch slot; anything the files fail to provide is
 //!   `Missing`, never absence.
@@ -22,12 +24,14 @@
 
 pub mod build;
 pub mod key;
+pub mod range;
 pub mod value;
 pub mod walk;
 
 pub use alloy_primitives::{keccak256, B256, U256};
 pub use alloy_trie::{Nibbles, EMPTY_ROOT_HASH, KECCAK_EMPTY};
-pub use build::{BuildError, Builder, Built, Sink};
+pub use build::{BuildError, Builder, Built, Discard, Sink};
+pub use range::{proof_for, verify_range, ProofError, RangeError, Sealed, Verified};
 pub use key::{code_key, path_of, speculative_keys, NodeKey, TooDeep, MAX_DEPTH};
 pub use value::{decode_word, encode_word, Account, EMPTY_ROOT};
 pub use walk::{walk, AbsentBy, Invalid, NodeSource, Outcome, Walk};
