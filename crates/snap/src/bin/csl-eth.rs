@@ -50,6 +50,15 @@ enum Cmd {
         /// Pivot on this block hash instead of the first peer's head.
         #[arg(long)]
         pivot: Option<B256>,
+        /// Connect to peers first and pivot on the block hash this file
+        /// holds once it appears (for a fetch at a finalized root).
+        #[arg(long, conflicts_with = "pivot")]
+        pivot_file: Option<PathBuf>,
+        /// Connect to peers first and pivot on the block whose timestamp is
+        /// this (the first block of an epoch, so finality will name it), or
+        /// `next` for the next epoch boundary.
+        #[arg(long, conflicts_with_all = ["pivot", "pivot_file"])]
+        pivot_at: Option<String>,
         /// Give up after this many seconds (0: never).
         #[arg(long, default_value_t = 0)]
         max_secs: u64,
@@ -210,7 +219,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
     match Cli::parse().cmd {
-        Cmd::Fetch { prefix, out, peers, bytes, timeout_secs, udp_port, no_dns, no_discv4, pivot, max_secs } => {
+        Cmd::Fetch { prefix, out, peers, bytes, timeout_secs, udp_port, no_dns, no_discv4, pivot, pivot_file, pivot_at, max_secs } => {
+            let pivot_at = match pivot_at.as_deref() {
+                None => None,
+                Some("next") => {
+                    let chain = csl_eth_head::Chain::mainnet();
+                    let slot = csl_eth_head::current_slot(&chain, std::time::SystemTime::now());
+                    let boundary = (slot / 32 + 1) * 32;
+                    Some(chain.genesis_time + boundary * 12)
+                }
+                Some(s) => Some(s.parse::<u64>().map_err(|e| format!("--pivot-at: {e}"))?),
+            };
             let cfg = FetchConfig {
                 prefix: parse_prefix(&prefix)?,
                 peers,
@@ -220,6 +239,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 use_dns: !no_dns,
                 use_discv4: !no_discv4,
                 pivot,
+                pivot_file,
+                pivot_at,
                 max_wall: Duration::from_secs(max_secs),
                 ..Default::default()
             };

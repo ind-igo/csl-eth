@@ -251,6 +251,34 @@ impl Peer {
         }
     }
 
+    /// The header at `number` over `eth`, checked to carry that number.
+    /// Nothing proves it canonical; in epoch mode finality does, later.
+    pub async fn header_at(&mut self, number: u64) -> Result<Option<Header>, PeerError> {
+        let request_id = self.request_id();
+        let msg = EthMessage::<EthNetworkPrimitives>::GetBlockHeaders(RequestPair {
+            request_id,
+            message: GetBlockHeaders { start_block: number.into(), limit: 1, skip: 0, direction: HeadersDirection::Rising },
+        });
+        self.send_eth(msg).await?;
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            match self.next_before(deadline).await? {
+                Inbound::Eth(EthMessage::BlockHeaders(rp)) if rp.request_id == request_id => {
+                    let Some(h) = rp.message.0.into_iter().next() else {
+                        return Ok(None);
+                    };
+                    if h.number != number {
+                        return Err(PeerError::Protocol("header is not at the requested number"));
+                    }
+                    return Ok(Some(h));
+                }
+                Inbound::Eth(m) => self.service_eth(m).await?,
+                Inbound::Snap(m) => self.service_snap(m).await?,
+                Inbound::Ignored => {}
+            }
+        }
+    }
+
     /// The peer's own head header, from the hash in its status.
     pub async fn own_head(&mut self) -> Result<Option<Header>, PeerError> {
         let hash = self.status.blockhash;

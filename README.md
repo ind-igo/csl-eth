@@ -55,16 +55,38 @@ Cloudflare R2, read from Taipei through a VPN (one range request about
 105 ms), an account read is 829 ms sequential and 131 ms with the predicted
 pages ± 1 prefetched as merged ranges and the top four trie levels kept
 across reads: 3 requests, 37 KB (44 at p95), one round trip and a quarter.
-Numbers and reasoning in `docs/decisions.md`. Finding peers is the slow part: about one
-dial in a hundred is accepted.
+Numbers and reasoning in `docs/decisions.md`.
+
+The head is in, and the chain of trust closes on one block. `head/` holds
+the beacon light-client objects as files (bootstrap, period updates,
+finality update), verified offline with `helios-consensus-core` from one
+weak-subjectivity checkpoint root; forged or misplaced files are rejected
+with the step named (`crates/head/tests`). The client's `open_at_head`
+reads only at the finalized block's `state_root` and refuses a bucket with
+no snapshot there. The producer fetches at the epoch-boundary block as soon
+as it exists (`fetch --pivot-at next`), since that is the block finality
+will name 13 to 19 minutes later, and writes the head files once it does.
+Run live on 2026-10-31 from two machines at once: both pivoted on block
+26,311,778 and fetched the same slice (17 MB, 14 to 24 seconds of transfer,
+2 to 3 peers), the finality update named it, and `check --checkpoint`
+verified every sampled value through the head, locally and on R2 (head: 5
+requests, 117 KB once; then the same 3 requests and 37 KB per account read
+as before). Finding peers is the hard part: mainnet nodes are full, and about one dial in a hundred is accepted,
+most of those for under a minute.
+
+```
+./target/release/csl-eth head fetch --bucket data/bucket-fin          # bootstrap, updates, finality from a beacon node
+./target/release/csl-eth check --slice data/slice-fin --bucket data/bucket-fin --checkpoint 0x<root> --prefetch 1 --top-levels 4
+```
 
 ```
 ./target/release/csl-eth check --slice data/slice-1a7 --bucket data/bucket-1a7
 ./target/release/csl-eth check --slice data/slice-1a7 --url https://host/bucket --prefetch 1 --top-levels 4
 ```
 
-Not yet built, in order: the model section fetched by key (the per-snapshot
-budget for a following client), storage speculation in the account's round,
-the head verifier over bucket files
-(`helios-consensus-core`), the content-addressed baseline client, the
-milestone 1 workload and fault table.
+Not yet built, in order: a browser client (the read path made async, the
+same crates compiled to WASM, a page that reads R2 and verifies the head in
+the tab, so the demo is static files plus a browser), the model section
+fetched by key (the per-snapshot budget for a following client), storage
+speculation in the account's round, the content-addressed baseline client,
+the milestone 1 workload and fault table.

@@ -33,6 +33,7 @@ use alloy_primitives::{keccak256, B256, U256};
 use csl_eth_trie::{decode_word, verify_range, Account, Nibbles, Sealed, EMPTY_ROOT, KECCAK_EMPTY};
 use reth_network_peers::{NodeRecord, PeerId};
 use std::{
+    path::PathBuf,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -67,6 +68,19 @@ pub struct Config {
     pub use_discv4: bool,
     /// A block hash to pivot on instead of the first peer's head.
     pub pivot: Option<B256>,
+    /// Hold mode: connect to peers and keep them idle until this file holds
+    /// a block hash, then pivot on it. Finding peers takes minutes and snap
+    /// serves a root for about 128 blocks, so a fetch at a finalized root
+    /// (13 to 19 minutes old when it appears) cannot afford to start
+    /// dialling after the root is known.
+    pub pivot_file: Option<PathBuf>,
+    /// Epoch mode: pivot on the canonical block whose timestamp is this,
+    /// or on the last block before it when that slot was missed. The
+    /// finalized checkpoint is always the first block of an epoch, whose
+    /// time is known in advance, so the fetch can start the moment the
+    /// block exists, with the whole snap window ahead of it, and finality
+    /// confirms the hash 13 to 19 minutes later. Peers are held until then.
+    pub pivot_at: Option<u64>,
     /// Stop after this long without completing (0: never).
     pub max_wall: Duration,
 }
@@ -86,6 +100,8 @@ impl Default for Config {
             use_dns: true,
             use_discv4: true,
             pivot: None,
+            pivot_file: None,
+            pivot_at: None,
             max_wall: Duration::from_secs(0),
         }
     }
@@ -101,6 +117,8 @@ pub enum FetchError {
     CodeMissing(B256),
     #[error("{0}")]
     Other(String),
+    #[error("the pivot block went stale on every peer before the slice completed")]
+    PivotStale,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -115,6 +133,8 @@ struct Pivot {
 enum Job {
     /// Fetch a header: the peer's own head, or a given hash.
     Head(Option<B256>),
+    /// Fetch the header at a block number (epoch mode; finality confirms it).
+    HeadAt(u64),
     Accounts {
         sub: usize,
         origin: B256,
@@ -134,6 +154,10 @@ enum Job {
 pub type StorageTrie = (B256, B256, Vec<(B256, U256)>, Option<B256>);
 
 enum Done {
+    /// The pivot file named a block hash.
+    Pivot(B256),
+    /// Epoch mode: time to ask a peer where its head is.
+    Tick,
     Head {
         peer: PeerId,
         from_job: bool,
@@ -298,6 +322,40 @@ pub async fn fetch(cfg: Config) -> Result<Slice, FetchError> {
     if let Some(h) = cfg.pivot {
         co.push(Job::Head(Some(h))).await;
     }
+    if let Some(target) = cfg.pivot_at {
+        let tx = tx.clone();
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            info!(target, "holding peers until the block at the epoch boundary exists");
+            loop {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                if now > target {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs((target - now).clamp(1, 30))).await;
+            }
+            while !shared.finished.load(Ordering::Relaxed) {
+                if tx.send(Done::Tick).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(6)).await;
+            }
+        });
+    }
+    if let Some(path) = cfg.pivot_file.clone() {
+        let tx = tx.clone();
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            info!(path = %path.display(), "holding peers until the pivot file names a block hash");
+            while !shared.finished.load(Ordering::Relaxed) {
+                if let Some(h) = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<B256>().ok()) {
+                    let _ = tx.send(Done::Pivot(h)).await;
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+    }
     let result = loop {
         let timeout = if cfg.max_wall.is_zero() { Duration::from_secs(3600 * 24) } else { cfg.max_wall.saturating_sub(started.elapsed()) };
         if timeout.is_zero() {
@@ -342,6 +400,10 @@ struct Coordinator {
     peers_seen: HashSet<PeerId>,
     repivots: u64,
     waiting_for_head: bool,
+    /// Epoch mode: the highest header seen before the boundary, and
+    /// whether a head job is queued or running.
+    below: Option<Header>,
+    head_job_out: bool,
 }
 
 impl Coordinator {
@@ -375,6 +437,8 @@ impl Coordinator {
             peers_seen: HashSet::new(),
             repivots: 0,
             waiting_for_head: true,
+            below: None,
+            head_job_out: false,
         }
     }
 
@@ -422,6 +486,50 @@ impl Coordinator {
         self.push(Job::Head(None)).await;
     }
 
+    fn now_secs() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    }
+
+    /// Epoch mode: one header closer to the block at `target`. Below it,
+    /// remember the header and ask for the next block once it is due;
+    /// above it, step back by the slot distance; the block before a missed
+    /// boundary slot is the pivot when the one after it is seen.
+    async fn epoch_step(&mut self, h: &Header, target: u64) {
+        if h.number < peer::FORK_HEAD_NUMBER {
+            // A syncing peer, or one announcing genesis: nothing to step from.
+            return;
+        }
+        if h.timestamp == target {
+            info!(number = h.number, "block at the epoch boundary");
+            self.set_pivot(h).await;
+        } else if h.timestamp < target {
+            if self.below.as_ref().is_none_or(|b| b.number < h.number) {
+                self.below = Some(h.clone());
+            }
+            if Self::now_secs() > target {
+                // Jump by the slot distance; the last step is one block.
+                self.ask_head_at(h.number + ((target - h.timestamp) / 12).max(1)).await;
+            }
+        } else {
+            if let Some(b) = self.below.clone() {
+                if b.number + 1 == h.number {
+                    info!(number = b.number, "epoch boundary slot missed; the block before it is the checkpoint");
+                    self.set_pivot(&b).await;
+                    return;
+                }
+            }
+            let back = ((h.timestamp - target) / 12).max(1);
+            self.ask_head_at(h.number.saturating_sub(back)).await;
+        }
+    }
+
+    async fn ask_head_at(&mut self, n: u64) {
+        if !self.head_job_out {
+            self.head_job_out = true;
+            self.push_front(Job::HeadAt(n)).await;
+        }
+    }
+
     async fn flush_storage(&mut self, all: bool) {
         while self.storage_want.len() >= self.cfg.storage_batch || (all && !self.storage_want.is_empty()) {
             let n = self.storage_want.len().min(self.cfg.storage_batch);
@@ -446,6 +554,31 @@ impl Coordinator {
     async fn handle(&mut self, done: Done) -> Result<bool, FetchError> {
         let mut job_finished = true;
         match done {
+            Done::Pivot(h) => {
+                job_finished = false;
+                info!(hash = %h, peers = self.shared.connected.load(Ordering::Relaxed), "pivot file read; asking peers for the header");
+                self.cfg.pivot = Some(h);
+                self.push(Job::Head(Some(h))).await;
+            }
+            Done::Tick => {
+                job_finished = false;
+                if self.waiting_for_head && !self.head_job_out && self.shared.connected.load(Ordering::Relaxed) > 0 {
+                    self.head_job_out = true;
+                    self.push_front(Job::Head(None)).await;
+                }
+            }
+            Done::Head { peer, from_job, header } if self.cfg.pivot_at.is_some() => {
+                self.peers_seen.insert(peer);
+                job_finished = from_job;
+                if from_job {
+                    self.head_job_out = false;
+                }
+                let target = self.cfg.pivot_at.unwrap_or_default();
+                info!(peer = %peer, number = header.number, timestamp = header.timestamp, target, "peer head");
+                if self.waiting_for_head {
+                    self.epoch_step(&header, target).await;
+                }
+            }
             Done::Head { peer, from_job, header } => {
                 self.peers_seen.insert(peer);
                 job_finished = from_job;
@@ -454,6 +587,8 @@ impl Coordinator {
                 // block, and nobody serves snap for those roots.
                 let wanted = match self.cfg.pivot {
                     Some(h) => header.hash_slow() == h,
+                    // Holding for the pivot file: no peer's head will do.
+                    None if self.cfg.pivot_file.is_some() => false,
                     None => {
                         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
                         header.number >= peer::FORK_HEAD_NUMBER && header.timestamp + MAX_PIVOT_AGE_SECS >= now
@@ -563,7 +698,13 @@ impl Coordinator {
                 let three_stale =
                     self.stale_peers.len() >= 3 || (!self.stale_peers.is_empty() && self.stale_peers.len() >= self.shared.connected.load(Ordering::Relaxed));
                 if stale && self.pivot.is_some() && three_stale {
+                    if self.cfg.pivot_at.is_some() || self.cfg.pivot_file.is_some() {
+                        return Err(FetchError::PivotStale);
+                    }
                     self.repivot().await;
+                } else if matches!(job, Job::HeadAt(_) | Job::Head(None)) && self.cfg.pivot_at.is_some() {
+                    // Not there yet, or not on this peer; the next tick asks again.
+                    self.head_job_out = false;
                 } else {
                     self.push_front(job).await;
                 }
@@ -703,6 +844,10 @@ async fn run_job(peer: &mut Peer, job: &Job, pivot: Option<Pivot>, cfg: &Config)
                 None => Err(Fail { stale: false, fatal: false, err: "peer has no such header".into() }),
             }
         }
+        Job::HeadAt(n) => match peer.header_at(*n).await? {
+            Some(h) => Ok(Done::Head { peer: peer.id(), from_job: true, header: Box::new(h) }),
+            None => Err(Fail { stale: false, fatal: false, err: "peer has no header at that number".into() }),
+        },
         Job::Accounts { sub, origin, limit } => {
             let p = pivot.ok_or_else(no_pivot)?;
             let resp = peer.account_range(p.state_root, *origin, *limit, cfg.response_bytes).await?;
