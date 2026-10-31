@@ -31,7 +31,7 @@ cargo build --release -p csl-eth-snap
 ./target/release/csl-eth build --slice data/slice-1a7 --out data/bucket-1a7
 ```
 
-## Status (2026-10-30)
+## Status (2026-10-31)
 
 Built and tested end to end on synthetic state (3,000 accounts, 1,000
 storage tries, code inline and as blobs, a crafted extension): every
@@ -50,16 +50,20 @@ absence proven inside the prefix, `Insufficient` outside. On the wire
 (`check --url`, a bucket behind HTTP) an account read at ε = 1 is 6.7
 range requests and 27 KB, or one round of 12 requests and 48 KB with the
 predicted page and its neighbours prefetched; the table's pre-order puts a
-path's deeper nodes on the same pages. Measured on loopback so far; the
-remote host is next. Numbers and reasoning in `docs/decisions.md`. Finding
-peers is the slow part: about one dial in a hundred is accepted.
+path's deeper nodes on the same pages. Against the same bucket on
+Cloudflare R2, read from Taipei through a VPN (one range request about
+110 ms), an account read is 829 ms sequential, 286 ms with the predicted
+pages prefetched, 179 ms at ± 1: one parallel round, 50 KB. Numbers and
+reasoning in `docs/decisions.md`. Finding peers is the slow part: about one
+dial in a hundred is accepted.
 
 ```
 ./target/release/csl-eth check --slice data/slice-1a7 --bucket data/bucket-1a7
 ./target/release/csl-eth check --slice data/slice-1a7 --url http://host/bucket --prefetch 1
 ```
 
-Not yet built, in order: the head verifier over bucket files
-(`helios-consensus-core`), an HTTP range `Bucket` and the remote-host
-measurement, the content-addressed baseline client, the milestone 1
-workload and fault table.
+Not yet built, in order: a two-page range per prediction and HTTP/2 (fewer
+requests and connections per round), the model section fetched by key, the
+top levels kept across reads, the head verifier over bucket files
+(`helios-consensus-core`), the content-addressed baseline client, the
+milestone 1 workload and fault table.
