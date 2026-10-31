@@ -14,6 +14,7 @@ csl-eth-trie = { path = "../trie" }
 csl-eth-store = { path = "../store" }
 csl-eth-client = { path = "../client", features = ["http"] }
 csl-eth-head = { path = "../head", features = ["fetch"] }
+csl-run.workspace = true
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-rlp.workspace = true
 alloy-trie.workspace = true
@@ -36,6 +37,10 @@ tokio-stream = "0.1"
 futures = "0.3"
 bytes = "1"
 rand.workspace = true
+rand_chacha.workspace = true
+# The workload's optional oracle: JSON-RPC `eth_getProof` at the slice's
+# block, scoring reads of the keys whose preimage is known.
+ureq = "3"
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true

@@ -1578,9 +1578,11 @@ dependencies = [
  "csl-eth-head",
  "csl-eth-store",
  "csl-eth-trie",
+ "csl-run",
  "futures",
  "hex",
  "rand 0.9.5",
+ "rand_chacha 0.9.0",
  "reth-chainspec",
  "reth-discv4",
  "reth-dns-discovery",
@@ -1598,6 +1600,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]
