@@ -1,16 +1,25 @@
 //! The client, profile §2: one speculative round, the walk, repair rounds,
 //! and nothing accepted that does not hash to `state_root`.
 //!
-//! The caller supplies the `state_root` it verified (from the head files in
-//! milestone 2; a supplied checkpoint in milestone 1). The snapshot's
-//! manifest says which root its files claim to serve, and the client
-//! refuses to open a snapshot for a different root rather than silently
-//! walking files that cannot match.
+//! The caller supplies the `state_root` it verified (from the head files;
+//! a supplied checkpoint in tests). The snapshot's manifest says which
+//! root its files claim to serve, and the client refuses to open a
+//! snapshot for a different root rather than silently walking files that
+//! cannot match.
 //!
 //! Every read returns `Verified`, `VerifiedAbsent` (proven by the trie's
 //! shape) or `Insufficient` (something was missing or wrong), with the
 //! requests, bytes and rounds it took. Fences, models, tombstones and
 //! missing files never become absence.
+//!
+//! The client does no I/O (see [`store`]): `try_account` and its siblings
+//! compute over what the [`Store`] holds and return [`Pending`] with the
+//! round's wants noted when they need more; `account` and its siblings
+//! drive that loop with the snapshot's [`Driver`]. A round's wants are
+//! the pages the model predicts for every depth the walk may touch,
+//! widened by the [`Hint`], and later rounds carry only what the walk
+//! found missing, so a read is one round trip when the prediction holds
+//! and one more per miss, however many pages each round has.
 
 use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{Nibbles, EMPTY_ROOT_HASH, KECCAK_EMPTY};
@@ -18,87 +27,22 @@ use csl_eth_store::{
     blob_path, manifest_path, table_path, Manifest, D_ACCOUNT, D_STORAGE, LATEST_FILE,
     TABLE_ACCOUNT_NODES, TABLE_CODE, TABLE_COUNT, TABLE_STORAGE_NODES,
 };
-use csl_eth_trie::{
-    decode_word, path_of, walk, AbsentBy, Account, Invalid, NodeKey, NodeSource, Outcome,
-};
-use csl_run::{Format, Reader, Source};
+use csl_eth_trie::{decode_word, path_of, walk, AbsentBy, Account, Invalid, NodeKey, Outcome};
+use csl_run::{Format, Reader};
 use std::{collections::HashMap, fmt, sync::Arc};
+
+pub mod store;
+#[cfg(not(target_arch = "wasm32"))]
+pub use store::DirDriver;
+pub use store::{drive, is_pending, Driver, Got, NoDriver, Pending, RunView, Store, Want, PENDING};
 
 #[cfg(feature = "http")]
 pub mod http;
 #[cfg(feature = "http")]
-pub use http::HttpBucket;
+pub use http::HttpDriver;
 
 pub mod head;
-pub use head::{open_at_head, HeadOpenError, VerifiedHead};
-
-/// Where the files are. Runs are read by byte range through
-/// [`csl_run::Source`]; manifests, `latest` and blobs are read whole.
-pub trait Bucket {
-    type Run: Source + Prefetch;
-    fn open_run(&self, rel: &str) -> Result<Self::Run, String>;
-    fn read_file(&self, rel: &str) -> Result<Vec<u8>, String>;
-    /// `Ok(None)` when the file is not there, as distinct from a failure to
-    /// read it; the head verifier treats the two differently.
-    fn read_file_opt(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
-        self.read_file(rel).map(Some)
-    }
-}
-
-/// A hint a source may act on: these byte ranges are about to be read, in
-/// no particular order, so a remote source fetches them now in parallel
-/// and serves the reads that follow from what came back. One speculative
-/// round is one `prefetch` call. A local source ignores it.
-pub trait Prefetch {
-    fn prefetch(&self, _ranges: &[(u64, usize)]) {}
-    /// A read is starting: drop whatever the last one fetched. What a
-    /// source keeps is one read's pages, never a cache across reads, so
-    /// every read is measured and verified on its own.
-    fn forget(&self) {}
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Prefetch for std::fs::File {}
-
-/// A source the snapshot and its reader both hold: the reader reads
-/// through it, the snapshot hands it prefetch hints.
-pub struct Shared<S>(pub Arc<S>);
-
-impl<S: Source> Source for Shared<S> {
-    fn read_at(&self, off: u64, len: usize) -> Result<Vec<u8>, csl_run::Error> {
-        self.0.read_at(off, len)
-    }
-}
-
-/// A directory on disk (the producer's output, or a mirror). Not on wasm,
-/// where there is no file system and `csl_run` has no `Source` for `File`.
-#[cfg(not(target_arch = "wasm32"))]
-pub struct DirBucket(pub std::path::PathBuf);
-
-#[cfg(not(target_arch = "wasm32"))]
-impl DirBucket {
-    pub fn new(p: impl AsRef<std::path::Path>) -> DirBucket {
-        DirBucket(p.as_ref().to_path_buf())
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Bucket for DirBucket {
-    type Run = std::fs::File;
-    fn open_run(&self, rel: &str) -> Result<std::fs::File, String> {
-        std::fs::File::open(self.0.join(rel)).map_err(|e| format!("{rel}: {e}"))
-    }
-    fn read_file(&self, rel: &str) -> Result<Vec<u8>, String> {
-        std::fs::read(self.0.join(rel)).map_err(|e| format!("{rel}: {e}"))
-    }
-    fn read_file_opt(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
-        match std::fs::read(self.0.join(rel)) {
-            Ok(v) => Ok(Some(v)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("{rel}: {e}")),
-        }
-    }
-}
+pub use head::{open_at_head, HeadOpenError, HeadOpener, VerifiedHead};
 
 /// Why a read could not be answered. None of these is evidence of absence.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,38 +113,38 @@ impl<T> Read<T> {
     pub fn is_insufficient(&self) -> bool {
         matches!(self, Read::Insufficient(_))
     }
+    fn map<U>(self, f: impl FnOnce(T) -> Read<U>) -> Read<U> {
+        match self {
+            Read::Verified(v) => f(v),
+            Read::VerifiedAbsent(b) => Read::VerifiedAbsent(b),
+            Read::Insufficient(r) => Read::Insufficient(r),
+        }
+    }
 }
 
 /// What one read cost.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cost {
-    /// Range requests for records and model sections.
+    /// Requests the host made: one per want of every round, merged ranges
+    /// counting once.
     pub requests: u64,
     pub bytes: u64,
-    /// Dependent network rounds: the speculative round plus one per repair.
+    /// Dependent network rounds: the speculative round plus one per round
+    /// of misses. Zero when every node came from the cache.
     pub rounds: u32,
+    /// Nodes the speculative round missed and a later round fetched.
     pub repairs: u32,
     /// Trie nodes decoded on the final walk(s).
     pub nodes: usize,
-}
-
-impl Cost {
-    fn add(&mut self, o: Cost) {
-        self.requests += o.requests;
-        self.bytes += o.bytes;
-        self.rounds += o.rounds;
-        self.repairs += o.repairs;
-        self.nodes += o.nodes;
-    }
 }
 
 /// Repairs a single read may take: one per node the speculative round
 /// missed, bounded by the walk's own node limit.
 pub const MAX_REPAIRS: u32 = csl_eth_trie::MAX_WALK_NODES as u32;
 
-/// How a speculative round is hinted to the source: the predicted page of
-/// every depth, widened `below` and `above` pages, and whether pages that
-/// touch are asked for as one range (one request) or one each.
+/// How a round is widened: the predicted page of every depth, `below` and
+/// `above` pages each side, and whether pages that touch are asked for as
+/// one range (one request) or one each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hint {
     pub below: u64,
@@ -217,18 +161,166 @@ impl Hint {
             merge: true,
         }
     }
+
+    /// The predicted pages only, touching pages merged.
+    pub fn none() -> Hint {
+        Hint::symmetric(0)
+    }
 }
 
-pub struct Snapshot<B: Bucket> {
-    bucket: B,
+impl Default for Hint {
+    fn default() -> Hint {
+        Hint::none()
+    }
+}
+
+/// Which snapshot to open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum At {
+    /// The one `latest` names.
+    Latest,
+    Block(B256),
+}
+
+/// A snapshot being opened: the manifest, then every table's model, each
+/// a round.
+pub struct Opener<D> {
+    driver: Option<D>,
+    store: Arc<Store>,
+    at: At,
+    state_root: B256,
+}
+
+impl<D: Driver> Opener<D> {
+    pub fn new(driver: D, store: Arc<Store>, at: At, state_root: B256) -> Opener<D> {
+        Opener {
+            driver: Some(driver),
+            store,
+            at,
+            state_root,
+        }
+    }
+
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
+    /// One synchronous round through the driver.
+    pub fn round(&self) {
+        if let Some(d) = &self.driver {
+            drive(d, &self.store, true);
+        }
+    }
+
+    /// Open from what the store holds, or `Pending` with the next round
+    /// wanted. `Ok(Err)` is a refusal: the snapshot is not there, or not
+    /// at the caller's root.
+    pub fn try_open(&mut self) -> Result<Result<Snapshot<D>, String>, Pending> {
+        let hash = match self.at {
+            At::Block(h) => h,
+            At::Latest => match self.store.file(LATEST_FILE)? {
+                Ok(Some(s)) => {
+                    let s = match String::from_utf8(s) {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Err(e.to_string())),
+                    };
+                    match hex::decode(s.trim())
+                        .ok()
+                        .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                        .map(B256::from)
+                    {
+                        Some(h) => h,
+                        None => return Ok(Err("latest is not a block hash".into())),
+                    }
+                }
+                Ok(None) => return Ok(Err("no latest file".into())),
+                Err(e) => return Ok(Err(e)),
+            },
+        };
+        let manifest = match self.store.file(&manifest_path(&hash))? {
+            Ok(Some(m)) => match Manifest::from_json(&m) {
+                Ok(m) => m,
+                Err(e) => return Ok(Err(e.to_string())),
+            },
+            Ok(None) => return Ok(Err(format!("no snapshot at {hash}"))),
+            Err(e) => return Ok(Err(e)),
+        };
+        if manifest.block_hash != hash {
+            return Ok(Err("manifest names a different block".into()));
+        }
+        if manifest.state_root != self.state_root {
+            return Ok(Err(format!(
+                "snapshot claims state_root {}, caller verified {}",
+                manifest.state_root, self.state_root
+            )));
+        }
+        // Every table's model in one round: each is a range the store may
+        // lack, and a reader's `load_model` is the read that wants it. A
+        // table that fails here (a model that does not hash, a truncated
+        // file) does not refuse the snapshot: its reads are `Insufficient`
+        // with that reason, and the other tables still serve.
+        let mut readers = Vec::with_capacity(TABLE_COUNT);
+        let mut pending = false;
+        for t in 0..TABLE_COUNT as u16 {
+            let Some(tr) = manifest.table(t) else {
+                readers.push(Err(Reason::NoTable(t)));
+                continue;
+            };
+            let view = RunView {
+                store: self.store.clone(),
+                rel: table_path(&hash, t),
+            };
+            let broken = |e: csl_run::Error| Reason::Run {
+                table: t,
+                error: e.to_string(),
+            };
+            let mut reader = match Reader::try_with_format(
+                view,
+                tr.run_ref(manifest.block_number),
+                Format::variable(),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    readers.push(Err(broken(e)));
+                    continue;
+                }
+            };
+            match reader.load_model() {
+                Ok(_) => readers.push(Ok(reader)),
+                Err(e) if is_pending(&e) => {
+                    pending = true;
+                    readers.push(Ok(reader));
+                }
+                Err(e) => readers.push(Err(broken(e))),
+            }
+        }
+        if pending {
+            return Err(Pending);
+        }
+        let driver = self.driver.take().expect("opened once");
+        Ok(Ok(Snapshot {
+            driver,
+            store: self.store.clone(),
+            manifest,
+            readers,
+            d_account: D_ACCOUNT,
+            d_storage: D_STORAGE,
+            hint: Hint::default(),
+            top_levels: 0,
+            top: HashMap::new(),
+        }))
+    }
+}
+
+pub struct Snapshot<D> {
+    driver: D,
+    store: Arc<Store>,
     manifest: Manifest,
-    tables: Vec<Option<Reader<Shared<B::Run>>>>,
-    sources: Vec<Option<Arc<B::Run>>>,
+    readers: Vec<Result<Reader<RunView>, Reason>>,
     pub d_account: usize,
     pub d_storage: usize,
-    /// Before a speculative round, hint the table's source with the pages
-    /// the model predicts (`None`: no hint, the reader fetches as it walks).
-    pub prefetch: Option<Hint>,
+    /// How each round is widened around the predicted pages.
+    pub hint: Hint,
     /// Account-trie nodes at depths below this are kept across reads of
     /// this snapshot once a verified walk has passed them, and neither
     /// hinted nor fetched again (`0`: off). Every block rewrites the top of
@@ -239,67 +331,26 @@ pub struct Snapshot<B: Bucket> {
     top: HashMap<NodeKey, Option<Vec<u8>>>,
 }
 
-impl<B: Bucket> Snapshot<B> {
+/// Nodes fetched so far, by position.
+type Nodes = HashMap<NodeKey, Vec<u8>>;
+
+impl<D: Driver> Snapshot<D> {
     /// Open the snapshot at `block_hash` (the newest when `None`) and
     /// require that it claims `state_root`, the root the caller verified.
+    /// Synchronous: the driver fetches each round.
     pub fn open(
-        bucket: B,
+        driver: D,
         block_hash: Option<B256>,
         state_root: B256,
-    ) -> Result<Snapshot<B>, String> {
-        let hash = match block_hash {
-            Some(h) => h,
-            None => {
-                let s = bucket.read_file(LATEST_FILE)?;
-                let s = String::from_utf8(s).map_err(|e| e.to_string())?;
-                hex::decode(s.trim())
-                    .ok()
-                    .and_then(|v| <[u8; 32]>::try_from(v).ok())
-                    .map(B256::from)
-                    .ok_or("latest is not a block hash")?
+    ) -> Result<Snapshot<D>, String> {
+        let at = block_hash.map_or(At::Latest, At::Block);
+        let mut o = Opener::new(driver, Store::new(), at, state_root);
+        loop {
+            match o.try_open() {
+                Ok(r) => return r,
+                Err(Pending) => o.round(),
             }
-        };
-        let manifest = Manifest::from_json(&bucket.read_file(&manifest_path(&hash))?)
-            .map_err(|e| e.to_string())?;
-        if manifest.block_hash != hash {
-            return Err("manifest names a different block".into());
         }
-        if manifest.state_root != state_root {
-            return Err(format!(
-                "snapshot claims state_root {}, caller verified {}",
-                manifest.state_root, state_root
-            ));
-        }
-        let mut tables = Vec::with_capacity(TABLE_COUNT);
-        let mut sources = Vec::with_capacity(TABLE_COUNT);
-        for t in 0..TABLE_COUNT as u16 {
-            let (r, src) = match manifest.table(t) {
-                Some(tr) => {
-                    let src = Arc::new(bucket.open_run(&table_path(&hash, t))?);
-                    let reader = Reader::try_with_format(
-                        Shared(src.clone()),
-                        tr.run_ref(manifest.block_number),
-                        Format::variable(),
-                    )
-                    .map_err(|e| format!("table {t}: {e}"))?;
-                    (Some(reader), Some(src))
-                }
-                None => (None, None),
-            };
-            tables.push(r);
-            sources.push(src);
-        }
-        Ok(Snapshot {
-            bucket,
-            manifest,
-            tables,
-            sources,
-            d_account: D_ACCOUNT,
-            d_storage: D_STORAGE,
-            prefetch: None,
-            top_levels: 0,
-            top: HashMap::new(),
-        })
     }
 
     pub fn manifest(&self) -> &Manifest {
@@ -310,27 +361,59 @@ impl<B: Bucket> Snapshot<B> {
         self.manifest.state_root
     }
 
-    /// Cumulative request statistics per table.
-    pub fn stats(&self, table: u16) -> Option<&csl_run::Stats> {
-        self.tables[table as usize].as_ref().map(|r| &r.stats)
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
     }
 
-    fn requests_so_far(&self) -> (u64, u64) {
-        self.tables.iter().flatten().fold((0, 0), |(r, b), t| {
-            (
-                r + t.stats.record_requests + t.stats.model_requests,
-                b + t.stats.record_bytes,
-            )
-        })
+    pub fn driver(&self) -> &D {
+        &self.driver
     }
 
-    /// Fetch one table key; `Ok(None)` when the table's page for it holds
-    /// no such entry (which the walk will report as `Missing`).
-    fn fetch(&mut self, table: u16, key: &[u8; 32]) -> Result<Option<Vec<u8>>, Reason> {
-        let Some(r) = self.tables[table as usize].as_mut() else {
-            return Err(Reason::NoTable(table));
+    /// A read is starting: the store drops the last read's pages. The
+    /// `try_` methods compute from the store; call this before the first
+    /// attempt of a read, not between its rounds.
+    pub fn begin_read(&self) {
+        self.store.begin_read();
+    }
+
+    /// One synchronous round through the driver.
+    pub fn round(&self) {
+        drive(&self.driver, &self.store, self.hint.merge);
+    }
+
+    fn run<T>(&mut self, mut f: impl FnMut(&mut Self) -> Result<T, Pending>) -> T {
+        self.begin_read();
+        loop {
+            match f(self) {
+                Ok(v) => return v,
+                Err(Pending) => self.round(),
+            }
+        }
+    }
+
+    fn cost(&self, repairs: u32, nodes: usize) -> Cost {
+        let (requests, bytes, rounds) = self.store.cost();
+        Cost {
+            requests,
+            bytes,
+            rounds,
+            repairs,
+            nodes,
+        }
+    }
+
+    /// One table key from the store: `Ok(None)` when the table's page for
+    /// it holds no such entry (which the walk will report as `Missing`).
+    fn fetch(
+        &mut self,
+        table: u16,
+        key: &[u8; 32],
+    ) -> Result<Result<Option<Vec<u8>>, Reason>, Pending> {
+        let r = match self.readers[table as usize].as_mut() {
+            Ok(r) => r,
+            Err(why) => return Ok(Err(why.clone())),
         };
-        match r.get_entry(key) {
+        Ok(match r.get_entry(key) {
             Ok((Some(e), _)) if e.tag == 0 => Ok(Some(e.value)),
             Ok((Some(_), _)) => Err(Reason::Invalid {
                 table,
@@ -338,30 +421,20 @@ impl<B: Bucket> Snapshot<B> {
                 what: Invalid::Rlp,
             }),
             Ok((None, _)) => Ok(None),
+            Err(e) if is_pending(&e) => return Err(Pending),
             Err(e) => Err(Reason::Run {
                 table,
                 error: e.to_string(),
             }),
-        }
+        })
     }
 
-    /// One read's pages are kept by a remote source for that read only.
-    fn begin_read(&self) {
-        for src in self.sources.iter().flatten() {
-            src.forget();
-        }
-    }
-
-    /// Hand the table's source the byte ranges of the pages the model
-    /// predicts for `keys`, widened as the hint says. Pages that touch are
-    /// one range when the hint merges: the depths of one path share pages
-    /// in a pre-order table, so a read's pages come in a few runs. Errors
-    /// here are not errors: the reads that follow report them.
-    fn hint(&mut self, table: u16, keys: &[[u8; 32]], h: Hint) {
-        let (Some(reader), Some(src)) = (
-            self.tables[table as usize].as_mut(),
-            self.sources[table as usize].as_ref(),
-        ) else {
+    /// Want the pages the model predicts for `keys`, widened as the hint
+    /// says, so the round fetches them together with whatever else it
+    /// finds missing. Pages the store holds are not wanted again.
+    fn want_pages(&mut self, table: u16, keys: &[[u8; 32]]) {
+        let h = self.hint;
+        let Ok(reader) = self.readers[table as usize].as_mut() else {
             return;
         };
         let Some(layout) = reader.layout().copied() else {
@@ -370,27 +443,18 @@ impl<B: Bucket> Snapshot<B> {
         let Ok(model) = reader.load_model() else {
             return;
         };
-        let mut pages = Vec::with_capacity(keys.len() * (h.below + h.above + 1) as usize);
+        let rel = table_path(&self.manifest.block_hash, table);
+        let len = layout.record_bytes as usize;
         for k in keys {
             let p = model.predict(csl_run::k64(k));
             let lo = p.saturating_sub(h.below).max(1);
             let hi = (p + h.above).min(layout.page_count);
-            pages.extend(lo..=hi);
-        }
-        pages.sort_unstable();
-        pages.dedup();
-        let len = layout.record_bytes as usize;
-        let mut ranges: Vec<(u64, usize)> = Vec::with_capacity(pages.len());
-        for q in pages {
-            let Some(off) = layout.checked_record_off(q) else {
-                continue;
-            };
-            match ranges.last_mut() {
-                Some((o, l)) if h.merge && *o + *l as u64 == off => *l += len,
-                _ => ranges.push((off, len)),
+            for q in lo..=hi {
+                if let Some(off) = layout.checked_record_off(q) {
+                    self.store.want_range(&rel, off, len);
+                }
             }
         }
-        src.prefetch(&ranges);
     }
 
     /// The cached answer for an account-trie node, when the cache applies.
@@ -405,25 +469,40 @@ impl<B: Bucket> Snapshot<B> {
     /// After a verified walk: every node (and every gap) above the deepest
     /// node fetched lies on the path and was hashed by the walk, so those
     /// at the cached depths are kept for the snapshot's later reads.
-    fn top_keep<F: Fn(&NodeKey) -> [u8; 32]>(
-        &mut self,
-        path: &Nibbles,
-        nodes: &Nodes<'_, F>,
-        max_depth: usize,
-    ) {
-        let Some(leaf) = nodes.map.keys().map(NodeKey::depth).max() else {
+    fn top_keep(&mut self, path: &Nibbles, nodes: &Nodes, max_depth: usize) {
+        let Some(leaf) = nodes.keys().map(NodeKey::depth).max() else {
             return;
         };
         for d in 0..leaf.min(self.top_levels).min(max_depth + 1) {
             let nk = NodeKey::prefix(path, d);
             self.top
                 .entry(nk)
-                .or_insert_with(|| nodes.map.get(&nk).cloned());
+                .or_insert_with(|| nodes.get(&nk).cloned());
         }
     }
 
+    /// The depths of `path` the speculative round asks `table` for: every
+    /// depth up to `max_depth` the cache does not answer.
+    fn speculative(&self, path: &Nibbles, max_depth: usize, cache: bool) -> (Vec<NodeKey>, Nodes) {
+        let mut wanted = Vec::with_capacity(max_depth + 1);
+        let mut nodes = Nodes::new();
+        for d in 0..=max_depth {
+            let nk = NodeKey::prefix(path, d);
+            match self.top_get(cache, &nk) {
+                Some(Some(v)) => {
+                    nodes.insert(nk, v.clone());
+                }
+                Some(None) => {}
+                None => wanted.push(nk),
+            }
+        }
+        (wanted, nodes)
+    }
+
     /// The walk of profile §2 over `table`: speculate `0..=max_depth`,
-    /// walk, repair until the trie answers.
+    /// walk, repair until the trie answers. `Pending` when the round needs
+    /// pages; the next attempt starts over from the store, which now has
+    /// them.
     fn walk_table(
         &mut self,
         table: u16,
@@ -432,67 +511,62 @@ impl<B: Bucket> Snapshot<B> {
         key_of: impl Fn(&NodeKey) -> [u8; 32],
         max_depth: usize,
         cache: bool,
-    ) -> (Read<Vec<u8>>, Cost) {
-        let mut cost = Cost::default();
+    ) -> Result<(Read<Vec<u8>>, u32, usize), Pending> {
         if root == EMPTY_ROOT_HASH {
-            return (Read::VerifiedAbsent(AbsentBy::EmptyTrie), cost);
+            return Ok((Read::VerifiedAbsent(AbsentBy::EmptyTrie), 0, 0));
         }
-        self.begin_read();
-        let (r0, b0) = self.requests_so_far();
-        let mut nodes: Nodes<_> = Nodes {
-            map: HashMap::new(),
-            key_of: &key_of,
-        };
-        // Speculative round: every depth not already known from the cache,
-        // errors deferred to the repair that would need the node.
-        cost.rounds = 1;
-        let mut wanted: Vec<NodeKey> = Vec::with_capacity(max_depth + 1);
-        for d in 0..=max_depth {
-            let nk = NodeKey::prefix(path, d);
-            match self.top_get(cache, &nk) {
-                Some(Some(v)) => {
-                    nodes.map.insert(nk, v.clone());
+        let (wanted, mut nodes) = self.speculative(path, max_depth, cache);
+        let keys: Vec<[u8; 32]> = wanted.iter().map(&key_of).collect();
+        self.want_pages(table, &keys);
+        // Every depth of the round, errors deferred to the repair that
+        // would need the node; a depth the store cannot answer yet does
+        // not stop the others from being wanted in the same round.
+        let mut pending = false;
+        for (nk, tk) in wanted.into_iter().zip(&keys) {
+            match self.fetch(table, tk) {
+                Ok(Ok(Some(v))) => {
+                    nodes.insert(nk, v);
                 }
-                Some(None) => {}
-                None => wanted.push(nk),
+                Ok(_) => {}
+                Err(Pending) => pending = true,
             }
         }
-        if let Some(h) = self.prefetch {
-            let keys: Vec<[u8; 32]> = wanted.iter().map(&key_of).collect();
-            self.hint(table, &keys, h);
+        if pending {
+            return Err(Pending);
         }
-        for nk in wanted {
-            let tk = key_of(&nk);
-            if let Ok(Some(v)) = self.fetch(table, &tk) {
-                nodes.map.insert(nk, v);
-            }
-        }
-        let outcome = loop {
+        let mut repairs = 0u32;
+        let (outcome, walked) = loop {
             let w = walk(root, path, &nodes);
-            cost.nodes = w.nodes;
+            let walked = w.nodes;
             match w.outcome {
-                Outcome::Present(v) => break Read::Verified(v),
-                Outcome::Absent(by) => break Read::VerifiedAbsent(by),
+                Outcome::Present(v) => break (Read::Verified(v), walked),
+                Outcome::Absent(by) => break (Read::VerifiedAbsent(by), walked),
                 Outcome::Invalid(nk, what) => {
-                    break Read::Insufficient(Reason::Invalid {
+                    let r = Reason::Invalid {
                         table,
                         key: key_of(&nk),
                         what,
-                    })
+                    };
+                    break (Read::Insufficient(r), walked);
                 }
                 Outcome::Missing(nk) => {
-                    if cost.repairs >= MAX_REPAIRS {
-                        break Read::Insufficient(Reason::Budget);
+                    if repairs >= MAX_REPAIRS {
+                        break (Read::Insufficient(Reason::Budget), walked);
                     }
-                    cost.repairs += 1;
-                    cost.rounds += 1;
+                    repairs += 1;
                     let tk = key_of(&nk);
-                    match self.fetch(table, &tk) {
+                    self.want_pages(table, &[tk]);
+                    match self.fetch(table, &tk)? {
                         Ok(Some(v)) => {
-                            nodes.map.insert(nk, v);
+                            nodes.insert(nk, v);
                         }
-                        Ok(None) => break Read::Insufficient(Reason::Missing { table, key: tk }),
-                        Err(r) => break Read::Insufficient(r),
+                        Ok(None) => {
+                            break (
+                                Read::Insufficient(Reason::Missing { table, key: tk }),
+                                walked,
+                            )
+                        }
+                        Err(r) => break (Read::Insufficient(r), walked),
                     }
                 }
             }
@@ -500,53 +574,171 @@ impl<B: Bucket> Snapshot<B> {
         if cache && self.top_levels > 0 && !outcome.is_insufficient() {
             self.top_keep(path, &nodes, max_depth);
         }
-        let (r1, b1) = self.requests_so_far();
-        cost.requests = r1 - r0;
-        cost.bytes = b1 - b0;
-        (outcome, cost)
+        Ok((outcome, repairs, walked))
     }
 
-    /// The account under `hashed = keccak(address)`.
-    pub fn account(&mut self, hashed: &B256) -> (Read<Account>, Cost) {
+    fn account_walk(&mut self, hashed: &B256) -> Result<(Read<Account>, u32, usize), Pending> {
         let path = path_of(hashed);
         let d = self.d_account;
-        let (r, cost) = self.walk_table(
+        let (r, repairs, nodes) = self.walk_table(
             TABLE_ACCOUNT_NODES,
             self.state_root(),
             &path,
             |nk| nk.table_key().expect("walk depth ≤ 62"),
             d,
             true,
-        );
-        let r = match r {
-            Read::Verified(v) => match Account::decode(&v) {
-                Ok(a) => Read::Verified(a),
-                Err(_) => Read::Insufficient(Reason::Value("account leaf")),
-            },
-            Read::VerifiedAbsent(b) => Read::VerifiedAbsent(b),
-            Read::Insufficient(r) => Read::Insufficient(r),
-        };
-        (r, cost)
+        )?;
+        let r = r.map(|v| match Account::decode(&v) {
+            Ok(a) => Read::Verified(a),
+            Err(_) => Read::Insufficient(Reason::Value("account leaf")),
+        });
+        Ok((r, repairs, nodes))
+    }
+
+    fn storage_walk(
+        &mut self,
+        account: &Account,
+        hashed: &B256,
+        hashed_slot: &B256,
+    ) -> Result<(Read<U256>, u32, usize), Pending> {
+        let path = path_of(hashed_slot);
+        let owner = *hashed;
+        let d = self.d_storage;
+        let (r, repairs, nodes) = self.walk_table(
+            TABLE_STORAGE_NODES,
+            account.storage_root,
+            &path,
+            |nk| nk.storage_table_key(&owner).expect("walk depth ≤ 62"),
+            d,
+            false,
+        )?;
+        let r = r.map(|v| match decode_word(&v) {
+            Ok(w) => Read::Verified(w),
+            Err(_) => Read::Insufficient(Reason::Value("storage leaf")),
+        });
+        Ok((r, repairs, nodes))
+    }
+
+    /// The account under `hashed = keccak(address)`, from the store.
+    pub fn try_account(&mut self, hashed: &B256) -> Result<(Read<Account>, Cost), Pending> {
+        let (r, repairs, nodes) = self.account_walk(hashed)?;
+        Ok((r, self.cost(repairs, nodes)))
     }
 
     /// Storage slot `hashed_slot = keccak(slot)` of the account under
-    /// `hashed`. The account walk comes first; an account that is absent or
-    /// has the empty root answers without a storage fetch.
-    pub fn storage(&mut self, hashed: &B256, hashed_slot: &B256) -> (Read<U256>, Cost) {
-        let (acct, mut cost) = self.account(hashed);
+    /// `hashed`, from the store. The storage trie's predicted pages are
+    /// wanted in the account's round (its table keys need only the owner),
+    /// so the two walks share one round when the predictions hold; an
+    /// account that is absent or has the empty root answers without
+    /// walking storage.
+    pub fn try_storage(
+        &mut self,
+        hashed: &B256,
+        hashed_slot: &B256,
+    ) -> Result<(Read<U256>, Cost), Pending> {
+        let spath = path_of(hashed_slot);
+        let owner = *hashed;
+        let skeys: Vec<[u8; 32]> = (0..=self.d_storage)
+            .map(|d| {
+                NodeKey::prefix(&spath, d)
+                    .storage_table_key(&owner)
+                    .expect("walk depth ≤ 62")
+            })
+            .collect();
+        self.want_pages(TABLE_STORAGE_NODES, &skeys);
+        let (acct, ar, an) = self.account_walk(hashed)?;
         let acct = match acct {
             Read::Verified(a) => a,
-            Read::VerifiedAbsent(b) => return (Read::VerifiedAbsent(b), cost),
-            Read::Insufficient(r) => return (Read::Insufficient(r), cost),
+            Read::VerifiedAbsent(b) => return Ok((Read::VerifiedAbsent(b), self.cost(ar, an))),
+            Read::Insufficient(r) => return Ok((Read::Insufficient(r), self.cost(ar, an))),
         };
-        let (r, c) = self.storage_of(&acct, hashed, hashed_slot);
-        // The account's speculative round and the storage's are one round
-        // in profile §2; count them so.
-        cost.add(Cost {
-            rounds: c.rounds.saturating_sub(1),
-            ..c
-        });
-        (r, cost)
+        let (r, sr, sn) = self.storage_walk(&acct, hashed, hashed_slot)?;
+        Ok((r, self.cost(ar + sr, an + sn)))
+    }
+
+    /// Storage of an account the caller has already verified, from the
+    /// store.
+    pub fn try_storage_of(
+        &mut self,
+        account: &Account,
+        hashed: &B256,
+        hashed_slot: &B256,
+    ) -> Result<(Read<U256>, Cost), Pending> {
+        let (r, repairs, nodes) = self.storage_walk(account, hashed, hashed_slot)?;
+        Ok((r, self.cost(repairs, nodes)))
+    }
+
+    /// Bytecode under a `codeHash` the caller verified, from the store.
+    /// `KECCAK_EMPTY` is empty code with no fetch; a blob (code above the
+    /// inline size) is a second round.
+    pub fn try_code(&mut self, code_hash: &B256) -> Result<(Read<Vec<u8>>, Cost), Pending> {
+        if *code_hash == KECCAK_EMPTY {
+            return Ok((Read::Verified(Vec::new()), self.cost(0, 0)));
+        }
+        self.want_pages(TABLE_CODE, &[code_hash.0]);
+        let reader = match self.readers[TABLE_CODE as usize].as_mut() {
+            Ok(r) => r,
+            Err(why) => {
+                let why = why.clone();
+                return Ok((Read::Insufficient(why), self.cost(0, 0)));
+            }
+        };
+        let entry = match reader.get_entry(&code_hash.0) {
+            Ok((e, _)) => e,
+            Err(e) if is_pending(&e) => return Err(Pending),
+            Err(e) => {
+                let r = Reason::Run {
+                    table: TABLE_CODE,
+                    error: e.to_string(),
+                };
+                return Ok((Read::Insufficient(r), self.cost(0, 0)));
+            }
+        };
+        let bytes = match entry {
+            None => {
+                let r = Reason::Missing {
+                    table: TABLE_CODE,
+                    key: code_hash.0,
+                };
+                return Ok((Read::Insufficient(r), self.cost(0, 0)));
+            }
+            Some(e) if e.tag == 0 => e.value,
+            Some(e) if e.tag == 2 => {
+                let h: [u8; 32] = e.value.as_slice().try_into().expect("tag 2 is 32 bytes");
+                match self.store.file(&blob_path(&h))? {
+                    Ok(Some(b)) if *blake3::hash(&b).as_bytes() == h => b,
+                    Ok(Some(_)) => {
+                        let r = Reason::Blob("blob does not hash to its name".into());
+                        return Ok((Read::Insufficient(r), self.cost(0, 0)));
+                    }
+                    Ok(None) => {
+                        let r = Reason::Blob(format!("{} is not in the bucket", blob_path(&h)));
+                        return Ok((Read::Insufficient(r), self.cost(0, 0)));
+                    }
+                    Err(e) => return Ok((Read::Insufficient(Reason::Blob(e)), self.cost(0, 0))),
+                }
+            }
+            Some(_) => {
+                let r = Reason::Code("tombstone in the code table");
+                return Ok((Read::Insufficient(r), self.cost(0, 0)));
+            }
+        };
+        if keccak256(&bytes) != *code_hash {
+            let r = Reason::Code("bytecode does not hash to codeHash");
+            return Ok((Read::Insufficient(r), self.cost(0, 0)));
+        }
+        Ok((Read::Verified(bytes), self.cost(0, 0)))
+    }
+
+    /// The account under `hashed = keccak(address)`.
+    pub fn account(&mut self, hashed: &B256) -> (Read<Account>, Cost) {
+        self.run(|s| s.try_account(hashed))
+    }
+
+    /// Storage slot `hashed_slot = keccak(slot)` of the account under
+    /// `hashed`.
+    pub fn storage(&mut self, hashed: &B256, hashed_slot: &B256) -> (Read<U256>, Cost) {
+        self.run(|s| s.try_storage(hashed, hashed_slot))
     }
 
     /// Storage of an account the caller has already verified.
@@ -556,113 +748,11 @@ impl<B: Bucket> Snapshot<B> {
         hashed: &B256,
         hashed_slot: &B256,
     ) -> (Read<U256>, Cost) {
-        let path = path_of(hashed_slot);
-        let owner = *hashed;
-        let d = self.d_storage;
-        let (r, cost) = self.walk_table(
-            TABLE_STORAGE_NODES,
-            account.storage_root,
-            &path,
-            |nk| nk.storage_table_key(&owner).expect("walk depth ≤ 62"),
-            d,
-            false,
-        );
-        let r = match r {
-            Read::Verified(v) => match decode_word(&v) {
-                Ok(w) => Read::Verified(w),
-                Err(_) => Read::Insufficient(Reason::Value("storage leaf")),
-            },
-            Read::VerifiedAbsent(b) => Read::VerifiedAbsent(b),
-            Read::Insufficient(r) => Read::Insufficient(r),
-        };
-        (r, cost)
+        self.run(|s| s.try_storage_of(account, hashed, hashed_slot))
     }
 
-    /// Bytecode under a `codeHash` the caller verified. `KECCAK_EMPTY` is
-    /// empty code with no fetch.
+    /// Bytecode under a `codeHash` the caller verified.
     pub fn code(&mut self, code_hash: &B256) -> (Read<Vec<u8>>, Cost) {
-        self.begin_read();
-        let mut cost = Cost::default();
-        if *code_hash == KECCAK_EMPTY {
-            return (Read::Verified(Vec::new()), cost);
-        }
-        let (r0, b0) = self.requests_so_far();
-        cost.rounds = 1;
-        let Some(reader) = self.tables[TABLE_CODE as usize].as_mut() else {
-            return (Read::Insufficient(Reason::NoTable(TABLE_CODE)), cost);
-        };
-        let entry = match reader.get_entry(&code_hash.0) {
-            Ok((e, _)) => e,
-            Err(e) => {
-                return (
-                    Read::Insufficient(Reason::Run {
-                        table: TABLE_CODE,
-                        error: e.to_string(),
-                    }),
-                    cost,
-                )
-            }
-        };
-        let bytes = match entry {
-            None => {
-                return (
-                    Read::Insufficient(Reason::Missing {
-                        table: TABLE_CODE,
-                        key: code_hash.0,
-                    }),
-                    cost,
-                )
-            }
-            Some(e) if e.tag == 0 => e.value,
-            Some(e) if e.tag == 2 => {
-                cost.rounds = 2;
-                let h: [u8; 32] = e.value.as_slice().try_into().expect("tag 2 is 32 bytes");
-                match self.bucket.read_file(&blob_path(&h)) {
-                    Ok(b) if *blake3::hash(&b).as_bytes() == h => {
-                        cost.requests += 1;
-                        cost.bytes += b.len() as u64;
-                        b
-                    }
-                    Ok(_) => {
-                        return (
-                            Read::Insufficient(Reason::Blob(
-                                "blob does not hash to its name".into(),
-                            )),
-                            cost,
-                        )
-                    }
-                    Err(e) => return (Read::Insufficient(Reason::Blob(e)), cost),
-                }
-            }
-            Some(_) => {
-                return (
-                    Read::Insufficient(Reason::Code("tombstone in the code table")),
-                    cost,
-                )
-            }
-        };
-        let (r1, b1) = self.requests_so_far();
-        cost.requests += r1 - r0;
-        cost.bytes += b1 - b0;
-        if keccak256(&bytes) != *code_hash {
-            return (
-                Read::Insufficient(Reason::Code("bytecode does not hash to codeHash")),
-                cost,
-            );
-        }
-        (Read::Verified(bytes), cost)
-    }
-}
-
-/// Nodes fetched so far, by position.
-struct Nodes<'a, F: Fn(&NodeKey) -> [u8; 32]> {
-    map: HashMap<NodeKey, Vec<u8>>,
-    #[allow(dead_code)]
-    key_of: &'a F,
-}
-
-impl<F: Fn(&NodeKey) -> [u8; 32]> NodeSource for Nodes<'_, F> {
-    fn node(&self, key: &NodeKey) -> Option<&[u8]> {
-        self.map.get(key).map(Vec::as_slice)
+        self.run(|s| s.try_code(code_hash))
     }
 }

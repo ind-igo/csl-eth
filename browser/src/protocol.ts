@@ -1,23 +1,33 @@
-// Messages between the page and the client worker. The worker owns the wasm
-// `Client`; the page only renders what comes back.
+// What the wasm client says and what the page shows. The client owns the
+// shapes of `done`; the page adds timing and the request log, which only it
+// can know.
 
-export type Request =
-  | { id: number; type: "init" }
-  | { id: number; type: "open"; base: string; checkpoint: string; prefetch: number; top_levels: number }
-  | { id: number; type: "account"; key: string }
-  | { id: number; type: "storage"; key: string; slot: string }
-  | { id: number; type: "code"; hash: string };
+/// One thing the client needs before it can continue: a whole file, or a
+/// byte range of one.
+export interface Need {
+  file: string;
+  offset?: number;
+  length?: number;
+}
 
-export type Call = Request extends infer R ? (R extends { id: number } ? Omit<R, "id"> : never) : never;
+/// One call of the client: more to fetch, or the answer, or a refusal.
+export type Step = { need: Need[] } | { done: unknown } | { error: string };
 
-export type Reply = { id: number; ok: true; data: unknown } | { id: number; ok: false; error: string };
-
-export interface HttpLogEntry {
+/// One request the page made, as the page saw it.
+export interface RequestLog {
+  round: number;
   file: string;
   offset: number | null;
   length: number | null;
   status: number;
   bytes: number;
+  ms: number;
+}
+
+/// What driving a call cost on the page's side.
+export interface Trip {
+  log: RequestLog[];
+  rounds: number;
   ms: number;
 }
 
@@ -34,7 +44,7 @@ export interface Head {
   state_root: string;
   timestamp: number;
   snapshot: { block_number: number; block_hash: string; state_root: string; prefix: string };
-  open: { requests: number; bytes: number; ms: number; log: HttpLogEntry[] };
+  open: { requests: number; bytes: number; rounds: number };
 }
 
 export interface Cost {
@@ -46,9 +56,8 @@ export interface Cost {
 }
 
 export interface ReadResult {
-  status: "verified" | "absent" | "insufficient" | "error";
+  status: "verified" | "absent" | "insufficient";
   why?: string | null;
-  error?: string;
   hashed?: string;
   address?: string | null;
   hashed_slot?: string;
@@ -62,16 +71,5 @@ export interface ReadResult {
   value_dec?: string;
   size?: number;
   prefix?: string;
-  cost?: Cost;
-  http?: { requests: number; bytes: number; log: HttpLogEntry[] };
-  ms?: number;
-}
-
-export interface InitReply {
-  version: string;
-  init_ms: number;
-}
-
-export interface OpenReply {
-  head: Head;
+  cost: Cost;
 }

@@ -1632,8 +1632,6 @@ dependencies = [
  "alloy-primitives",
  "alloy-trie",
  "csl-eth-client",
- "csl-eth-head",
- "csl-run",
  "getrandom 0.3.4",
  "hex",
  "js-sys",

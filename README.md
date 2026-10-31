@@ -19,9 +19,9 @@ implementation.
 |---|---|
 | `crates/trie` (`csl-eth-trie`) | node positions and table keys; a streaming builder from sorted leaves that emits every hashed node and agrees with alloy's `HashBuilder` root; the verifier walk (`Present` / `Absent` by trie shape / `Missing` / `Invalid`) |
 | `crates/store` (`csl-eth-store`) | the bucket layout, the JSON manifest, and the producer: storage tries built and checked per account, the account trie checked against `state_root`, code checked against `codeHash`, four tables written through `csl-run` in the variable layout, code blobs above 3,968 B |
-| `crates/client` (`csl-eth-client`) | `Snapshot::open(bucket, block, state_root)` then `account`, `storage`, `code`: one speculative round over depths `0..=D`, the walk, repair rounds, with requests, bytes and rounds per read |
+| `crates/client` (`csl-eth-client`) | the client as a state machine over a `Store` of fetched bytes: `try_account` / `try_storage` / `try_code` compute from what the store holds and return `Pending` with the round's wants (`Want::Range`, `Want::File`) when they need more; a `Driver` (a directory, HTTP over threads) fetches each round for the synchronous `account` / `storage` / `code`; one speculative round over depths `0..=D`, the walk, repairs, with requests, bytes and rounds per read |
 | `crates/head` (`csl-eth-head`) | the beacon light-client protocol from files: `head/bootstrap/<root>`, `head/updates/<period>`, `head/finality`, verified with helios-consensus-core from one checkpoint root to the finalized execution block |
-| `crates/wasm` (`csl-eth-wasm`) | the client and the head verifier for the browser: wasm-bindgen bindings with a synchronous JS-backed byte-range source |
+| `crates/wasm` (`csl-eth-wasm`) | the client and the head verifier for the browser: wasm-bindgen bindings over the step loop (`open` / `account` / `storage` / `code` return a `need` list, `supply` hands bytes back, `step` continues to `done`); the page fetches every round with `Promise.all` |
 | `crates/snap` (`csl-eth-snap`, bin `csl-eth`) | mainnet state with no node: peers from the EIP-1459 DNS tree and discv4, RLPx with eth/68–69 and snap/1–2 over reth's wire crates, account and storage ranges verified by rebuilding, bytecode by hash; `fetch` writes a slice, `build` makes a bucket from it with the range proofs as the trie boundary |
 
 ```
@@ -88,10 +88,15 @@ most of those for under a minute.
 
 The client runs in the browser: `crates/wasm` compiles the client and the
 head verifier to WebAssembly, `browser/` is a page that opens the R2 bucket
-through the head in a Web Worker (synchronous XHR ranges behind
-`globalThis.cslFetch`) and reads accounts, storage and code with each
-answer's status and cost. Deployed at https://csl-eth.indigo-db8.workers.dev;
+through the head and reads accounts, storage and code with each answer's
+status and cost. The client does no I/O: `browser/src/client.ts` drives its
+`need` / `supply` / `step` loop, fetching every round's ranges at once from
+the main thread (`cache: "no-store"`, or Chromium queues same-URL ranges
+behind its cache lock). Deployed at https://csl-eth.indigo-db8.workers.dev;
 `?open` opens on load, `?bucket=<url>&checkpoint=<root>` change the inputs.
+From Taipei through a VPN: the head in 8 requests and 5 rounds (about 1 s),
+an account in 2 to 4 requests and one round (120 to 310 ms), a storage slot
+in 10 requests and one round (250 to 310 ms).
 
 ```
 mise install                      # rust + wasm32 target + llvm-tools, bun, wasm-bindgen-cli
@@ -100,9 +105,8 @@ cd browser && bun install && bun run serve      # http://127.0.0.1:8791/
 bun run site && (cd deploy && cf deploy)        # assemble browser/site and deploy it
 ```
 
-Not yet built, in order: parallel ranges in the page (the main thread's
-`fetch` behind a `SharedArrayBuffer` handshake, so a hinted round is one
-round trip as in the CLI), the model section fetched by key (the
-per-snapshot budget for a following client), storage speculation in the
-account's round, the content-addressed baseline client, the milestone 1
-workload and fault table.
+Not yet built, in order: the model section fetched by key (the
+per-snapshot budget for a following client), the content-addressed baseline
+client, the milestone 1 workload and fault table, a visualizer of the rounds
+(the `need` lists are its event stream), the head's period updates batched
+into one round.

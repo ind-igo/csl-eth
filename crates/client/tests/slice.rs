@@ -5,7 +5,8 @@
 //! pages, never in an answer.
 
 use alloy_primitives::{keccak256, B256, U256};
-use csl_eth_client::{DirBucket, Hint, Read, Reason, Snapshot};
+use csl_eth_client::{DirDriver, Hint, Read, Reason, Snapshot};
+use csl_eth_store::TABLE_ACCOUNT_NODES;
 use csl_eth_store::{produce_with, AccountLeaf, Head, ProduceError, ProduceOptions};
 use csl_eth_trie::{
     build::build_all, encode_word, path_of, proof_for, verify_range, Account, Nibbles, Sealed,
@@ -153,7 +154,16 @@ fn slice_reads_inside_and_insufficient_outside() {
     assert_eq!(produced.stats.sealed as usize, boundary.len());
     assert_eq!(produced.stats.accounts as usize, inside.len());
 
-    let mut snap = Snapshot::open(DirBucket::new(&dir), None, w.root).unwrap();
+    let mut snap = Snapshot::open(DirDriver::new(&dir), None, w.root).unwrap();
+    // Ask for the model's error bound around every predicted page, so a
+    // read is one round when the trie is as deep as speculated and one
+    // more per repair.
+    let eps = snap
+        .manifest()
+        .table(TABLE_ACCOUNT_NODES)
+        .unwrap()
+        .epsilon_pages as u64;
+    snap.hint = Hint::symmetric(eps + 1);
     let mut rounds_max = 0;
     for a in &inside {
         let (r, c) = snap.account(&a.hashed);
@@ -307,9 +317,9 @@ fn cached_top_levels_answer_the_same_for_fewer_requests() {
         },
     )
     .unwrap();
-    let mut plain = Snapshot::open(DirBucket::new(&dir), None, w.root).unwrap();
-    let mut cached = Snapshot::open(DirBucket::new(&dir), None, w.root).unwrap();
-    cached.prefetch = Some(Hint::symmetric(1));
+    let mut plain = Snapshot::open(DirDriver::new(&dir), None, w.root).unwrap();
+    let mut cached = Snapshot::open(DirDriver::new(&dir), None, w.root).unwrap();
+    cached.hint = Hint::symmetric(1);
     cached.top_levels = 3;
 
     let mut keys: Vec<B256> = inside.iter().map(|a| a.hashed).collect();

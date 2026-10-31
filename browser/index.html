@@ -101,7 +101,7 @@
       <div class="row">
         <label class="wide">bucket URL<input id="base" class="mono" /></label>
         <label class="wide">weak-subjectivity checkpoint (beacon block root)<input id="checkpoint" class="mono" /></label>
-        <label class="narrow">prefetch<input id="prefetch" type="number" min="0" max="8" value="1" /></label>
+        <label class="narrow">pages each side<input id="prefetch" type="number" min="0" max="8" value="1" /></label>
         <label class="narrow">top levels<input id="toplevels" type="number" min="0" max="9" value="4" /></label>
         <button id="open">Open</button>
       </div>
@@ -136,7 +136,7 @@
     </div>
 
     <footer>
-      <span id="version"></span> · the client is the same Rust crate the CLI uses, compiled to WebAssembly; verification happens in a Web Worker in this tab.
+      <span id="version"></span> · the client is the same Rust crate the CLI uses, compiled to WebAssembly. It does no I/O: each round it names the byte ranges it needs, this page fetches them all at once, and every byte is verified in this tab.
     </footer>
     <script type="module" src="./dist/main.js"></script>
   </body>

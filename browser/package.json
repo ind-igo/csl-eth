@@ -3,7 +3,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "build": "bun build src/main.ts src/worker.ts --outdir dist --target browser --format esm --sourcemap=linked",
+    "build": "bun build src/main.ts --outdir dist --target browser --format esm --sourcemap=linked",
     "serve": "bun src/serve.ts",
     "site": "bun src/serve.ts --site site",
     "typecheck": "tsc --noEmit -p ."

@@ -5,7 +5,7 @@
 
 use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{HashBuilder, Nibbles, KECCAK_EMPTY};
-use csl_eth_client::{Bucket, Cost, DirBucket, Read, Reason, Snapshot};
+use csl_eth_client::{Cost, DirDriver, Driver, Got, Read, Reason, Snapshot, Want};
 use csl_eth_store::{
     produce, table_path, trie::AbsentBy, AccountLeaf, Head, TABLE_ACCOUNT_NODES,
     TABLE_STORAGE_NODES,
@@ -154,19 +154,30 @@ fn every_shape_reads_correctly_and_within_budget() {
     assert!(st.storage_tries > 0 && st.storage_nodes > 0);
     eprintln!("produced: {st:?}");
 
-    let mut snap = Snapshot::open(DirBucket::new(&dir), None, w.head.state_root).unwrap();
+    let mut snap = Snapshot::open(DirDriver::new(&dir), None, w.head.state_root).unwrap();
     assert_eq!(snap.manifest().block_number, 24_400_000);
+    // The model puts a stored key within ε pages of its prediction and an
+    // absent key within ε + 1: a round that asks for that span around every
+    // predicted page is the one round the claims below count.
+    let eps = snap
+        .manifest()
+        .table(TABLE_ACCOUNT_NODES)
+        .unwrap()
+        .epsilon_pages as u64;
+    snap.hint = csl_eth_client::Hint::symmetric(eps + 1);
 
     // Present accounts: verified, one round each on a random path. The
     // crafted pair sits under a 60-nibble extension that speculation to
-    // depth 9 cannot reach, so it alone costs two repairs.
+    // depth 9 cannot reach, so it alone costs two repairs; a repair whose
+    // page a neighbouring depth's span already fetched costs no round.
     let mut max_cost = Cost::default();
     let mut repaired = 0;
     for a in &w.accounts {
         let (r, c) = snap.account(&a.hashed);
         assert_eq!(r, Read::Verified(a.account), "{}", a.hashed);
         if a.hashed[0] == 0x33 && a.hashed[1] == 0x33 {
-            assert_eq!((c.repairs, c.rounds), (2, 3), "crafted pair: {c:?}");
+            assert_eq!(c.repairs, 2, "crafted pair: {c:?}");
+            assert!((1..=3).contains(&c.rounds), "crafted pair: {c:?}");
             repaired += 1;
             continue;
         }
@@ -253,10 +264,10 @@ fn every_shape_reads_correctly_and_within_budget() {
     assert_eq!(r, Read::VerifiedAbsent(AbsentBy::EmptyTrie));
     let (ra, ca) = snap.account(&empty.hashed);
     assert!(matches!(ra, Read::Verified(_)));
-    assert_eq!(
-        c.requests, ca.requests,
-        "empty storage costs no storage request"
-    );
+    // The storage pages are speculated in the account's round, so an
+    // empty storage root costs bytes it did not need but never a round.
+    assert_eq!(c.rounds, ca.rounds, "empty storage costs no extra round");
+    assert!(c.requests >= ca.requests);
     let (r, _) = snap.storage(&random_absent(&mut rng, &present), &B256::repeat_byte(9));
     assert!(r.is_absent());
 
@@ -280,7 +291,7 @@ fn every_shape_reads_correctly_and_within_budget() {
     assert!(matches!(r, Read::Insufficient(Reason::Missing { .. })));
 
     // A different trusted root: the snapshot refuses to open.
-    assert!(Snapshot::open(DirBucket::new(&dir), None, B256::repeat_byte(1)).is_err());
+    assert!(Snapshot::open(DirDriver::new(&dir), None, B256::repeat_byte(1)).is_err());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -293,7 +304,7 @@ fn faults_never_become_false_answers() {
     let w = world(600, 2);
     let dir = scratch("faults");
     let produced = produce(&dir, &w.head, "", w.accounts.iter().cloned(), &w.code).unwrap();
-    let bucket = DirBucket::new(&dir);
+    let bucket = DirDriver::new(&dir);
     let present: BTreeMap<B256, ()> = w.accounts.iter().map(|a| (a.hashed, ())).collect();
     let mut rng = ChaCha8Rng::seed_from_u64(3);
     let mut absent_keys = Vec::new();
@@ -301,10 +312,10 @@ fn faults_never_become_false_answers() {
         absent_keys.push(random_absent(&mut rng, &present));
     }
 
-    fn check_with<B: Bucket>(
+    fn check_with<D: Driver>(
         w: &World,
         absent_keys: &[B256],
-        snap: &mut Snapshot<B>,
+        snap: &mut Snapshot<D>,
         label: &str,
     ) -> (usize, usize) {
         let mut insufficient = 0;
@@ -338,9 +349,9 @@ fn faults_never_become_false_answers() {
         (ok, insufficient)
     }
     let check =
-        |snap: &mut Snapshot<DirBucket>, label: &str| check_with(&w, &absent_keys, snap, label);
+        |snap: &mut Snapshot<DirDriver>, label: &str| check_with(&w, &absent_keys, snap, label);
 
-    let mut snap = Snapshot::open(DirBucket::new(&dir), None, w.head.state_root).unwrap();
+    let mut snap = Snapshot::open(DirDriver::new(&dir), None, w.head.state_root).unwrap();
     let (ok, ins) = check(&mut snap, "clean");
     assert_eq!(ins, 0);
     eprintln!("clean: {ok} ok");
@@ -362,7 +373,7 @@ fn faults_never_become_false_answers() {
         }
         std::fs::write(&acct_file, &a).unwrap();
         std::fs::write(&stor_file, &s).unwrap();
-        let mut snap = Snapshot::open(DirBucket::new(&dir), None, w.head.state_root).unwrap();
+        let mut snap = Snapshot::open(DirDriver::new(&dir), None, w.head.state_root).unwrap();
         let (ok, ins) = check(&mut snap, &format!("flips round {round}"));
         eprintln!("flips round {round}: {ok} ok, {ins} insufficient");
         assert!(ins > 0, "40 flips per table should break something");
@@ -371,57 +382,51 @@ fn faults_never_become_false_answers() {
     // Truncated tables.
     std::fs::write(&acct_file, &clean_acct[..clean_acct.len() / 2]).unwrap();
     std::fs::write(&stor_file, &clean_stor).unwrap();
-    let mut snap = Snapshot::open(DirBucket::new(&dir), None, w.head.state_root).unwrap();
+    let mut snap = Snapshot::open(DirDriver::new(&dir), None, w.head.state_root).unwrap();
     let (_, ins) = check(&mut snap, "truncated");
     assert!(ins > 0);
 
-    // A table removed entirely: accounts still verify; storage is Insufficient.
+    // A table removed entirely: the snapshot still opens, accounts still
+    // verify, and every storage read is Insufficient with the table's error.
     std::fs::write(&acct_file, &clean_acct).unwrap();
     std::fs::remove_file(&stor_file).unwrap();
+    let mut snap = Snapshot::open(DirDriver::new(&dir), None, w.head.state_root).unwrap();
+    let (ok, ins) = check(&mut snap, "no storage table");
     assert!(
-        Snapshot::open(DirBucket::new(&dir), None, w.head.state_root).is_err(),
-        "manifest names the table"
+        ok > 0 && ins > 0,
+        "accounts verify, storage is insufficient: {ok} ok, {ins} insufficient"
+    );
+    let with_storage = w.accounts.iter().find(|a| !a.storage.is_empty()).unwrap();
+    assert!(
+        matches!(
+            snap.storage(&with_storage.hashed, &with_storage.storage[0].0)
+                .0,
+            Read::Insufficient(Reason::Run { table: 1, .. })
+        ),
+        "storage names the missing table"
     );
     std::fs::write(&stor_file, &clean_stor).unwrap();
 
     // A node omitted from its page is Missing then Insufficient, never
     // absent: serve the storage table from a bucket that drops every read
     // of one page.
-    struct DropPage(DirBucket, u64);
-    struct Dropping(std::fs::File, u64);
-    impl csl_eth_client::Prefetch for Dropping {}
-    impl csl_run::Source for Dropping {
-        fn read_at(&self, off: u64, len: usize) -> Result<Vec<u8>, csl_run::Error> {
-            if self
-                .1
-                .checked_sub(1)
-                .and_then(|p| p.checked_mul(4096))
-                .map(|o| o + 4096)
-                == Some(off)
-            {
-                return Err(csl_run::Error::ShortRead {
-                    off,
-                    want: len,
-                    got: 0,
-                });
-            }
-            self.0.read_at(off, len)
-        }
-    }
-    impl Bucket for DropPage {
-        type Run = Dropping;
-        fn open_run(&self, rel: &str) -> Result<Dropping, String> {
-            Ok(Dropping(
-                self.0.open_run(rel)?,
-                if rel.ends_with("account_nodes.run") {
-                    self.1
-                } else {
-                    u64::MAX
-                },
-            ))
-        }
-        fn read_file(&self, rel: &str) -> Result<Vec<u8>, String> {
-            self.0.read_file(rel)
+    struct DropPage(DirDriver, u64);
+    impl Driver for DropPage {
+        fn fetch(&self, wants: &[Want]) -> Vec<Got> {
+            let dropped = self.1 * 4096;
+            wants
+                .iter()
+                .map(|w| match w {
+                    Want::Range { rel, off, len }
+                        if rel.ends_with("account_nodes.run")
+                            && *off < dropped + 4096
+                            && off + *len as u64 > dropped =>
+                    {
+                        Err("dropped".to_string())
+                    }
+                    w => self.0.fetch(std::slice::from_ref(w)).remove(0),
+                })
+                .collect()
         }
     }
     let pages = produced
@@ -502,7 +507,7 @@ fn walk_invalid_shapes_are_insufficient_not_absent() {
     // The manifest still names the real root and page counts; opening may
     // fail on the model root or reads may fail on shape. Either is fine;
     // what is never fine is an answer.
-    if let Ok(mut snap) = Snapshot::open(DirBucket::new(&dir), None, w.head.state_root) {
+    if let Ok(mut snap) = Snapshot::open(DirDriver::new(&dir), None, w.head.state_root) {
         for a in w.accounts.iter().take(20) {
             let (r, _) = snap.account(&a.hashed);
             assert!(
@@ -547,7 +552,7 @@ fn epsilon_against_requests_per_read() {
             },
         )
         .unwrap();
-        let mut snap = Snapshot::open(DirBucket::new(&dir), None, w.head.state_root).unwrap();
+        let mut snap = Snapshot::open(DirDriver::new(&dir), None, w.head.state_root).unwrap();
         let mut rng = ChaCha8Rng::seed_from_u64(eps as u64);
         let (mut req, mut bytes, mut n, mut max) = (0u64, 0u64, 0u64, 0u64);
         for a in w.accounts.iter().step_by(3) {
@@ -558,27 +563,25 @@ fn epsilon_against_requests_per_read() {
             max = max.max(c.requests);
             n += 1;
         }
-        let (mut areq, mut an) = (0u64, 0u64);
+        let (mut areq, mut arounds, mut an) = (0u64, 0u64, 0u64);
         for _ in 0..500 {
             let k = random_absent(&mut rng, &present);
-            assert!(snap.account(&k).0.is_absent());
-            areq += snap.stats(TABLE_ACCOUNT_NODES).unwrap().record_requests;
+            let (r, c) = snap.account(&k);
+            assert!(r.is_absent());
+            areq += c.requests;
+            arounds += c.rounds as u64;
             an += 1;
         }
         let acct = produced.stats.tables[TABLE_ACCOUNT_NODES as usize].unwrap();
-        let st = snap.stats(TABLE_ACCOUNT_NODES).unwrap().clone();
         eprintln!(
-            "ε={eps}: account table {} pages, model {} B; present read mean {:.1} requests / {:.0} B, max {max}; paths direct {} walk {} (pages {}) fallback {}",
+            "ε={eps}: account table {} pages, model {} B; present read mean {:.1} requests / {:.0} B, max {max}; absent read mean {:.2} requests / {:.2} rounds",
             acct.pages,
             acct.model_bytes,
             req as f64 / n as f64,
             bytes as f64 / n as f64,
-            st.direct,
-            st.walk,
-            st.walk_pages,
-            st.fallback
+            areq as f64 / an as f64,
+            arounds as f64 / an as f64,
         );
-        let _ = (areq, an);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

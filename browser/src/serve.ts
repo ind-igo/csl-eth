@@ -1,5 +1,4 @@
-// The dev server: bundles `src/main.ts` and `src/worker.ts` into `dist/`
-// with Bun, then serves `index.html`, `dist/*` and the wasm-bindgen output
+// The dev server: bundles `src/main.ts` into `dist/` with Bun, then serves `index.html`, `dist/*` and the wasm-bindgen output
 // in `pkg/*` (`.wasm` as `application/wasm`, so the module compiles while
 // streaming). With `--site <dir>` it instead assembles a static site there
 // (index.html, dist/, pkg/) for hosting, and exits.
@@ -23,7 +22,7 @@ const TYPES: Record<string, string> = {
 
 export async function build(): Promise<void> {
   const out = await Bun.build({
-    entrypoints: [join(ROOT, "src/main.ts"), join(ROOT, "src/worker.ts")],
+    entrypoints: [join(ROOT, "src/main.ts")],
     outdir: join(ROOT, "dist"),
     target: "browser",
     format: "esm",
@@ -42,7 +41,7 @@ function site(dir: string) {
   cpSync(join(ROOT, "index.html"), join(out, "index.html"));
   cpSync(join(ROOT, "dist"), join(out, "dist"), { recursive: true });
   cpSync(join(ROOT, "pkg"), join(out, "pkg"), { recursive: true });
-  // Cloudflare Pages: cache the hashed-by-nothing assets for a short while.
+  // Static-assets Worker: cache the hashed-by-nothing assets for a short while.
   Bun.write(join(out, "_headers"), "/pkg/*\n  Cache-Control: public, max-age=300\n/dist/*\n  Cache-Control: public, max-age=300\n");
   console.log(`site assembled in ${out}`);
 }

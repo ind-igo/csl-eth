@@ -3,22 +3,18 @@
 
 use alloy_primitives::B256;
 use clap::{Parser, Subcommand};
-use csl_eth_client::{open_at_head, DirBucket, Hint, Read, Reason, Snapshot, VerifiedHead};
+use csl_eth_client::{open_at_head, DirDriver, Hint, Read, Reason, Snapshot, VerifiedHead};
 use csl_eth_snap::{fetch, probe, FetchConfig, Slice};
 use csl_eth_store::{produce_with, ProduceOptions};
 use csl_eth_trie::Nibbles;
 use csl_eth_trie::KECCAK_EMPTY;
-use std::{
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{path::PathBuf, time::Duration};
 
 #[derive(Parser)]
-#[command(name = "csl-eth", about = "Ethereum state as static files: acquisition and build")]
+#[command(
+    name = "csl-eth",
+    about = "Ethereum state as static files: acquisition and build"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -95,8 +91,8 @@ enum Cmd {
         d_account: Option<usize>,
         #[arg(long)]
         d_storage: Option<usize>,
-        /// Fetch the speculative round in parallel: the predicted page per
-        /// depth plus this many pages each side. Off when absent.
+        /// Widen the speculative round: the predicted page per depth plus
+        /// this many pages each side (0: the predicted pages only).
         #[arg(long)]
         prefetch: Option<u64>,
         /// Pages below / above the prediction, overriding --prefetch's span
@@ -183,11 +179,16 @@ fn head_json(h: &VerifiedHead) -> serde_json::Value {
 
 /// The snapshot `check` reads: at the slice's pinned header, or at the head
 /// the bucket proves when a checkpoint is given.
-fn open_for_check<B: csl_eth_client::Bucket>(b: B, s: &Slice, checkpoint: Option<B256>) -> Result<(Snapshot<B>, Option<serde_json::Value>), String> {
+fn open_for_check<D: csl_eth_client::Driver>(
+    b: D,
+    s: &Slice,
+    checkpoint: Option<B256>,
+) -> Result<(Snapshot<D>, Option<serde_json::Value>), String> {
     match checkpoint {
         None => Ok((Snapshot::open(b, None, s.head.state_root)?, None)),
         Some(c) => {
-            let (snap, head) = open_at_head(b, c, std::time::SystemTime::now()).map_err(|e| e.to_string())?;
+            let (snap, head) =
+                open_at_head(b, c, std::time::SystemTime::now()).map_err(|e| e.to_string())?;
             if head.execution.state_root != s.head.state_root {
                 return Err(format!(
                     "the slice is at block {} ({}), the finalized head at block {} ({}); fetch a slice at the finalized block",
@@ -206,7 +207,10 @@ fn parse_prefix(s: &str) -> Result<Nibbles, String> {
     }
     let mut out = Vec::with_capacity(s.len());
     for c in s.chars() {
-        out.push(c.to_digit(16).ok_or_else(|| format!("not a hex nibble: {c}"))? as u8);
+        out.push(
+            c.to_digit(16)
+                .ok_or_else(|| format!("not a hex nibble: {c}"))? as u8,
+        );
     }
     Ok(Nibbles::from_nibbles(out))
 }
@@ -215,11 +219,25 @@ fn parse_prefix(s: &str) -> Result<Nibbles, String> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,discv4=warn,reth_dns_discovery=warn,hickory=warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,discv4=warn,reth_dns_discovery=warn,hickory=warn".into()),
         )
         .init();
     match Cli::parse().cmd {
-        Cmd::Fetch { prefix, out, peers, bytes, timeout_secs, udp_port, no_dns, no_discv4, pivot, pivot_file, pivot_at, max_secs } => {
+        Cmd::Fetch {
+            prefix,
+            out,
+            peers,
+            bytes,
+            timeout_secs,
+            udp_port,
+            no_dns,
+            no_discv4,
+            pivot,
+            pivot_file,
+            pivot_at,
+            max_secs,
+        } => {
             let pivot_at = match pivot_at.as_deref() {
                 None => None,
                 Some("next") => {
@@ -248,11 +266,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             slice.write(&out)?;
             println!("{}", serde_json::to_string_pretty(&slice.head)?);
         }
-        Cmd::Build { slice, out, epsilon } => {
+        Cmd::Build {
+            slice,
+            out,
+            epsilon,
+        } => {
             let t = std::time::Instant::now();
             let s = Slice::read(&slice)?;
             let head = s.produce_head();
-            let produced = produce_with(&out, &head, &s.head.prefix, s.leaves(), &s.code, ProduceOptions { epsilon, boundary: s.boundary.clone() })?;
+            let produced = produce_with(
+                &out,
+                &head,
+                &s.head.prefix,
+                s.leaves(),
+                &s.code,
+                ProduceOptions {
+                    epsilon,
+                    boundary: s.boundary.clone(),
+                },
+            )?;
             println!(
                 "{}",
                 serde_json::json!({
@@ -264,20 +296,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             );
         }
-        Cmd::Check { slice, bucket, url, proxy, samples, d_account, d_storage, prefetch, prefetch_below, prefetch_above, no_merge, top_levels, checkpoint } => {
+        Cmd::Check {
+            slice,
+            bucket,
+            url,
+            proxy,
+            samples,
+            d_account,
+            d_storage,
+            prefetch,
+            prefetch_below,
+            prefetch_above,
+            no_merge,
+            top_levels,
+            checkpoint,
+        } => {
             let s = Slice::read(&slice)?;
-            let prefetch = match (prefetch, prefetch_below, prefetch_above) {
-                (None, None, None) => None,
-                (span, below, above) => Some(Hint {
-                    below: below.or(span).unwrap_or(0),
-                    above: above.or(span).unwrap_or(0),
-                    merge: !no_merge,
-                }),
+            let hint = Hint {
+                below: prefetch_below.or(prefetch).unwrap_or(0),
+                above: prefetch_above.or(prefetch).unwrap_or(0),
+                merge: !no_merge,
             };
-            let mut opts = CheckOpts { samples, d_account, d_storage, prefetch, top_levels, http: None };
+            let opts = CheckOpts {
+                samples,
+                d_account,
+                d_storage,
+                hint,
+                top_levels,
+            };
             let out = match (bucket, url) {
                 (Some(dir), None) => {
-                    let (snap, head) = open_for_check(DirBucket::new(&dir), &s, checkpoint)?;
+                    let (snap, head) = open_for_check(DirDriver::new(&dir), &s, checkpoint)?;
                     let mut out = check(&s, snap, &opts);
                     if let Some(h) = head {
                         out["head"] = h;
@@ -285,9 +334,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     out
                 }
                 (None, Some(base)) => {
-                    let b = csl_eth_client::HttpBucket::new(&base, proxy.as_deref())?;
-                    let (req, bytes, hinted) = (b.requests.clone(), b.bytes.clone(), b.hinted.clone());
-                    opts.http = Some([req.clone(), bytes.clone(), hinted.clone()]);
+                    let b = csl_eth_client::HttpDriver::new(&base, proxy.as_deref())?;
+                    let (req, bytes) = (b.requests.clone(), b.bytes.clone());
                     let (snap, head) = open_for_check(b, &s, checkpoint)?;
                     let head_requests = req.load(std::sync::atomic::Ordering::Relaxed);
                     let head_bytes = bytes.load(std::sync::atomic::Ordering::Relaxed);
@@ -300,7 +348,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     out["http"] = serde_json::json!({
                         "requests": req.load(std::sync::atomic::Ordering::Relaxed),
                         "bytes": bytes.load(std::sync::atomic::Ordering::Relaxed),
-                        "hinted_pages": hinted.load(std::sync::atomic::Ordering::Relaxed),
                     });
                     out
                 }
@@ -308,29 +355,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             println!("{}", out);
         }
-        Cmd::Head { cmd: HeadCmd::Fetch { beacon, bucket, checkpoint } } => {
+        Cmd::Head {
+            cmd:
+                HeadCmd::Fetch {
+                    beacon,
+                    bucket,
+                    checkpoint,
+                },
+        } => {
             let f = csl_eth_head::fetch::fetch_into(&beacon, &bucket, checkpoint)?;
             let mut out = head_json(&f.head);
             out["updates_written"] = serde_json::json!(f.updates);
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
-        Cmd::Head { cmd: HeadCmd::Verify { checkpoint, bucket, url, proxy } } => {
+        Cmd::Head {
+            cmd:
+                HeadCmd::Verify {
+                    checkpoint,
+                    bucket,
+                    url,
+                    proxy,
+                },
+        } => {
             let now = std::time::SystemTime::now();
-            let chain = csl_eth_head::Chain::mainnet();
-            let h = match (bucket, url) {
-                (Some(dir), None) => csl_eth_head::verify(&csl_eth_head::DirSource(dir), &chain, checkpoint, now)?,
+            let (h, http) = match (bucket, url) {
+                (Some(dir), None) => (
+                    csl_eth_client::head::verify_head(&DirDriver::new(dir), checkpoint, now)?,
+                    None,
+                ),
                 (None, Some(base)) => {
-                    let b = csl_eth_client::HttpBucket::new(&base, proxy.as_deref())?;
-                    csl_eth_head::verify(&csl_eth_client::head::HeadFiles(&b), &chain, checkpoint, now)?
+                    let b = csl_eth_client::HttpDriver::new(&base, proxy.as_deref())?;
+                    let h = csl_eth_client::head::verify_head(&b, checkpoint, now)?;
+                    let http = serde_json::json!({
+                        "requests": b.requests.load(std::sync::atomic::Ordering::Relaxed),
+                        "bytes": b.bytes.load(std::sync::atomic::Ordering::Relaxed),
+                    });
+                    (h, Some(http))
                 }
                 _ => return Err("give --bucket <dir> or --url <base>".into()),
             };
-            println!("{}", serde_json::to_string_pretty(&head_json(&h))?);
+            let mut out = head_json(&h);
+            if let Some(http) = http {
+                out["http"] = http;
+            }
+            println!("{}", serde_json::to_string_pretty(&out)?);
         }
-        Cmd::Peers { count, timeout_secs, udp_port } => {
+        Cmd::Peers {
+            count,
+            timeout_secs,
+            udp_port,
+        } => {
             let rows = probe(count, Duration::from_secs(timeout_secs), udp_port).await;
             for (record, client, snap, head) in &rows {
-                println!("{:<45} snap/{} head={} {}", client, snap, head.map(|n| n.to_string()).unwrap_or_else(|| "?".into()), record.address);
+                println!(
+                    "{:<45} snap/{} head={} {}",
+                    client,
+                    snap,
+                    head.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+                    record.address
+                );
             }
             println!("{} peers", rows.len());
         }
@@ -346,23 +429,15 @@ struct Series {
     rounds: Vec<u64>,
     nodes: Vec<u64>,
     micros: Vec<u64>,
-    http_requests: Vec<u64>,
-    http_bytes: Vec<u64>,
-    http_dependent: Vec<u64>,
 }
 
 impl Series {
-    fn push(&mut self, c: &csl_eth_client::Cost, wall: Duration, http: Option<(u64, u64, u64)>) {
+    fn push(&mut self, c: &csl_eth_client::Cost, wall: Duration) {
         self.requests.push(c.requests);
         self.bytes.push(c.bytes);
         self.rounds.push(c.rounds as u64);
         self.nodes.push(c.nodes as u64);
         self.micros.push(wall.as_micros() as u64);
-        if let Some((r, b, d)) = http {
-            self.http_requests.push(r);
-            self.http_bytes.push(b);
-            self.http_dependent.push(d);
-        }
     }
 
     fn summary(&self) -> serde_json::Value {
@@ -387,9 +462,6 @@ impl Series {
             "rounds": stats(&self.rounds),
             "nodes_walked": stats(&self.nodes),
             "ms": stats(&self.micros.iter().map(|u| u / 1000).collect::<Vec<_>>()),
-            "http_requests": stats(&self.http_requests),
-            "http_bytes": stats(&self.http_bytes),
-            "http_dependent_requests": stats(&self.http_dependent),
         })
     }
 }
@@ -398,38 +470,24 @@ struct CheckOpts {
     samples: usize,
     d_account: Option<usize>,
     d_storage: Option<usize>,
-    prefetch: Option<Hint>,
+    hint: Hint,
     top_levels: usize,
-    /// HTTP requests, bytes and hinted pages, when the bucket is remote.
-    http: Option<[Arc<AtomicU64>; 3]>,
-}
-
-/// A read's HTTP cost: requests and bytes actually on the wire, and how
-/// many of the requests were dependent (not in the prefetch hint).
-fn http_delta(o: &CheckOpts, before: [u64; 3]) -> Option<(u64, u64, u64)> {
-    let c = o.http.as_ref()?;
-    let now = [c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed), c[2].load(Ordering::Relaxed)];
-    let (req, bytes, hinted) = (now[0] - before[0], now[1] - before[1], now[2] - before[2]);
-    Some((req, bytes, req.saturating_sub(hinted)))
-}
-
-fn http_now(o: &CheckOpts) -> [u64; 3] {
-    match &o.http {
-        Some(c) => [c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed), c[2].load(Ordering::Relaxed)],
-        None => [0; 3],
-    }
 }
 
 /// Sampled accounts, their slots and code, absent keys inside the prefix
 /// and keys outside it, through the client; cost and wall time per read.
-fn check<B: csl_eth_client::Bucket>(s: &Slice, mut snap: Snapshot<B>, o: &CheckOpts) -> serde_json::Value {
+fn check<D: csl_eth_client::Driver>(
+    s: &Slice,
+    mut snap: Snapshot<D>,
+    o: &CheckOpts,
+) -> serde_json::Value {
     if let Some(d) = o.d_account {
         snap.d_account = d;
     }
     if let Some(d) = o.d_storage {
         snap.d_storage = d;
     }
-    snap.prefetch = o.prefetch;
+    snap.hint = o.hint;
     snap.top_levels = o.top_levels;
     let prefix_nibbles = parse_prefix(&s.head.prefix).expect("slice prefix");
     let in_prefix = |h: &B256| csl_eth_trie::path_of(h).starts_with(&prefix_nibbles);
@@ -442,10 +500,10 @@ fn check<B: csl_eth_client::Bucket>(s: &Slice, mut snap: Snapshot<B>, o: &CheckO
     let (mut wrong, mut unexpected) = (0usize, 0usize);
     let t_all = std::time::Instant::now();
     for (i, (h, a)) in s.accounts.iter().enumerate().step_by(stride) {
-        let (t, h0) = (std::time::Instant::now(), http_now(o));
+        let t = std::time::Instant::now();
         let (r, c) = snap.account(h);
         match r {
-            Read::Verified(got) if got == *a => acc.push(&c, t.elapsed(), http_delta(o, h0)),
+            Read::Verified(got) if got == *a => acc.push(&c, t.elapsed()),
             Read::Verified(_) => wrong += 1,
             other => {
                 unexpected += 1;
@@ -454,10 +512,10 @@ fn check<B: csl_eth_client::Bucket>(s: &Slice, mut snap: Snapshot<B>, o: &CheckO
         }
         if let Some(slots) = s.storage.get(&a.storage_root) {
             if let Some((k, v)) = slots.get(i % slots.len()) {
-                let (t, h0) = (std::time::Instant::now(), http_now(o));
+                let t = std::time::Instant::now();
                 let (r, c) = snap.storage(h, k);
                 match r {
-                    Read::Verified(got) if got == *v => slot.push(&c, t.elapsed(), http_delta(o, h0)),
+                    Read::Verified(got) if got == *v => slot.push(&c, t.elapsed()),
                     Read::Verified(_) => wrong += 1,
                     other => {
                         unexpected += 1;
@@ -467,10 +525,12 @@ fn check<B: csl_eth_client::Bucket>(s: &Slice, mut snap: Snapshot<B>, o: &CheckO
             }
         }
         if a.code_hash != KECCAK_EMPTY {
-            let (t, h0) = (std::time::Instant::now(), http_now(o));
+            let t = std::time::Instant::now();
             let (r, c) = snap.code(&a.code_hash);
             match r {
-                Read::Verified(bytes) if alloy_primitives::keccak256(&bytes) == a.code_hash => code.push(&c, t.elapsed(), http_delta(o, h0)),
+                Read::Verified(bytes) if alloy_primitives::keccak256(&bytes) == a.code_hash => {
+                    code.push(&c, t.elapsed())
+                }
                 Read::Verified(_) => wrong += 1,
                 other => {
                     unexpected += 1;
@@ -483,10 +543,10 @@ fn check<B: csl_eth_client::Bucket>(s: &Slice, mut snap: Snapshot<B>, o: &CheckO
         let mut k = *h;
         k.0[31] ^= 0x5a;
         if s.accounts.binary_search_by(|(x, _)| x.cmp(&k)).is_err() {
-            let (t, h0) = (std::time::Instant::now(), http_now(o));
+            let t = std::time::Instant::now();
             let (r, c) = snap.account(&k);
             match r {
-                Read::VerifiedAbsent(_) => absent.push(&c, t.elapsed(), http_delta(o, h0)),
+                Read::VerifiedAbsent(_) => absent.push(&c, t.elapsed()),
                 other => {
                     unexpected += 1;
                     eprintln!("absent {k}: {other:?}");
@@ -497,10 +557,10 @@ fn check<B: csl_eth_client::Bucket>(s: &Slice, mut snap: Snapshot<B>, o: &CheckO
         let mut k = *h;
         k.0[0] ^= 0x10;
         if !in_prefix(&k) {
-            let (t, h0) = (std::time::Instant::now(), http_now(o));
+            let t = std::time::Instant::now();
             let (r, c) = snap.account(&k);
             match r {
-                Read::Insufficient(Reason::Missing { .. }) => outside.push(&c, t.elapsed(), http_delta(o, h0)),
+                Read::Insufficient(Reason::Missing { .. }) => outside.push(&c, t.elapsed()),
                 other => {
                     unexpected += 1;
                     eprintln!("outside {k}: {other:?}");
@@ -513,7 +573,7 @@ fn check<B: csl_eth_client::Bucket>(s: &Slice, mut snap: Snapshot<B>, o: &CheckO
         "prefix": s.head.prefix,
         "d_account": snap.d_account,
         "d_storage": snap.d_storage,
-        "prefetch": o.prefetch.map(|h| serde_json::json!({"below": h.below, "above": h.above, "merge": h.merge})),
+        "hint": {"below": o.hint.below, "above": o.hint.above, "merge": o.hint.merge},
         "top_levels": o.top_levels,
         "wrong_values": wrong,
         "unexpected_reads": unexpected,
