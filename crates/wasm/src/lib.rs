@@ -111,11 +111,13 @@ enum Op {
     Account {
         hashed: B256,
         address: Option<String>,
+        baseline: bool,
     },
     Storage {
         hashed: B256,
         address: Option<String>,
         hashed_slot: B256,
+        baseline: bool,
     },
     Code(B256),
 }
@@ -228,21 +230,24 @@ impl Client {
         self.step()
     }
 
-    /// The account under an address or a hashed key.
-    pub fn account(&mut self, key: &str) -> String {
+    /// The account under an address or a hashed key. `baseline` reads it
+    /// the content-addressed way (every node by hash, one round each)
+    /// instead of the path-keyed one.
+    pub fn account(&mut self, key: &str, baseline: bool) -> String {
         match account_key(key) {
-            Ok((hashed, address)) => self.start(Op::Account { hashed, address }),
+            Ok((hashed, address)) => self.start(Op::Account { hashed, address, baseline }),
             Err(e) => self.fail(e),
         }
     }
 
     /// Storage slot `slot` (hex or decimal) of the account under `key`.
-    pub fn storage(&mut self, key: &str, slot: &str) -> String {
+    pub fn storage(&mut self, key: &str, slot: &str, baseline: bool) -> String {
         match (account_key(key), slot_key(slot)) {
             (Ok((hashed, address)), Ok(hashed_slot)) => self.start(Op::Storage {
                 hashed,
                 address,
                 hashed_slot,
+                baseline,
             }),
             (Err(e), _) | (_, Err(e)) => self.fail(e),
         }
@@ -322,14 +327,18 @@ impl Client {
                     None => return self.fail("open first"),
                 };
                 match op {
-                    Op::Account { hashed, address } => match snap.try_account(&hashed) {
+                    Op::Account { hashed, address, baseline } => match if baseline {
+                        snap.try_account_by_hash(&hashed)
+                    } else {
+                        snap.try_account(&hashed)
+                    } {
                         Err(Pending) => {
                             let w = snap.store().take_wanted(merge);
-                            self.op = Op::Account { hashed, address };
+                            self.op = Op::Account { hashed, address, baseline };
                             self.need(w)
                         }
                         Ok((r, cost)) => {
-                            let v = serde_json::json!({ "hashed": format!("{hashed}"), "address": address });
+                            let v = serde_json::json!({ "hashed": format!("{hashed}"), "address": address, "baseline": baseline });
                             self.finish(r, cost, v, |a, v| {
                                 v["nonce"] = serde_json::json!(a.nonce);
                                 v["balance"] = serde_json::json!(a.balance.to_string());
@@ -346,19 +355,25 @@ impl Client {
                         hashed,
                         address,
                         hashed_slot,
-                    } => match snap.try_storage(&hashed, &hashed_slot) {
+                        baseline,
+                    } => match if baseline {
+                        snap.try_storage_by_hash(&hashed, &hashed_slot)
+                    } else {
+                        snap.try_storage(&hashed, &hashed_slot)
+                    } {
                         Err(Pending) => {
                             let w = snap.store().take_wanted(merge);
                             self.op = Op::Storage {
                                 hashed,
                                 address,
                                 hashed_slot,
+                                baseline,
                             };
                             self.need(w)
                         }
                         Ok((r, cost)) => {
                             let v = serde_json::json!({
-                                "hashed": format!("{hashed}"), "address": address, "hashed_slot": format!("{hashed_slot}")
+                                "hashed": format!("{hashed}"), "address": address, "hashed_slot": format!("{hashed_slot}"), "baseline": baseline
                             });
                             self.finish(r, cost, v, |x, v| {
                                 v["value"] = serde_json::json!(format!("{x:#x}"));

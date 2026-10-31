@@ -64,6 +64,8 @@ export interface ReadResult {
   hashed?: string;
   address?: string | null;
   hashed_slot?: string;
+  /// The read went the content-addressed way (every node by hash).
+  baseline?: boolean;
   nonce?: number;
   balance?: string;
   storage_root?: string;

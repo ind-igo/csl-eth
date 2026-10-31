@@ -10,8 +10,8 @@ import type { Need, RequestLog, Step, Trip } from "./protocol.ts";
 export interface ClientLike {
   free(): void;
   open(): string;
-  account(key: string): string;
-  storage(key: string, slot: string): string;
+  account(key: string, baseline: boolean): string;
+  storage(key: string, slot: string, baseline: boolean): string;
   code(hash: string): string;
   supply(i: number, status: number, body?: Uint8Array | null, error?: string | null): void;
   step(): string;

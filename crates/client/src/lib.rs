@@ -20,12 +20,20 @@
 //! widened by the [`Hint`], and later rounds carry only what the walk
 //! found missing, so a read is one round trip when the prediction holds
 //! and one more per miss, however many pages each round has.
+//!
+//! The content-addressed baseline (profile §9) reads the same state the
+//! way a hash-addressed store must: `account_by_hash` and
+//! `storage_by_hash` walk from the root fetching each node by its hash
+//! from `nodes_by_hash`, so a read is one dependent round per node on the
+//! path. Same host, same files, same verification; only the key changes.
+//! It is measured beside the path-keyed read, not used by wallets.
 
 use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{Nibbles, EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use csl_eth_store::{
     blob_path, manifest_path, table_path, Manifest, D_ACCOUNT, D_STORAGE, FORMAT_VERSION,
-    LATEST_FILE, RUN_FORMAT, TABLE_ACCOUNT_NODES, TABLE_CODE, TABLE_COUNT, TABLE_STORAGE_NODES,
+    LATEST_FILE, RUN_FORMAT, TABLE_ACCOUNT_NODES, TABLE_CODE, TABLE_COUNT, TABLE_NODES_BY_HASH,
+    TABLE_STORAGE_NODES,
 };
 use csl_eth_trie::{decode_word, path_of, walk, AbsentBy, Account, Invalid, NodeKey, Outcome};
 use csl_run::Reader;
@@ -647,6 +655,110 @@ impl<D: Driver> Snapshot<D> {
         Ok((r, repairs, nodes))
     }
 
+    /// The baseline's walk: no speculation, every node fetched by the hash
+    /// its parent committed to, one dependent round each (two when the
+    /// node's model page is cold). `repairs` counts the nodes fetched. The
+    /// top-level cache applies when `cache`, as it does to the path-keyed
+    /// walk, so the two are compared on equal terms.
+    fn walk_by_hash(
+        &mut self,
+        root: B256,
+        path: &Nibbles,
+        cache: bool,
+    ) -> Result<(Read<Vec<u8>>, u32, usize), Pending> {
+        if root == EMPTY_ROOT_HASH {
+            return Ok((Read::VerifiedAbsent(AbsentBy::EmptyTrie), 0, 0));
+        }
+        let mut nodes = Nodes::new();
+        if cache {
+            for d in 0..self.top_levels {
+                let nk = NodeKey::prefix(path, d);
+                if let Some(Some(v)) = self.top.get(&nk) {
+                    nodes.insert(nk, v.clone());
+                }
+            }
+        }
+        let mut fetched = 0u32;
+        let (outcome, walked) = loop {
+            let w = walk(root, path, &nodes);
+            let walked = w.nodes;
+            match w.outcome {
+                Outcome::Present(v) => break (Read::Verified(v), walked),
+                Outcome::Absent(by) => break (Read::VerifiedAbsent(by), walked),
+                Outcome::Invalid(nk, what) => {
+                    let key = w.expected.map(|h| h.0).unwrap_or_else(|| nk.table_key().unwrap_or([0; 32]));
+                    let r = Reason::Invalid {
+                        table: TABLE_NODES_BY_HASH,
+                        key,
+                        what,
+                    };
+                    break (Read::Insufficient(r), walked);
+                }
+                Outcome::Missing(nk) => {
+                    if fetched >= MAX_REPAIRS {
+                        break (Read::Insufficient(Reason::Budget), walked);
+                    }
+                    let h = w.expected.expect("a missing node has the hash its parent committed to");
+                    fetched += 1;
+                    self.want_pages(TABLE_NODES_BY_HASH, &[h.0]);
+                    match self.fetch(TABLE_NODES_BY_HASH, &h.0)? {
+                        Ok(Some(v)) => {
+                            nodes.insert(nk, v);
+                        }
+                        Ok(None) => {
+                            let r = Reason::Missing {
+                                table: TABLE_NODES_BY_HASH,
+                                key: h.0,
+                            };
+                            break (Read::Insufficient(r), walked);
+                        }
+                        Err(r) => break (Read::Insufficient(r), walked),
+                    }
+                }
+            }
+        };
+        if cache && self.top_levels > 0 && !outcome.is_insufficient() {
+            self.top_keep(path, &nodes, self.top_levels);
+        }
+        Ok((outcome, fetched, walked))
+    }
+
+    /// The account under `hashed`, read the baseline's way (see the crate
+    /// doc): the same answer as `try_account`, one round per node.
+    pub fn try_account_by_hash(
+        &mut self,
+        hashed: &B256,
+    ) -> Result<(Read<Account>, Cost), Pending> {
+        let path = path_of(hashed);
+        let (r, fetched, nodes) = self.walk_by_hash(self.state_root(), &path, true)?;
+        let r = r.map(|v| match Account::decode(&v) {
+            Ok(a) => Read::Verified(a),
+            Err(_) => Read::Insufficient(Reason::Value("account leaf")),
+        });
+        Ok((r, self.cost(fetched, nodes)))
+    }
+
+    /// Storage slot `hashed_slot` of the account under `hashed`, the
+    /// baseline's way: the account's nodes, then the slot's, one round each.
+    pub fn try_storage_by_hash(
+        &mut self,
+        hashed: &B256,
+        hashed_slot: &B256,
+    ) -> Result<(Read<U256>, Cost), Pending> {
+        let (acct, af, an) = self.try_account_by_hash(hashed).map(|(r, c)| (r, c.repairs, c.nodes))?;
+        let acct = match acct {
+            Read::Verified(a) => a,
+            Read::VerifiedAbsent(b) => return Ok((Read::VerifiedAbsent(b), self.cost(af, an))),
+            Read::Insufficient(r) => return Ok((Read::Insufficient(r), self.cost(af, an))),
+        };
+        let (r, sf, sn) = self.walk_by_hash(acct.storage_root, &path_of(hashed_slot), false)?;
+        let r = r.map(|v| match decode_word(&v) {
+            Ok(w) => Read::Verified(w),
+            Err(_) => Read::Insufficient(Reason::Value("storage leaf")),
+        });
+        Ok((r, self.cost(af + sf, an + sn)))
+    }
+
     /// The account under `hashed = keccak(address)`, from the store.
     pub fn try_account(&mut self, hashed: &B256) -> Result<(Read<Account>, Cost), Pending> {
         let (r, repairs, nodes) = self.account_walk(hashed)?;
@@ -782,5 +894,15 @@ impl<D: Driver> Snapshot<D> {
     /// Bytecode under a `codeHash` the caller verified.
     pub fn code(&mut self, code_hash: &B256) -> (Read<Vec<u8>>, Cost) {
         self.run(|s| s.try_code(code_hash))
+    }
+
+    /// The account, the content-addressed baseline's way.
+    pub fn account_by_hash(&mut self, hashed: &B256) -> (Read<Account>, Cost) {
+        self.run(|s| s.try_account_by_hash(hashed))
+    }
+
+    /// The storage slot, the content-addressed baseline's way.
+    pub fn storage_by_hash(&mut self, hashed: &B256, hashed_slot: &B256) -> (Read<U256>, Cost) {
+        self.run(|s| s.try_storage_by_hash(hashed, hashed_slot))
     }
 }

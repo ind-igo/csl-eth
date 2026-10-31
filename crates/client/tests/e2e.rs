@@ -592,3 +592,102 @@ fn epsilon_against_requests_per_read() {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// The content-addressed baseline (profile §9) over the same bucket: the
+/// same answers as the path-keyed read, every node one dependent round,
+/// and a tampered node by hash is `Insufficient`, never a value.
+#[test]
+fn baseline_by_hash_agrees_and_costs_a_round_per_node() {
+    let w = world(1500, 11);
+    let dir = scratch("baseline");
+    produce(&dir, &w.head, "", w.accounts.iter().cloned(), &w.code).unwrap();
+    let mut snap = Snapshot::open(DirDriver::new(&dir), None, w.head.state_root).unwrap();
+    let eps = snap.manifest().table(TABLE_ACCOUNT_NODES).unwrap().epsilon_pages as u64;
+    snap.hint = csl_eth_client::Hint::symmetric(eps + 1);
+
+    let mut path_rounds = 0u64;
+    let mut hash_rounds = 0u64;
+    let mut hash_max = Cost::default();
+    for a in w.accounts.iter().step_by(7) {
+        let (p, pc) = snap.account(&a.hashed);
+        let (h, hc) = snap.account_by_hash(&a.hashed);
+        assert_eq!(p, Read::Verified(a.account));
+        assert_eq!(h, p, "{}", a.hashed);
+        // Every node on the path is one fetch and, unless the widened
+        // round of an earlier node happened to bring its page, one round;
+        // the aggregate below is where "serial" is asserted.
+        assert!(hc.repairs >= 1 && hc.rounds >= 1, "{}: {hc:?}", a.hashed);
+        assert!(hc.repairs as usize <= hc.nodes, "a node fetched by hash is a node walked (embedded ones are walked, not fetched)");
+        path_rounds += pc.rounds as u64;
+        hash_rounds += hc.rounds as u64;
+        hash_max.rounds = hash_max.rounds.max(hc.rounds);
+        hash_max.requests = hash_max.requests.max(hc.requests);
+        hash_max.bytes = hash_max.bytes.max(hc.bytes);
+    }
+    eprintln!("rounds: path {path_rounds}, by hash {hash_rounds}; by hash max {hash_max:?}");
+    assert!(hash_rounds > 3 * path_rounds, "the baseline is serial");
+
+    // Absent keys: proven by the trie, the same shape either way.
+    let present: BTreeMap<B256, ()> = w.accounts.iter().map(|a| (a.hashed, ())).collect();
+    let mut rng = ChaCha8Rng::seed_from_u64(3);
+    for _ in 0..50 {
+        let k = random_absent(&mut rng, &present);
+        let (p, _) = snap.account(&k);
+        let (h, hc) = snap.account_by_hash(&k);
+        assert!(p.is_absent() && h == p, "{k}: {p:?} / {h:?}");
+        assert!(hc.rounds >= 1);
+    }
+
+    // Storage: account nodes then slot nodes, all by hash.
+    let mut slots = 0;
+    for a in w.accounts.iter().filter(|a| !a.storage.is_empty()).take(30) {
+        let (s, v) = a.storage[a.storage.len() / 2];
+        let (p, pc) = snap.storage(&a.hashed, &s);
+        let (h, hc) = snap.storage_by_hash(&a.hashed, &s);
+        assert_eq!(p, Read::Verified(v));
+        assert_eq!(h, p);
+        assert!(hc.rounds > pc.rounds, "{}: path {pc:?} hash {hc:?}", a.hashed);
+        slots += 1;
+    }
+    assert!(slots > 0);
+    let empty = w.accounts.iter().find(|a| a.storage.is_empty()).unwrap();
+    let (r, _) = snap.storage_by_hash(&empty.hashed, &B256::repeat_byte(9));
+    assert_eq!(r, Read::VerifiedAbsent(AbsentBy::EmptyTrie));
+
+    // With the top levels cached, the baseline skips those rounds too.
+    snap.top_levels = 3;
+    let a = &w.accounts[5];
+    let (_, first) = snap.account_by_hash(&a.hashed);
+    let b = &w.accounts[6];
+    let (r, second) = snap.account_by_hash(&b.hashed);
+    assert_eq!(r, Read::Verified(b.account));
+    assert!(second.repairs < first.repairs || first.repairs <= 3, "cache: {first:?} then {second:?}");
+    snap.top_levels = 0;
+
+    // Tamper with nodes_by_hash: a value byte flipped in the middle of the
+    // table. Every read is still right or Insufficient.
+    let rel = table_path(&snap.manifest().block_hash, csl_eth_store::TABLE_NODES_BY_HASH);
+    let path = dir.join(&rel);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mut rng = ChaCha8Rng::seed_from_u64(9);
+    for _ in 0..400 {
+        let i = rng.random_range(4096..bytes.len());
+        bytes[i] ^= 0x01;
+    }
+    std::fs::write(&path, &bytes).unwrap();
+    let mut snap = Snapshot::open(DirDriver::new(&dir), None, w.head.state_root).unwrap();
+    let (mut ok, mut insufficient) = (0, 0);
+    for a in w.accounts.iter().step_by(5) {
+        match snap.account_by_hash(&a.hashed).0 {
+            Read::Verified(got) => {
+                assert_eq!(got, a.account);
+                ok += 1;
+            }
+            Read::VerifiedAbsent(_) => panic!("tampering made {} absent", a.hashed),
+            Read::Insufficient(_) => insufficient += 1,
+        }
+    }
+    eprintln!("tampered nodes_by_hash: {ok} verified, {insufficient} insufficient");
+    assert!(insufficient > 0, "400 flipped bytes hit something");
+    std::fs::remove_dir_all(&dir).ok();
+}

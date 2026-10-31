@@ -1,12 +1,12 @@
 //! `csl-eth`: fetch a mainnet slice over snap, build a bucket from it,
 //! probe peers.
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, U256};
 use clap::{Parser, Subcommand};
 use csl_eth_client::{open_at_head, DirDriver, Hint, Read, Reason, Snapshot, VerifiedHead};
 use csl_eth_snap::{fetch, probe, FetchConfig, Slice};
 use csl_eth_store::{produce_with, ProduceOptions};
-use csl_eth_trie::Nibbles;
+use csl_eth_trie::{Account, Nibbles};
 use csl_eth_trie::KECCAK_EMPTY;
 use std::{path::PathBuf, time::Duration};
 
@@ -108,6 +108,10 @@ enum Cmd {
         /// reads (0: off).
         #[arg(long, default_value_t = 0)]
         top_levels: usize,
+        /// Read the content-addressed baseline instead (profile §9): every
+        /// node fetched by hash from `nodes_by_hash`, one round each.
+        #[arg(long)]
+        baseline: bool,
         /// Verify the head from the bucket's `head/` files starting at this
         /// weak-subjectivity checkpoint root, and read at the finalized
         /// block's `state_root` instead of the slice's pinned header.
@@ -309,6 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             prefetch_above,
             no_merge,
             top_levels,
+            baseline,
             checkpoint,
         } => {
             let s = Slice::read(&slice)?;
@@ -323,6 +328,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 d_storage,
                 hint,
                 top_levels,
+                baseline,
             };
             let out = match (bucket, url) {
                 (Some(dir), None) => {
@@ -475,6 +481,23 @@ struct CheckOpts {
     d_storage: Option<usize>,
     hint: Hint,
     top_levels: usize,
+    baseline: bool,
+}
+
+fn read_account<D: csl_eth_client::Driver>(snap: &mut Snapshot<D>, baseline: bool, h: &B256) -> (Read<Account>, csl_eth_client::Cost) {
+    if baseline {
+        snap.account_by_hash(h)
+    } else {
+        snap.account(h)
+    }
+}
+
+fn read_slot<D: csl_eth_client::Driver>(snap: &mut Snapshot<D>, baseline: bool, h: &B256, k: &B256) -> (Read<U256>, csl_eth_client::Cost) {
+    if baseline {
+        snap.storage_by_hash(h, k)
+    } else {
+        snap.storage(h, k)
+    }
 }
 
 /// Sampled accounts, their slots and code, absent keys inside the prefix
@@ -504,7 +527,7 @@ fn check<D: csl_eth_client::Driver>(
     let t_all = std::time::Instant::now();
     for (i, (h, a)) in s.accounts.iter().enumerate().step_by(stride) {
         let t = std::time::Instant::now();
-        let (r, c) = snap.account(h);
+        let (r, c) = read_account(&mut snap, o.baseline, h);
         match r {
             Read::Verified(got) if got == *a => acc.push(&c, t.elapsed()),
             Read::Verified(_) => wrong += 1,
@@ -516,7 +539,7 @@ fn check<D: csl_eth_client::Driver>(
         if let Some(slots) = s.storage.get(&a.storage_root) {
             if let Some((k, v)) = slots.get(i % slots.len()) {
                 let t = std::time::Instant::now();
-                let (r, c) = snap.storage(h, k);
+                let (r, c) = read_slot(&mut snap, o.baseline, h, k);
                 match r {
                     Read::Verified(got) if got == *v => slot.push(&c, t.elapsed()),
                     Read::Verified(_) => wrong += 1,
@@ -547,7 +570,7 @@ fn check<D: csl_eth_client::Driver>(
         k.0[31] ^= 0x5a;
         if s.accounts.binary_search_by(|(x, _)| x.cmp(&k)).is_err() {
             let t = std::time::Instant::now();
-            let (r, c) = snap.account(&k);
+            let (r, c) = read_account(&mut snap, o.baseline, &k);
             match r {
                 Read::VerifiedAbsent(_) => absent.push(&c, t.elapsed()),
                 other => {
@@ -561,7 +584,7 @@ fn check<D: csl_eth_client::Driver>(
         k.0[0] ^= 0x10;
         if !in_prefix(&k) {
             let t = std::time::Instant::now();
-            let (r, c) = snap.account(&k);
+            let (r, c) = read_account(&mut snap, o.baseline, &k);
             match r {
                 Read::Insufficient(Reason::Missing { .. }) => outside.push(&c, t.elapsed()),
                 other => {
@@ -578,6 +601,7 @@ fn check<D: csl_eth_client::Driver>(
         "d_storage": snap.d_storage,
         "hint": {"below": o.hint.below, "above": o.hint.above, "merge": o.hint.merge},
         "top_levels": o.top_levels,
+        "mode": if o.baseline { "baseline" } else { "path" },
         "wrong_values": wrong,
         "unexpected_reads": unexpected,
         "wall_ms": t_all.elapsed().as_millis() as u64,

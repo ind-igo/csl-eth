@@ -14,6 +14,7 @@ const base = $<HTMLInputElement>("base");
 const checkpoint = $<HTMLInputElement>("checkpoint");
 const prefetch = $<HTMLInputElement>("prefetch");
 const toplevels = $<HTMLInputElement>("toplevels");
+const baseline = $<HTMLInputElement>("baseline");
 const openBtn = $<HTMLButtonElement>("open");
 const openStatus = $<HTMLParagraphElement>("openstatus");
 const headEl = $<HTMLDivElement>("head");
@@ -98,7 +99,8 @@ function renderResult(r: ReadResult, what: string, trip: Trip) {
   }
   const dl = rows.map(([k, v, plain]) => `<dt>${esc(k)}</dt><dd${plain ? ' class="plain"' : ""}>${esc(v)}</dd>`).join("");
   const c = r.cost;
-  const cost = `<p class="cost"><b>${plural(c.requests, "request")}</b> in <b>${plural(c.rounds, "round")}</b>, <b>${kb(c.bytes)}</b>, <b>${trip.ms.toFixed(0)} ms</b> · ${plural(c.repairs, "repair")}, ${c.nodes} trie nodes checked${c.model_pages ? `, ${plural(c.model_pages, "model page")} fetched` : ""}</p>`;
+  const how = r.baseline ? `<b>baseline</b> (by hash, serial) · ${plural(c.repairs, "node")} fetched one round each` : plural(c.repairs, "repair");
+  const cost = `<p class="cost"><b>${plural(c.requests, "request")}</b> in <b>${plural(c.rounds, "round")}</b>, <b>${kb(c.bytes)}</b>, <b>${trip.ms.toFixed(0)} ms</b> · ${how}, ${c.nodes} trie nodes checked${c.model_pages ? `, ${plural(c.model_pages, "model page")} fetched` : ""}</p>`;
   const more = what === "account" && r.status === "verified" && r.has_code ? `<div class="chips"><button class="ghost" id="readcode">read its code</button></div>` : "";
   resultEl.innerHTML = `${badge}<dl>${dl}</dl>${cost}${more}${logTable(trip.log)}`;
   const rc = document.getElementById("readcode");
@@ -171,9 +173,9 @@ async function read() {
   try {
     const start =
       what === "account"
-        ? () => c.account(key.value)
+        ? () => c.account(key.value, baseline.checked)
         : what === "storage"
-          ? () => c.storage(key.value, slot.value || "0")
+          ? () => c.storage(key.value, slot.value || "0", baseline.checked)
           : () => c.code(key.value);
     const { result, trip } = await drive<ReadResult>(c, bucket, start);
     renderResult(result, what, trip);
