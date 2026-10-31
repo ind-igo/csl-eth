@@ -7,7 +7,10 @@
 use alloy_primitives::{keccak256, B256, U256};
 use csl_eth_client::{DirBucket, Hint, Read, Reason, Snapshot};
 use csl_eth_store::{produce_with, AccountLeaf, Head, ProduceError, ProduceOptions};
-use csl_eth_trie::{build::build_all, encode_word, path_of, proof_for, verify_range, Account, Nibbles, Sealed, EMPTY_ROOT, KECCAK_EMPTY};
+use csl_eth_trie::{
+    build::build_all, encode_word, path_of, proof_for, verify_range, Account, Nibbles, Sealed,
+    EMPTY_ROOT, KECCAK_EMPTY,
+};
 use std::{collections::HashMap, path::PathBuf};
 
 const PREFIX: u8 = 0x7;
@@ -25,7 +28,14 @@ fn world(n: u32) -> World {
         .map(|i| {
             let hashed = keccak256(i.to_be_bytes());
             let storage: Vec<(B256, U256)> = if i % 3 == 0 {
-                let mut s: Vec<(B256, U256)> = (0..(1 + i % 7)).map(|j| (keccak256([i.to_be_bytes(), j.to_be_bytes()].concat()), U256::from(j + 1))).collect();
+                let mut s: Vec<(B256, U256)> = (0..(1 + i % 7))
+                    .map(|j| {
+                        (
+                            keccak256([i.to_be_bytes(), j.to_be_bytes()].concat()),
+                            U256::from(j + 1),
+                        )
+                    })
+                    .collect();
                 s.sort();
                 s
             } else {
@@ -34,7 +44,10 @@ fn world(n: u32) -> World {
             let storage_root = if storage.is_empty() {
                 EMPTY_ROOT
             } else {
-                let leaves: Vec<(Nibbles, Vec<u8>)> = storage.iter().map(|(k, v)| (path_of(k), encode_word(v))).collect();
+                let leaves: Vec<(Nibbles, Vec<u8>)> = storage
+                    .iter()
+                    .map(|(k, v)| (path_of(k), encode_word(v)))
+                    .collect();
                 build_all(&leaves).unwrap().0.root
             };
             let code_hash = if i % 4 == 0 {
@@ -47,16 +60,29 @@ fn world(n: u32) -> World {
             };
             AccountLeaf {
                 hashed,
-                account: Account { nonce: i as u64, balance: U256::from(i) * U256::from(1_000_000_007u64), storage_root, code_hash },
+                account: Account {
+                    nonce: i as u64,
+                    balance: U256::from(i) * U256::from(1_000_000_007u64),
+                    storage_root,
+                    code_hash,
+                },
                 storage,
             }
         })
         .collect();
     accounts.sort_by_key(|a| a.hashed);
-    let leaves: Vec<(Nibbles, Vec<u8>)> = accounts.iter().map(|a| (path_of(&a.hashed), a.account.encode())).collect();
+    let leaves: Vec<(Nibbles, Vec<u8>)> = accounts
+        .iter()
+        .map(|a| (path_of(&a.hashed), a.account.encode()))
+        .collect();
     let (built, nodes) = build_all(&leaves).unwrap();
     let nodes = nodes.into_iter().map(|(_, r)| (keccak256(&r), r)).collect();
-    World { accounts, code, root: built.root, nodes }
+    World {
+        accounts,
+        code,
+        root: built.root,
+        nodes,
+    }
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -91,7 +117,12 @@ fn slice_of(w: &World) -> (Vec<AccountLeaf>, Vec<Sealed>) {
     if dropped {
         boundary.push(v.last.unwrap());
     }
-    let inside: Vec<AccountLeaf> = w.accounts.iter().filter(|a| a.hashed >= lo && a.hashed <= hi).cloned().collect();
+    let inside: Vec<AccountLeaf> = w
+        .accounts
+        .iter()
+        .filter(|a| a.hashed >= lo && a.hashed <= hi)
+        .cloned()
+        .collect();
     (inside, boundary)
 }
 
@@ -100,9 +131,25 @@ fn slice_reads_inside_and_insufficient_outside() {
     let w = world(4000);
     let (inside, boundary) = slice_of(&w);
     assert!(inside.len() > 200 && inside.len() < 300, "{}", inside.len());
-    let head = Head { block_hash: B256::repeat_byte(0xAB), block_number: 1, timestamp: 1, state_root: w.root };
+    let head = Head {
+        block_hash: B256::repeat_byte(0xAB),
+        block_number: 1,
+        timestamp: 1,
+        state_root: w.root,
+    };
     let dir = scratch("ok");
-    let produced = produce_with(&dir, &head, "7", inside.iter().cloned(), &w.code, ProduceOptions { epsilon: 4, boundary: boundary.clone() }).unwrap();
+    let produced = produce_with(
+        &dir,
+        &head,
+        "7",
+        inside.iter().cloned(),
+        &w.code,
+        ProduceOptions {
+            epsilon: 4,
+            boundary: boundary.clone(),
+        },
+    )
+    .unwrap();
     assert_eq!(produced.stats.sealed as usize, boundary.len());
     assert_eq!(produced.stats.accounts as usize, inside.len());
 
@@ -148,7 +195,12 @@ fn slice_reads_inside_and_insufficient_outside() {
     // Present and absent keys outside the prefix: the root is there, the
     // depth-1 node under their nibble is sealed and missing. Never an answer.
     let mut outside = 0;
-    for a in w.accounts.iter().filter(|a| a.hashed.0[0] >> 4 != PREFIX).step_by(37) {
+    for a in w
+        .accounts
+        .iter()
+        .filter(|a| a.hashed.0[0] >> 4 != PREFIX)
+        .step_by(37)
+    {
         match snap.account(&a.hashed).0 {
             Read::Insufficient(Reason::Missing { .. }) => outside += 1,
             other => panic!("outside present {}: {other:?}", a.hashed),
@@ -172,10 +224,25 @@ fn slice_reads_inside_and_insufficient_outside() {
 fn a_wrong_or_missing_boundary_fails_the_root_check() {
     let w = world(1500);
     let (inside, boundary) = slice_of(&w);
-    let head = Head { block_hash: B256::repeat_byte(0xAC), block_number: 1, timestamp: 1, state_root: w.root };
+    let head = Head {
+        block_hash: B256::repeat_byte(0xAC),
+        block_number: 1,
+        timestamp: 1,
+        state_root: w.root,
+    };
     let dir = scratch("bad");
     // No boundary: the slice alone is not the trie.
-    let r = produce_with(&dir, &head, "7", inside.iter().cloned(), &w.code, ProduceOptions { epsilon: 4, boundary: Vec::new() });
+    let r = produce_with(
+        &dir,
+        &head,
+        "7",
+        inside.iter().cloned(),
+        &w.code,
+        ProduceOptions {
+            epsilon: 4,
+            boundary: Vec::new(),
+        },
+    );
     assert!(matches!(r, Err(ProduceError::StateRoot { .. })), "{r:?}");
     // One sealed reference altered.
     let mut bad = boundary.clone();
@@ -184,12 +251,32 @@ fn a_wrong_or_missing_boundary_fails_the_root_check() {
     let last = raw.len() - 1;
     raw[last] ^= 1;
     bad[0] = (p, alloy_trie::nodes::RlpNode::from_raw(&raw).unwrap());
-    let r = produce_with(&dir, &head, "7", inside.iter().cloned(), &w.code, ProduceOptions { epsilon: 4, boundary: bad });
+    let r = produce_with(
+        &dir,
+        &head,
+        "7",
+        inside.iter().cloned(),
+        &w.code,
+        ProduceOptions {
+            epsilon: 4,
+            boundary: bad,
+        },
+    );
     assert!(matches!(r, Err(ProduceError::StateRoot { .. })), "{r:?}");
     // One boundary subtree dropped.
     let mut bad = boundary.clone();
     bad.remove(bad.len() / 2);
-    let r = produce_with(&dir, &head, "7", inside.iter().cloned(), &w.code, ProduceOptions { epsilon: 4, boundary: bad });
+    let r = produce_with(
+        &dir,
+        &head,
+        "7",
+        inside.iter().cloned(),
+        &w.code,
+        ProduceOptions {
+            epsilon: 4,
+            boundary: bad,
+        },
+    );
     assert!(matches!(r, Err(ProduceError::StateRoot { .. })), "{r:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -201,9 +288,25 @@ fn a_wrong_or_missing_boundary_fails_the_root_check() {
 fn cached_top_levels_answer_the_same_for_fewer_requests() {
     let w = world(4000);
     let (inside, boundary) = slice_of(&w);
-    let head = Head { block_hash: B256::repeat_byte(0xAD), block_number: 1, timestamp: 1, state_root: w.root };
+    let head = Head {
+        block_hash: B256::repeat_byte(0xAD),
+        block_number: 1,
+        timestamp: 1,
+        state_root: w.root,
+    };
     let dir = scratch("cache");
-    produce_with(&dir, &head, "7", inside.iter().cloned(), &w.code, ProduceOptions { epsilon: 4, boundary }).unwrap();
+    produce_with(
+        &dir,
+        &head,
+        "7",
+        inside.iter().cloned(),
+        &w.code,
+        ProduceOptions {
+            epsilon: 4,
+            boundary,
+        },
+    )
+    .unwrap();
     let mut plain = Snapshot::open(DirBucket::new(&dir), None, w.root).unwrap();
     let mut cached = Snapshot::open(DirBucket::new(&dir), None, w.root).unwrap();
     cached.prefetch = Some(Hint::symmetric(1));
@@ -215,7 +318,12 @@ fn cached_top_levels_answer_the_same_for_fewer_requests() {
         k.0[0] = (PREFIX << 4) | (k.0[0] & 0x0f);
         keys.push(k);
     }
-    for a in w.accounts.iter().filter(|a| a.hashed.0[0] >> 4 != PREFIX).step_by(50) {
+    for a in w
+        .accounts
+        .iter()
+        .filter(|a| a.hashed.0[0] >> 4 != PREFIX)
+        .step_by(50)
+    {
         keys.push(a.hashed);
     }
     let (mut req_plain, mut req_cached) = (0u64, 0u64);
@@ -225,16 +333,27 @@ fn cached_top_levels_answer_the_same_for_fewer_requests() {
         match (&p, &c) {
             (Read::Verified(x), Read::Verified(y)) => assert_eq!(x, y),
             (Read::VerifiedAbsent(x), Read::VerifiedAbsent(y)) => assert_eq!(x, y),
-            (Read::Insufficient(Reason::Missing { .. }), Read::Insufficient(Reason::Missing { .. })) => {}
+            (
+                Read::Insufficient(Reason::Missing { .. }),
+                Read::Insufficient(Reason::Missing { .. }),
+            ) => {}
             other => panic!("{k}: {other:?}"),
         }
         if i > 0 {
             req_plain += cp.requests;
             req_cached += cc.requests;
-            assert!(cc.requests <= cp.requests, "{k}: cached {} > plain {}", cc.requests, cp.requests);
+            assert!(
+                cc.requests <= cp.requests,
+                "{k}: cached {} > plain {}",
+                cc.requests,
+                cp.requests
+            );
         }
     }
-    assert!(req_cached < req_plain, "cached {req_cached} plain {req_plain}");
+    assert!(
+        req_cached < req_plain,
+        "cached {req_cached} plain {req_plain}"
+    );
     // Storage and code are untouched by the account cache.
     for a in inside.iter().filter(|a| !a.storage.is_empty()).take(20) {
         let (slot, value) = &a.storage[0];

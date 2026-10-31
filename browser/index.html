@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>csl-eth · cold state in the browser</title>
+    <style>
+      :root {
+        --fg: #1b1b1b;
+        --muted: #666;
+        --bg: #fbfbfa;
+        --panel: #fff;
+        --line: #ddd;
+        --ok: #1d6b35;
+        --okbg: #e6f4ea;
+        --bad: #a3221b;
+        --badbg: #fbe9e7;
+        --warn: #8a5a00;
+        --warnbg: #fff4d6;
+        --accent: #2563a8;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --fg: #e6e6e6;
+          --muted: #9a9a9a;
+          --bg: #161616;
+          --panel: #1f1f1f;
+          --line: #383838;
+          --ok: #6fcf8a;
+          --okbg: #1b2e21;
+          --bad: #f08a80;
+          --badbg: #3a1f1c;
+          --warn: #f0c060;
+          --warnbg: #3a2f14;
+          --accent: #7db3ec;
+        }
+      }
+      * { box-sizing: border-box; }
+      [hidden] { display: none !important; }
+      body {
+        margin: 0 auto;
+        max-width: 64rem;
+        padding: 1rem;
+        font: 14px/1.45 system-ui, sans-serif;
+        color: var(--fg);
+        background: var(--bg);
+      }
+      h1 { font-size: 1.3rem; margin: 0.5rem 0 0.25rem; }
+      h2 { font-size: 0.95rem; margin: 0 0 0.6rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+      p.sub { color: var(--muted); margin: 0 0 1rem; }
+      .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 0.9rem 1rem; margin: 0.75rem 0; }
+      .row { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: flex-end; }
+      .row > label { display: flex; flex-direction: column; gap: 0.2rem; font-size: 12px; color: var(--muted); flex: 1 1 10rem; }
+      .row > label.wide { flex: 3 1 24rem; }
+      .row > label.narrow { flex: 0 1 6rem; }
+      input, select, button {
+        font: inherit;
+        color: var(--fg);
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0.4rem 0.55rem;
+      }
+      input.mono { font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; }
+      button { cursor: pointer; background: var(--accent); color: #fff; border-color: transparent; font-weight: 600; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      button.ghost { background: transparent; color: var(--accent); border-color: var(--line); font-weight: 500; }
+      .badge { display: inline-block; padding: 0.15rem 0.55rem; border-radius: 999px; font-size: 12px; font-weight: 600; }
+      .badge.ok { color: var(--ok); background: var(--okbg); }
+      .badge.bad { color: var(--bad); background: var(--badbg); }
+      .badge.warn { color: var(--warn); background: var(--warnbg); }
+      .badge.idle { color: var(--muted); background: var(--bg); border: 1px solid var(--line); }
+      dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 0.5rem 0 0; }
+      dt { color: var(--muted); }
+      dd { margin: 0; font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; overflow-wrap: anywhere; }
+      dd.plain { font-family: inherit; font-size: inherit; }
+      .cost { color: var(--muted); margin-top: 0.6rem; }
+      .cost b { color: var(--fg); font-weight: 600; }
+      table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+      th, td { text-align: left; padding: 0.2rem 0.4rem; border-top: 1px solid var(--line); }
+      th { color: var(--muted); font-weight: 500; border-top: none; }
+      td.num, th.num { text-align: right; }
+      details summary { cursor: pointer; color: var(--muted); margin-top: 0.6rem; }
+      .chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.6rem; }
+      .chips button { font-size: 12px; padding: 0.25rem 0.5rem; }
+      .status { color: var(--muted); }
+      .err { color: var(--bad); }
+      footer { color: var(--muted); font-size: 12px; margin: 1.5rem 0 0.5rem; }
+      a { color: var(--accent); }
+    </style>
+  </head>
+  <body>
+    <h1>Cold state, read from the browser</h1>
+    <p class="sub">
+      Ethereum mainnet state as static files on object storage. This tab verifies the chain's finalized head from one checkpoint root,
+      then reads accounts, storage, and code by byte range and checks every answer against the state root. No RPC, no node, nothing trusted but the checkpoint.
+    </p>
+
+    <div class="card">
+      <h2>Trust input</h2>
+      <div class="row">
+        <label class="wide">bucket URL<input id="base" class="mono" /></label>
+        <label class="wide">weak-subjectivity checkpoint (beacon block root)<input id="checkpoint" class="mono" /></label>
+        <label class="narrow">prefetch<input id="prefetch" type="number" min="0" max="8" value="1" /></label>
+        <label class="narrow">top levels<input id="toplevels" type="number" min="0" max="9" value="4" /></label>
+        <button id="open">Open</button>
+      </div>
+      <p class="status" id="openstatus">loading the client module…</p>
+    </div>
+
+    <div class="card">
+      <h2>Verified head</h2>
+      <div id="head"><span class="badge idle">not opened</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Read</h2>
+      <div class="row">
+        <label class="narrow">what
+          <select id="kind">
+            <option value="account">account</option>
+            <option value="storage">storage slot</option>
+            <option value="code">code</option>
+          </select>
+        </label>
+        <label class="wide" id="keylabel">address or hashed key<input id="key" class="mono" placeholder="0x…" /></label>
+        <label id="slotlabel" hidden>slot (hex or decimal)<input id="slot" class="mono" placeholder="0" /></label>
+        <button id="read" disabled>Read</button>
+      </div>
+      <div class="chips" id="chips"></div>
+    </div>
+
+    <div class="card">
+      <h2>Answer</h2>
+      <div id="result"><span class="badge idle">nothing read yet</span></div>
+    </div>
+
+    <footer>
+      <span id="version"></span> · the client is the same Rust crate the CLI uses, compiled to WebAssembly; verification happens in a Web Worker in this tab.
+    </footer>
+    <script type="module" src="./dist/main.js"></script>
+  </body>
+</html>

@@ -1,2 +1,9 @@
 [tools]
-rust = "1.98.1"
+# llvm-tools: llvm-ar for the browser build, whose C dependency (blst, under
+# helios-consensus-core) Apple's ar cannot archive for wasm32
+# (scripts/build-wasm.sh).
+rust = { version = "1.98.1", components = "llvm-tools", targets = "wasm32-unknown-unknown" }
+bun = "1.4.4"
+# Must equal the `wasm-bindgen` crate version in crates/wasm/Cargo.toml
+# exactly (scripts/build-wasm.sh checks).
+"cargo:wasm-bindgen-cli" = "0.2.129"

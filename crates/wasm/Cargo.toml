@@ -1,0 +1,22 @@
+[package]
+name = "csl-eth-wasm"
+description = "The Ethereum profile's client compiled for the browser: wasm-bindgen bindings over csl-eth-client with a synchronous JS-backed byte-range source, and the head verified in the tab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+csl-eth-client = { path = "../client" }
+csl-eth-head = { path = "../head" }
+csl-run.workspace = true
+alloy-primitives.workspace = true
+alloy-trie = { workspace = true, features = ["ethereum"] }
+hex.workspace = true
+serde_json.workspace = true
+wasm-bindgen = "0.2.129"
+js-sys = "0.3"
+getrandom = { version = "0.3", features = ["wasm_js"] }

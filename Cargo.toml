@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/trie", "crates/store", "crates/client", "crates/head", "crates/snap"]
+members = ["crates/trie", "crates/store", "crates/client", "crates/head", "crates/snap", "crates/wasm"]
 
 [workspace.package]
 version = "0.1.0"
@@ -29,3 +29,10 @@ clap = { version = "4.5", features = ["derive"] }
 debug = 1
 lto = "thin"
 codegen-units = 4
+
+# The browser build: release, no debug info, fat LTO, one codegen unit.
+[profile.wasm]
+inherits = "release"
+debug = false
+lto = "fat"
+codegen-units = 1

@@ -8,8 +8,8 @@
 
 use crate::{manifest_path, Bucket, Snapshot};
 use alloy_primitives::B256;
-pub use csl_eth_head::{Chain, ExecutionHead, HeadError, VerifiedHead};
 use csl_eth_head::{verify, HeadSource};
+pub use csl_eth_head::{Chain, ExecutionHead, HeadError, VerifiedHead};
 use csl_eth_store::Manifest;
 use std::{fmt, time::SystemTime};
 
@@ -27,7 +27,10 @@ pub enum HeadOpenError {
     Head(HeadError),
     /// The bucket has no snapshot at the finalized block. `newest` is the
     /// block its `latest` names, when that could be read.
-    NotAtHead { finalized: ExecutionHead, newest: Option<(u64, B256)> },
+    NotAtHead {
+        finalized: ExecutionHead,
+        newest: Option<(u64, B256)>,
+    },
     Open(String),
 }
 
@@ -35,11 +38,21 @@ impl fmt::Display for HeadOpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HeadOpenError::Head(e) => write!(f, "head: {e}"),
-            HeadOpenError::NotAtHead { finalized, newest: Some((n, h)) } => {
+            HeadOpenError::NotAtHead {
+                finalized,
+                newest: Some((n, h)),
+            } => {
                 write!(f, "no snapshot at finalized block {} ({}); the bucket's newest is block {n} ({h})", finalized.block_number, finalized.block_hash)
             }
-            HeadOpenError::NotAtHead { finalized, newest: None } => {
-                write!(f, "no snapshot at finalized block {} ({})", finalized.block_number, finalized.block_hash)
+            HeadOpenError::NotAtHead {
+                finalized,
+                newest: None,
+            } => {
+                write!(
+                    f,
+                    "no snapshot at finalized block {} ({})",
+                    finalized.block_number, finalized.block_hash
+                )
             }
             HeadOpenError::Open(e) => write!(f, "snapshot: {e}"),
         }
@@ -51,10 +64,18 @@ impl std::error::Error for HeadOpenError {}
 /// Verify the head from `checkpoint` as of `now`, then open the snapshot
 /// at the finalized execution block with its verified `state_root`.
 #[allow(clippy::result_large_err)]
-pub fn open_at_head<B: Bucket>(bucket: B, checkpoint: B256, now: SystemTime) -> Result<(Snapshot<B>, VerifiedHead), HeadOpenError> {
-    let head = verify(&HeadFiles(&bucket), &Chain::mainnet(), checkpoint, now).map_err(HeadOpenError::Head)?;
+pub fn open_at_head<B: Bucket>(
+    bucket: B,
+    checkpoint: B256,
+    now: SystemTime,
+) -> Result<(Snapshot<B>, VerifiedHead), HeadOpenError> {
+    let head = verify(&HeadFiles(&bucket), &Chain::mainnet(), checkpoint, now)
+        .map_err(HeadOpenError::Head)?;
     let at = head.execution.block_hash;
-    let present = bucket.read_file_opt(&manifest_path(&at)).map_err(HeadOpenError::Open)?.is_some();
+    let present = bucket
+        .read_file_opt(&manifest_path(&at))
+        .map_err(HeadOpenError::Open)?
+        .is_some();
     if !present {
         let newest = bucket
             .read_file_opt(csl_eth_store::LATEST_FILE)
@@ -69,8 +90,12 @@ pub fn open_at_head<B: Bucket>(bucket: B, checkpoint: B256, now: SystemTime) -> 
                 let m = Manifest::from_json(&m).ok()?;
                 Some((m.block_number, h))
             });
-        return Err(HeadOpenError::NotAtHead { finalized: head.execution, newest });
+        return Err(HeadOpenError::NotAtHead {
+            finalized: head.execution,
+            newest,
+        });
     }
-    let snap = Snapshot::open(bucket, Some(at), head.execution.state_root).map_err(HeadOpenError::Open)?;
+    let snap =
+        Snapshot::open(bucket, Some(at), head.execution.state_root).map_err(HeadOpenError::Open)?;
     Ok((snap, head))
 }

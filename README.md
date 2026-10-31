@@ -20,6 +20,8 @@ implementation.
 | `crates/trie` (`csl-eth-trie`) | node positions and table keys; a streaming builder from sorted leaves that emits every hashed node and agrees with alloy's `HashBuilder` root; the verifier walk (`Present` / `Absent` by trie shape / `Missing` / `Invalid`) |
 | `crates/store` (`csl-eth-store`) | the bucket layout, the JSON manifest, and the producer: storage tries built and checked per account, the account trie checked against `state_root`, code checked against `codeHash`, four tables written through `csl-run` in the variable layout, code blobs above 3,968 B |
 | `crates/client` (`csl-eth-client`) | `Snapshot::open(bucket, block, state_root)` then `account`, `storage`, `code`: one speculative round over depths `0..=D`, the walk, repair rounds, with requests, bytes and rounds per read |
+| `crates/head` (`csl-eth-head`) | the beacon light-client protocol from files: `head/bootstrap/<root>`, `head/updates/<period>`, `head/finality`, verified with helios-consensus-core from one checkpoint root to the finalized execution block |
+| `crates/wasm` (`csl-eth-wasm`) | the client and the head verifier for the browser: wasm-bindgen bindings with a synchronous JS-backed byte-range source |
 | `crates/snap` (`csl-eth-snap`, bin `csl-eth`) | mainnet state with no node: peers from the EIP-1459 DNS tree and discv4, RLPx with eth/68–69 and snap/1–2 over reth's wire crates, account and storage ranges verified by rebuilding, bytecode by hash; `fetch` writes a slice, `build` makes a bucket from it with the range proofs as the trie boundary |
 
 ```
@@ -84,9 +86,23 @@ most of those for under a minute.
 ./target/release/csl-eth check --slice data/slice-1a7 --url https://host/bucket --prefetch 1 --top-levels 4
 ```
 
-Not yet built, in order: a browser client (the read path made async, the
-same crates compiled to WASM, a page that reads R2 and verifies the head in
-the tab, so the demo is static files plus a browser), the model section
-fetched by key (the per-snapshot budget for a following client), storage
-speculation in the account's round, the content-addressed baseline client,
-the milestone 1 workload and fault table.
+The client runs in the browser: `crates/wasm` compiles the client and the
+head verifier to WebAssembly, `browser/` is a page that opens the R2 bucket
+through the head in a Web Worker (synchronous XHR ranges behind
+`globalThis.cslFetch`) and reads accounts, storage and code with each
+answer's status and cost. Deployed at https://csl-eth.indigo-db8.workers.dev;
+`?open` opens on load, `?bucket=<url>&checkpoint=<root>` change the inputs.
+
+```
+mise install                      # rust + wasm32 target + llvm-tools, bun, wasm-bindgen-cli
+./scripts/build-wasm.sh           # browser/pkg/
+cd browser && bun install && bun run serve      # http://127.0.0.1:8791/
+bun run site && (cd deploy && cf deploy)        # assemble browser/site and deploy it
+```
+
+Not yet built, in order: parallel ranges in the page (the main thread's
+`fetch` behind a `SharedArrayBuffer` handshake, so a hinted round is one
+round trip as in the CLI), the model section fetched by key (the
+per-snapshot budget for a following client), storage speculation in the
+account's round, the content-addressed baseline client, the milestone 1
+workload and fault table.

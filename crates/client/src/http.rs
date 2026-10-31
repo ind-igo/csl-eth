@@ -236,7 +236,10 @@ mod tests {
     #[test]
     fn a_read_is_served_from_any_range_that_covers_it() {
         let mut ready = BTreeMap::new();
-        ready.insert(4096u64, (0u8..=255).cycle().take(3 * 4096).collect::<Vec<u8>>());
+        ready.insert(
+            4096u64,
+            (0u8..=255).cycle().take(3 * 4096).collect::<Vec<u8>>(),
+        );
         ready.insert(40960, vec![7u8; 4096]);
         // Each page of the merged range, by its own offset.
         for p in 1..=3u64 {

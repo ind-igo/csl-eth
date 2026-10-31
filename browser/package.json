@@ -1,0 +1,15 @@
+{
+  "name": "csl-eth-browser",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "bun build src/main.ts src/worker.ts --outdir dist --target browser --format esm --sourcemap=linked",
+    "serve": "bun src/serve.ts",
+    "site": "bun src/serve.ts --site site",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.4",
+    "typescript": "7.0.2"
+  }
+}

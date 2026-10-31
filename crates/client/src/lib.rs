@@ -22,13 +22,7 @@ use csl_eth_trie::{
     decode_word, path_of, walk, AbsentBy, Account, Invalid, NodeKey, NodeSource, Outcome,
 };
 use csl_run::{Format, Reader, Source};
-use std::{
-    collections::HashMap,
-    fmt,
-    fs::File,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 #[cfg(feature = "http")]
 pub mod http;
@@ -63,7 +57,8 @@ pub trait Prefetch {
     fn forget(&self) {}
 }
 
-impl Prefetch for File {}
+#[cfg(not(target_arch = "wasm32"))]
+impl Prefetch for std::fs::File {}
 
 /// A source the snapshot and its reader both hold: the reader reads
 /// through it, the snapshot hands it prefetch hints.
@@ -75,19 +70,23 @@ impl<S: Source> Source for Shared<S> {
     }
 }
 
-/// A directory on disk (the producer's output, or a mirror).
-pub struct DirBucket(pub PathBuf);
+/// A directory on disk (the producer's output, or a mirror). Not on wasm,
+/// where there is no file system and `csl_run` has no `Source` for `File`.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct DirBucket(pub std::path::PathBuf);
 
+#[cfg(not(target_arch = "wasm32"))]
 impl DirBucket {
-    pub fn new(p: impl AsRef<Path>) -> DirBucket {
+    pub fn new(p: impl AsRef<std::path::Path>) -> DirBucket {
         DirBucket(p.as_ref().to_path_buf())
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Bucket for DirBucket {
-    type Run = File;
-    fn open_run(&self, rel: &str) -> Result<File, String> {
-        File::open(self.0.join(rel)).map_err(|e| format!("{rel}: {e}"))
+    type Run = std::fs::File;
+    fn open_run(&self, rel: &str) -> Result<std::fs::File, String> {
+        std::fs::File::open(self.0.join(rel)).map_err(|e| format!("{rel}: {e}"))
     }
     fn read_file(&self, rel: &str) -> Result<Vec<u8>, String> {
         std::fs::read(self.0.join(rel)).map_err(|e| format!("{rel}: {e}"))
@@ -406,13 +405,20 @@ impl<B: Bucket> Snapshot<B> {
     /// After a verified walk: every node (and every gap) above the deepest
     /// node fetched lies on the path and was hashed by the walk, so those
     /// at the cached depths are kept for the snapshot's later reads.
-    fn top_keep<F: Fn(&NodeKey) -> [u8; 32]>(&mut self, path: &Nibbles, nodes: &Nodes<'_, F>, max_depth: usize) {
+    fn top_keep<F: Fn(&NodeKey) -> [u8; 32]>(
+        &mut self,
+        path: &Nibbles,
+        nodes: &Nodes<'_, F>,
+        max_depth: usize,
+    ) {
         let Some(leaf) = nodes.map.keys().map(NodeKey::depth).max() else {
             return;
         };
         for d in 0..leaf.min(self.top_levels).min(max_depth + 1) {
             let nk = NodeKey::prefix(path, d);
-            self.top.entry(nk).or_insert_with(|| nodes.map.get(&nk).cloned());
+            self.top
+                .entry(nk)
+                .or_insert_with(|| nodes.map.get(&nk).cloned());
         }
     }
 

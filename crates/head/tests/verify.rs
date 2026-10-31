@@ -27,16 +27,30 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
-    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(format!("{FIX}/meta.json")).unwrap()).unwrap();
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(format!("{FIX}/meta.json")).unwrap()).unwrap();
     let checkpoint: B256 = meta["checkpoint"].as_str().unwrap().parse().unwrap();
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(meta["now"].as_u64().unwrap());
     let mut files = HashMap::new();
-    files.insert(paths::bootstrap(&checkpoint), std::fs::read(format!("{FIX}/bootstrap.json")).unwrap());
+    files.insert(
+        paths::bootstrap(&checkpoint),
+        std::fs::read(format!("{FIX}/bootstrap.json")).unwrap(),
+    );
     for p in [1897u64, 1898] {
-        files.insert(paths::update(p), std::fs::read(format!("{FIX}/update-{p}.json")).unwrap());
+        files.insert(
+            paths::update(p),
+            std::fs::read(format!("{FIX}/update-{p}.json")).unwrap(),
+        );
     }
-    files.insert(paths::FINALITY.to_string(), std::fs::read(format!("{FIX}/finality.json")).unwrap());
-    Fixture { checkpoint, now, files: Files(files) }
+    files.insert(
+        paths::FINALITY.to_string(),
+        std::fs::read(format!("{FIX}/finality.json")).unwrap(),
+    );
+    Fixture {
+        checkpoint,
+        now,
+        files: Files(files),
+    }
 }
 
 fn edit_json(bytes: &[u8], f: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
@@ -52,18 +66,35 @@ fn the_head_verifies_from_the_checkpoint_alone() {
     assert_eq!(h.checkpoint, fx.checkpoint);
     assert_eq!(h.period, 1898);
     assert_eq!(h.updates_applied, 1, "the checkpoint's own period update");
-    assert!(h.participants > 341, "two thirds of 512: {}", h.participants);
+    assert!(
+        h.participants > 341,
+        "two thirds of 512: {}",
+        h.participants
+    );
     assert_eq!(h.execution.block_number, 26_310_853);
-    assert_eq!(h.execution.block_hash, "0x4f081166c6721bf4adbc941c2dd72ebd621c4e7fc9ebf462c7921b79cc3858b4".parse::<B256>().unwrap());
+    assert_eq!(
+        h.execution.block_hash,
+        "0x4f081166c6721bf4adbc941c2dd72ebd621c4e7fc9ebf462c7921b79cc3858b4"
+            .parse::<B256>()
+            .unwrap()
+    );
     assert_ne!(h.execution.state_root, B256::ZERO);
-    assert!(h.finality_lag_secs > 12 * 60 && h.finality_lag_secs < 40 * 60, "lag {}", h.finality_lag_secs);
+    assert!(
+        h.finality_lag_secs > 12 * 60 && h.finality_lag_secs < 40 * 60,
+        "lag {}",
+        h.finality_lag_secs
+    );
 }
 
 #[test]
 fn a_different_checkpoint_root_rejects_the_bootstrap() {
     let mut fx = fixture();
     let other = B256::repeat_byte(0x11);
-    let b = fx.files.0.remove(&paths::bootstrap(&fx.checkpoint)).unwrap();
+    let b = fx
+        .files
+        .0
+        .remove(&paths::bootstrap(&fx.checkpoint))
+        .unwrap();
     fx.files.0.insert(paths::bootstrap(&other), b);
     let r = verify(&fx.files, &Chain::mainnet(), other, fx.now);
     assert!(matches!(r, Err(HeadError::Bootstrap(_))), "{r:?}");
@@ -82,7 +113,8 @@ fn a_forged_execution_state_root_fails_the_header_proof() {
     let mut fx = fixture();
     let f = fx.files.0.get_mut(paths::FINALITY).unwrap();
     *f = edit_json(f, |v| {
-        v["data"]["finalized_header"]["execution"]["state_root"] = serde_json::Value::String(format!("{}", B256::repeat_byte(0x42)));
+        v["data"]["finalized_header"]["execution"]["state_root"] =
+            serde_json::Value::String(format!("{}", B256::repeat_byte(0x42)));
     });
     let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
     assert!(matches!(r, Err(HeadError::Finality(_))), "{r:?}");
@@ -93,7 +125,8 @@ fn a_forged_finalized_block_hash_fails_the_header_proof() {
     let mut fx = fixture();
     let f = fx.files.0.get_mut(paths::FINALITY).unwrap();
     *f = edit_json(f, |v| {
-        v["data"]["finalized_header"]["execution"]["block_hash"] = serde_json::Value::String(format!("{}", B256::repeat_byte(0x43)));
+        v["data"]["finalized_header"]["execution"]["block_hash"] =
+            serde_json::Value::String(format!("{}", B256::repeat_byte(0x43)));
     });
     let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
     assert!(matches!(r, Err(HeadError::Finality(_))), "{r:?}");
@@ -105,10 +138,13 @@ fn too_few_signers_are_rejected() {
     let f = fx.files.0.get_mut(paths::FINALITY).unwrap();
     *f = edit_json(f, |v| {
         // Keep one byte of participation: 8 of 512, far under two thirds.
-        let bits = v["data"]["sync_aggregate"]["sync_committee_bits"].as_str().unwrap();
+        let bits = v["data"]["sync_aggregate"]["sync_committee_bits"]
+            .as_str()
+            .unwrap();
         let mut hexs = bits.trim_start_matches("0x").to_string();
         hexs = format!("ff{}", "00".repeat(hexs.len() / 2 - 1));
-        v["data"]["sync_aggregate"]["sync_committee_bits"] = serde_json::Value::String(format!("0x{hexs}"));
+        v["data"]["sync_aggregate"]["sync_committee_bits"] =
+            serde_json::Value::String(format!("0x{hexs}"));
     });
     let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
     assert!(matches!(r, Err(HeadError::Finality(_))), "{r:?}");
@@ -121,10 +157,14 @@ fn a_changed_signer_set_breaks_the_aggregate_signature() {
     *f = edit_json(f, |v| {
         // Flip one bit: still a supermajority, but the aggregate public key
         // no longer matches the signature.
-        let bits = v["data"]["sync_aggregate"]["sync_committee_bits"].as_str().unwrap().to_string();
+        let bits = v["data"]["sync_aggregate"]["sync_committee_bits"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let mut raw = hex::decode(bits.trim_start_matches("0x")).unwrap();
         raw[3] ^= 0x01;
-        v["data"]["sync_aggregate"]["sync_committee_bits"] = serde_json::Value::String(format!("0x{}", hex::encode(raw)));
+        v["data"]["sync_aggregate"]["sync_committee_bits"] =
+            serde_json::Value::String(format!("0x{}", hex::encode(raw)));
     });
     let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
     assert!(matches!(r, Err(HeadError::Finality(_))), "{r:?}");
@@ -136,7 +176,13 @@ fn a_finality_update_from_the_future_is_rejected() {
     // A clock a day behind the objects: their signature slot is in the future.
     let early = fx.now - Duration::from_secs(24 * 3600);
     let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, early);
-    assert!(matches!(r, Err(HeadError::Finality(_)) | Err(HeadError::Update { .. })), "{r:?}");
+    assert!(
+        matches!(
+            r,
+            Err(HeadError::Finality(_)) | Err(HeadError::Update { .. })
+        ),
+        "{r:?}"
+    );
 }
 
 #[test]
@@ -144,7 +190,11 @@ fn a_frozen_finality_file_shows_as_lag_not_as_fresh_state() {
     let fx = fixture();
     let later = fx.now + Duration::from_secs(6 * 3600);
     let h = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, later).unwrap();
-    assert!(h.finality_lag_secs > 6 * 3600, "lag {}", h.finality_lag_secs);
+    assert!(
+        h.finality_lag_secs > 6 * 3600,
+        "lag {}",
+        h.finality_lag_secs
+    );
     assert_eq!(h.execution.block_number, 26_310_853);
 }
 
@@ -155,13 +205,19 @@ fn an_update_from_the_wrong_period_is_rejected() {
     let wrong = fx.files.0.get(&paths::update(1897)).unwrap().clone();
     fx.files.0.insert(paths::update(1898), wrong);
     let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
-    assert!(matches!(r, Err(HeadError::Update { period: 1898, .. })), "{r:?}");
+    assert!(
+        matches!(r, Err(HeadError::Update { period: 1898, .. })),
+        "{r:?}"
+    );
 }
 
 #[test]
 fn a_file_that_is_not_the_object_is_a_decode_error() {
     let mut fx = fixture();
-    fx.files.0.insert(paths::FINALITY.to_string(), b"{\"version\":\"fulu\",\"data\":{}}".to_vec());
+    fx.files.0.insert(
+        paths::FINALITY.to_string(),
+        b"{\"version\":\"fulu\",\"data\":{}}".to_vec(),
+    );
     let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
     assert!(matches!(r, Err(HeadError::Decode { .. })), "{r:?}");
 }

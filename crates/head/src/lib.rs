@@ -22,7 +22,8 @@
 use alloy_primitives::{fixed_bytes, B256};
 use helios_consensus_core::{
     apply_bootstrap, apply_finality_update, apply_update, calc_sync_period,
-    consensus_spec::MainnetConsensusSpec, expected_current_slot, get_bits,
+    consensus_spec::MainnetConsensusSpec,
+    get_bits,
     types::{Bootstrap, FinalityUpdate, Fork, Forks, LightClientStore, Update},
     verify_bootstrap, verify_finality_update, verify_update,
 };
@@ -66,7 +67,9 @@ impl Chain {
         };
         Chain {
             genesis_time: 1_606_824_023,
-            genesis_root: fixed_bytes!("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"),
+            genesis_root: fixed_bytes!(
+                "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+            ),
             forks: Forks {
                 genesis: fork(0, [0, 0, 0, 0]),
                 altair: fork(74_240, [1, 0, 0, 0]),
@@ -136,7 +139,9 @@ impl fmt::Display for HeadError {
             HeadError::Read(e) => write!(f, "head file unreadable: {e}"),
             HeadError::Decode { path, error } => write!(f, "{path}: {error}"),
             HeadError::Bootstrap(e) => write!(f, "bootstrap rejected: {e}"),
-            HeadError::Update { period, error } => write!(f, "update for period {period} rejected: {error}"),
+            HeadError::Update { period, error } => {
+                write!(f, "update for period {period} rejected: {error}")
+            }
             HeadError::Finality(e) => write!(f, "finality update rejected: {e}"),
             HeadError::NoExecution => write!(f, "finalized header has no execution payload"),
         }
@@ -175,8 +180,14 @@ pub struct VerifiedHead {
 }
 
 fn read<T: for<'de> Deserialize<'de>>(src: &dyn HeadSource, path: &str) -> Result<T, HeadError> {
-    let bytes = src.read_head(path).map_err(HeadError::Read)?.ok_or_else(|| HeadError::Missing(path.to_string()))?;
-    let env: Envelope<T> = serde_json::from_slice(&bytes).map_err(|e| HeadError::Decode { path: path.to_string(), error: e.to_string() })?;
+    let bytes = src
+        .read_head(path)
+        .map_err(HeadError::Read)?
+        .ok_or_else(|| HeadError::Missing(path.to_string()))?;
+    let env: Envelope<T> = serde_json::from_slice(&bytes).map_err(|e| HeadError::Decode {
+        path: path.to_string(),
+        error: e.to_string(),
+    })?;
     Ok(env.data)
 }
 
@@ -185,13 +196,19 @@ fn read<T: for<'de> Deserialize<'de>>(src: &dyn HeadSource, path: &str) -> Resul
 /// current one, then the finality update. Each step is checked against
 /// what the previous one established; nothing is taken from the files on
 /// faith. `now` is a parameter so that a test can fix it.
-pub fn verify(src: &dyn HeadSource, chain: &Chain, checkpoint: B256, now: SystemTime) -> Result<VerifiedHead, HeadError> {
+pub fn verify(
+    src: &dyn HeadSource,
+    chain: &Chain,
+    checkpoint: B256,
+    now: SystemTime,
+) -> Result<VerifiedHead, HeadError> {
     let bootstrap: Bootstrap<Spec> = read(src, &paths::bootstrap(&checkpoint))?;
-    verify_bootstrap::<Spec>(&bootstrap, checkpoint, &chain.forks).map_err(|e| HeadError::Bootstrap(e.to_string()))?;
+    verify_bootstrap::<Spec>(&bootstrap, checkpoint, &chain.forks)
+        .map_err(|e| HeadError::Bootstrap(e.to_string()))?;
     let mut store = LightClientStore::<Spec>::default();
     apply_bootstrap::<Spec>(&mut store, &bootstrap);
 
-    let current_slot = expected_current_slot(now, chain.genesis_time);
+    let current_slot = current_slot(chain, now);
     let current_period = calc_sync_period::<Spec>(current_slot);
     let mut period = calc_sync_period::<Spec>(store.finalized_header.beacon().slot);
     let mut updates_applied = 0;
@@ -199,9 +216,22 @@ pub fn verify(src: &dyn HeadSource, chain: &Chain, checkpoint: B256, now: System
         let path = paths::update(period);
         match src.read_head(&path).map_err(HeadError::Read)? {
             Some(bytes) => {
-                let env: Envelope<Update<Spec>> = serde_json::from_slice(&bytes).map_err(|e| HeadError::Decode { path: path.clone(), error: e.to_string() })?;
-                verify_update::<Spec>(&env.data, current_slot, &store, chain.genesis_root, &chain.forks)
-                    .map_err(|e| HeadError::Update { period, error: e.to_string() })?;
+                let env: Envelope<Update<Spec>> =
+                    serde_json::from_slice(&bytes).map_err(|e| HeadError::Decode {
+                        path: path.clone(),
+                        error: e.to_string(),
+                    })?;
+                verify_update::<Spec>(
+                    &env.data,
+                    current_slot,
+                    &store,
+                    chain.genesis_root,
+                    &chain.forks,
+                )
+                .map_err(|e| HeadError::Update {
+                    period,
+                    error: e.to_string(),
+                })?;
                 apply_update::<Spec>(&mut store, &env.data);
                 updates_applied += 1;
             }
@@ -216,7 +246,14 @@ pub fn verify(src: &dyn HeadSource, chain: &Chain, checkpoint: B256, now: System
     }
 
     let finality: FinalityUpdate<Spec> = read(src, paths::FINALITY)?;
-    verify_finality_update::<Spec>(&finality, current_slot, &store, chain.genesis_root, &chain.forks).map_err(|e| HeadError::Finality(e.to_string()))?;
+    verify_finality_update::<Spec>(
+        &finality,
+        current_slot,
+        &store,
+        chain.genesis_root,
+        &chain.forks,
+    )
+    .map_err(|e| HeadError::Finality(e.to_string()))?;
     let participants = get_bits::<Spec>(&finality.sync_aggregate().sync_committee_bits);
     apply_finality_update::<Spec>(&mut store, &finality);
 
@@ -229,7 +266,10 @@ pub fn verify(src: &dyn HeadSource, chain: &Chain, checkpoint: B256, now: System
         state_root: *exec.state_root(),
         timestamp: *exec.timestamp(),
     };
-    let now_secs = now.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now_secs = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     Ok(VerifiedHead {
         checkpoint,
         slot: beacon.slot,
@@ -247,7 +287,12 @@ pub fn period_of(slot: u64) -> u64 {
     calc_sync_period::<Spec>(slot)
 }
 
-/// The slot the wall clock says it is.
+/// The slot the wall clock says it is: 12-second slots from genesis. Our
+/// own arithmetic rather than helios's, whose clock type differs on wasm.
 pub fn current_slot(chain: &Chain, now: SystemTime) -> u64 {
-    expected_current_slot(now, chain.genesis_time)
+    let secs = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    secs.saturating_sub(chain.genesis_time) / 12
 }
