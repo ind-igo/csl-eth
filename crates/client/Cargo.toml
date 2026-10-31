@@ -10,6 +10,7 @@ repository.workspace = true
 csl-run.workspace = true
 csl-eth-trie = { path = "../trie" }
 csl-eth-store = { path = "../store" }
+csl-eth-head = { path = "../head" }
 alloy-primitives.workspace = true
 alloy-trie = { workspace = true, features = ["ethereum"] }
 blake3.workspace = true

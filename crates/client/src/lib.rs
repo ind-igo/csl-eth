@@ -35,12 +35,20 @@ pub mod http;
 #[cfg(feature = "http")]
 pub use http::HttpBucket;
 
+pub mod head;
+pub use head::{open_at_head, HeadOpenError, VerifiedHead};
+
 /// Where the files are. Runs are read by byte range through
 /// [`csl_run::Source`]; manifests, `latest` and blobs are read whole.
 pub trait Bucket {
     type Run: Source + Prefetch;
     fn open_run(&self, rel: &str) -> Result<Self::Run, String>;
     fn read_file(&self, rel: &str) -> Result<Vec<u8>, String>;
+    /// `Ok(None)` when the file is not there, as distinct from a failure to
+    /// read it; the head verifier treats the two differently.
+    fn read_file_opt(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
+        self.read_file(rel).map(Some)
+    }
 }
 
 /// A hint a source may act on: these byte ranges are about to be read, in
@@ -83,6 +91,13 @@ impl Bucket for DirBucket {
     }
     fn read_file(&self, rel: &str) -> Result<Vec<u8>, String> {
         std::fs::read(self.0.join(rel)).map_err(|e| format!("{rel}: {e}"))
+    }
+    fn read_file_opt(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
+        match std::fs::read(self.0.join(rel)) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{rel}: {e}")),
+        }
     }
 }
 
@@ -397,9 +412,7 @@ impl<B: Bucket> Snapshot<B> {
         };
         for d in 0..leaf.min(self.top_levels).min(max_depth + 1) {
             let nk = NodeKey::prefix(path, d);
-            if !self.top.contains_key(&nk) {
-                self.top.insert(nk, nodes.map.get(&nk).cloned());
-            }
+            self.top.entry(nk).or_insert_with(|| nodes.map.get(&nk).cloned());
         }
     }
 

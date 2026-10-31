@@ -3,7 +3,7 @@
 
 use alloy_primitives::B256;
 use clap::{Parser, Subcommand};
-use csl_eth_client::{DirBucket, Hint, Read, Reason, Snapshot};
+use csl_eth_client::{open_at_head, DirBucket, Hint, Read, Reason, Snapshot, VerifiedHead};
 use csl_eth_snap::{fetch, probe, FetchConfig, Slice};
 use csl_eth_store::{produce_with, ProduceOptions};
 use csl_eth_trie::Nibbles;
@@ -103,6 +103,17 @@ enum Cmd {
         /// reads (0: off).
         #[arg(long, default_value_t = 0)]
         top_levels: usize,
+        /// Verify the head from the bucket's `head/` files starting at this
+        /// weak-subjectivity checkpoint root, and read at the finalized
+        /// block's `state_root` instead of the slice's pinned header.
+        #[arg(long)]
+        checkpoint: Option<B256>,
+    },
+    /// The head files: pull them from a beacon node into a bucket, or
+    /// verify a bucket's from a checkpoint.
+    Head {
+        #[command(subcommand)]
+        cmd: HeadCmd,
     },
     /// Dial peers and report client, snap version and head.
     Peers {
@@ -113,6 +124,70 @@ enum Cmd {
         #[arg(long, default_value_t = 30399)]
         udp_port: u16,
     },
+}
+
+#[derive(Subcommand)]
+enum HeadCmd {
+    /// Fetch bootstrap, period updates and the finality update from a
+    /// beacon node's light-client API into `<bucket>/head/`, and verify
+    /// the set written.
+    Fetch {
+        /// Beacon node base URL with the light-client endpoints enabled.
+        #[arg(long, default_value = "https://lodestar-mainnet.chainsafe.io")]
+        beacon: String,
+        #[arg(long)]
+        bucket: PathBuf,
+        /// Checkpoint block root; the node's current finalized checkpoint
+        /// when absent (then printed, to be pinned from here on).
+        #[arg(long)]
+        checkpoint: Option<B256>,
+    },
+    /// Verify a bucket's head files from a checkpoint and print the
+    /// finalized execution block.
+    Verify {
+        #[arg(long)]
+        checkpoint: B256,
+        #[arg(long, conflicts_with = "url")]
+        bucket: Option<PathBuf>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        proxy: Option<String>,
+    },
+}
+
+fn head_json(h: &VerifiedHead) -> serde_json::Value {
+    serde_json::json!({
+        "checkpoint": h.checkpoint,
+        "slot": h.slot,
+        "beacon_root": h.beacon_root,
+        "period": h.period,
+        "participants": h.participants,
+        "updates_applied": h.updates_applied,
+        "block_number": h.execution.block_number,
+        "block_hash": h.execution.block_hash,
+        "state_root": h.execution.state_root,
+        "timestamp": h.execution.timestamp,
+        "finality_lag_secs": h.finality_lag_secs,
+    })
+}
+
+/// The snapshot `check` reads: at the slice's pinned header, or at the head
+/// the bucket proves when a checkpoint is given.
+fn open_for_check<B: csl_eth_client::Bucket>(b: B, s: &Slice, checkpoint: Option<B256>) -> Result<(Snapshot<B>, Option<serde_json::Value>), String> {
+    match checkpoint {
+        None => Ok((Snapshot::open(b, None, s.head.state_root)?, None)),
+        Some(c) => {
+            let (snap, head) = open_at_head(b, c, std::time::SystemTime::now()).map_err(|e| e.to_string())?;
+            if head.execution.state_root != s.head.state_root {
+                return Err(format!(
+                    "the slice is at block {} ({}), the finalized head at block {} ({}); fetch a slice at the finalized block",
+                    s.head.block_number, s.head.state_root, head.execution.block_number, head.execution.state_root
+                ));
+            }
+            Ok((snap, Some(head_json(&head))))
+        }
+    }
 }
 
 fn parse_prefix(s: &str) -> Result<Nibbles, String> {
@@ -168,7 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             );
         }
-        Cmd::Check { slice, bucket, url, proxy, samples, d_account, d_storage, prefetch, prefetch_below, prefetch_above, no_merge, top_levels } => {
+        Cmd::Check { slice, bucket, url, proxy, samples, d_account, d_storage, prefetch, prefetch_below, prefetch_above, no_merge, top_levels, checkpoint } => {
             let s = Slice::read(&slice)?;
             let prefetch = match (prefetch, prefetch_below, prefetch_above) {
                 (None, None, None) => None,
@@ -180,12 +255,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let mut opts = CheckOpts { samples, d_account, d_storage, prefetch, top_levels, http: None };
             let out = match (bucket, url) {
-                (Some(dir), None) => check(&s, Snapshot::open(DirBucket::new(&dir), None, s.head.state_root)?, &opts),
+                (Some(dir), None) => {
+                    let (snap, head) = open_for_check(DirBucket::new(&dir), &s, checkpoint)?;
+                    let mut out = check(&s, snap, &opts);
+                    if let Some(h) = head {
+                        out["head"] = h;
+                    }
+                    out
+                }
                 (None, Some(base)) => {
                     let b = csl_eth_client::HttpBucket::new(&base, proxy.as_deref())?;
                     let (req, bytes, hinted) = (b.requests.clone(), b.bytes.clone(), b.hinted.clone());
                     opts.http = Some([req.clone(), bytes.clone(), hinted.clone()]);
-                    let mut out = check(&s, Snapshot::open(b, None, s.head.state_root)?, &opts);
+                    let (snap, head) = open_for_check(b, &s, checkpoint)?;
+                    let head_requests = req.load(std::sync::atomic::Ordering::Relaxed);
+                    let head_bytes = bytes.load(std::sync::atomic::Ordering::Relaxed);
+                    let mut out = check(&s, snap, &opts);
+                    if let Some(mut h) = head {
+                        h["http_requests"] = head_requests.into();
+                        h["http_bytes"] = head_bytes.into();
+                        out["head"] = h;
+                    }
                     out["http"] = serde_json::json!({
                         "requests": req.load(std::sync::atomic::Ordering::Relaxed),
                         "bytes": bytes.load(std::sync::atomic::Ordering::Relaxed),
@@ -196,6 +286,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => return Err("give --bucket <dir> or --url <base>".into()),
             };
             println!("{}", out);
+        }
+        Cmd::Head { cmd: HeadCmd::Fetch { beacon, bucket, checkpoint } } => {
+            let f = csl_eth_head::fetch::fetch_into(&beacon, &bucket, checkpoint)?;
+            let mut out = head_json(&f.head);
+            out["updates_written"] = serde_json::json!(f.updates);
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Cmd::Head { cmd: HeadCmd::Verify { checkpoint, bucket, url, proxy } } => {
+            let now = std::time::SystemTime::now();
+            let chain = csl_eth_head::Chain::mainnet();
+            let h = match (bucket, url) {
+                (Some(dir), None) => csl_eth_head::verify(&csl_eth_head::DirSource(dir), &chain, checkpoint, now)?,
+                (None, Some(base)) => {
+                    let b = csl_eth_client::HttpBucket::new(&base, proxy.as_deref())?;
+                    csl_eth_head::verify(&csl_eth_client::head::HeadFiles(&b), &chain, checkpoint, now)?
+                }
+                _ => return Err("give --bucket <dir> or --url <base>".into()),
+            };
+            println!("{}", serde_json::to_string_pretty(&head_json(&h))?);
         }
         Cmd::Peers { count, timeout_secs, udp_port } => {
             let rows = probe(count, Duration::from_secs(timeout_secs), udp_port).await;

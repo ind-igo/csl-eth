@@ -1,0 +1,28 @@
+[package]
+name = "csl-eth-head"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The finalized head from files in the bucket: beacon light-client objects verified offline"
+
+[dependencies]
+alloy-primitives.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The verifier (profile §3): verify_bootstrap / verify_update /
+# apply_finality_update over a LightClientStore, per-fork SSZ types, BLS.
+# Git only; pinned to the revision read on 2026-10-31.
+helios-consensus-core = { git = "https://github.com/a16z/helios", rev = "2af9b41887e069144ee56cd710f3ddca195473f8" }
+tree_hash = "0.10"
+ureq = { version = "3", optional = true }
+
+[features]
+# Pull the objects from a beacon node's light-client API into a bucket
+# directory (the producer's side; the client never needs it).
+fetch = ["dep:ureq"]
+
+[dev-dependencies]
+serde_json.workspace = true
+hex.workspace = true

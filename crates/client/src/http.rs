@@ -187,6 +187,28 @@ impl Bucket for HttpBucket {
         })
     }
 
+    fn read_file_opt(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
+        let url = self.url(rel);
+        match self.agent.get(&url).call() {
+            Ok(mut resp) => {
+                let v = resp
+                    .body_mut()
+                    .with_config()
+                    .limit(64 * 1024 * 1024)
+                    .read_to_vec()
+                    .map_err(|e| format!("GET {url} body: {e}"))?;
+                self.requests.fetch_add(1, Ordering::Relaxed);
+                self.bytes.fetch_add(v.len() as u64, Ordering::Relaxed);
+                Ok(Some(v))
+            }
+            Err(ureq::Error::StatusCode(404)) => {
+                self.requests.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            }
+            Err(e) => Err(format!("GET {url}: {e}")),
+        }
+    }
+
     fn read_file(&self, rel: &str) -> Result<Vec<u8>, String> {
         let url = self.url(rel);
         let mut resp = self

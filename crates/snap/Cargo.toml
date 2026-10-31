@@ -13,6 +13,7 @@ path = "src/bin/csl-eth.rs"
 csl-eth-trie = { path = "../trie" }
 csl-eth-store = { path = "../store" }
 csl-eth-client = { path = "../client", features = ["http"] }
+csl-eth-head = { path = "../head", features = ["fetch"] }
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-rlp.workspace = true
 alloy-trie.workspace = true
