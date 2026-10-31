@@ -112,7 +112,12 @@ state), and a cold neighbourhood costs one round before its data pages.
 Measured against R2: accounts 2.7 requests, 37 KB, one round (two when cold),
 135 ms p50; the page shows the model pages a read fetched.
 
-Not yet built, in order: the content-addressed baseline client, the
-milestone 1 workload and fault table, a visualizer of the rounds (the `need`
+The content-addressed baseline (2026-10-31) reads the same state by node
+hash from `nodes_by_hash`, one dependent round per node: `check --baseline`
+and the page's "baseline (by hash, serial)" toggle. Against R2, uncached:
+8.9 rounds, 106 KB, 1162 ms p50 per account against 1 round, 48 KB, 118 ms
+path-keyed; the baseline uses fewer bytes only on storage (76 against 130 KB).
+
+Not yet built, in order: the milestone 1 workload and fault table, a visualizer of the rounds (the `need`
 lists are its event stream), the head's period updates batched into one
 round, a producer loop that follows finality.
