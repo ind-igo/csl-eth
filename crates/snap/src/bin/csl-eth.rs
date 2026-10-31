@@ -3,7 +3,7 @@
 
 use alloy_primitives::B256;
 use clap::{Parser, Subcommand};
-use csl_eth_client::{DirBucket, Read, Reason, Snapshot};
+use csl_eth_client::{DirBucket, Hint, Read, Reason, Snapshot};
 use csl_eth_snap::{fetch, probe, FetchConfig, Slice};
 use csl_eth_store::{produce_with, ProduceOptions};
 use csl_eth_trie::Nibbles;
@@ -90,6 +90,19 @@ enum Cmd {
         /// depth plus this many pages each side. Off when absent.
         #[arg(long)]
         prefetch: Option<u64>,
+        /// Pages below / above the prediction, overriding --prefetch's span
+        /// on that side.
+        #[arg(long)]
+        prefetch_below: Option<u64>,
+        #[arg(long)]
+        prefetch_above: Option<u64>,
+        /// Ask for touching pages one request each instead of one range.
+        #[arg(long)]
+        no_merge: bool,
+        /// Keep verified account-trie nodes at depths below this across
+        /// reads (0: off).
+        #[arg(long, default_value_t = 0)]
+        top_levels: usize,
     },
     /// Dial peers and report client, snap version and head.
     Peers {
@@ -155,9 +168,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             );
         }
-        Cmd::Check { slice, bucket, url, proxy, samples, d_account, d_storage, prefetch } => {
+        Cmd::Check { slice, bucket, url, proxy, samples, d_account, d_storage, prefetch, prefetch_below, prefetch_above, no_merge, top_levels } => {
             let s = Slice::read(&slice)?;
-            let mut opts = CheckOpts { samples, d_account, d_storage, prefetch, http: None };
+            let prefetch = match (prefetch, prefetch_below, prefetch_above) {
+                (None, None, None) => None,
+                (span, below, above) => Some(Hint {
+                    below: below.or(span).unwrap_or(0),
+                    above: above.or(span).unwrap_or(0),
+                    merge: !no_merge,
+                }),
+            };
+            let mut opts = CheckOpts { samples, d_account, d_storage, prefetch, top_levels, http: None };
             let out = match (bucket, url) {
                 (Some(dir), None) => check(&s, Snapshot::open(DirBucket::new(&dir), None, s.head.state_root)?, &opts),
                 (None, Some(base)) => {
@@ -247,7 +268,8 @@ struct CheckOpts {
     samples: usize,
     d_account: Option<usize>,
     d_storage: Option<usize>,
-    prefetch: Option<u64>,
+    prefetch: Option<Hint>,
+    top_levels: usize,
     /// HTTP requests, bytes and hinted pages, when the bucket is remote.
     http: Option<[Arc<AtomicU64>; 3]>,
 }
@@ -278,6 +300,7 @@ fn check<B: csl_eth_client::Bucket>(s: &Slice, mut snap: Snapshot<B>, o: &CheckO
         snap.d_storage = d;
     }
     snap.prefetch = o.prefetch;
+    snap.top_levels = o.top_levels;
     let prefix_nibbles = parse_prefix(&s.head.prefix).expect("slice prefix");
     let in_prefix = |h: &B256| csl_eth_trie::path_of(h).starts_with(&prefix_nibbles);
     let stride = (s.accounts.len() / o.samples.max(1)).max(1);
@@ -360,7 +383,8 @@ fn check<B: csl_eth_client::Bucket>(s: &Slice, mut snap: Snapshot<B>, o: &CheckO
         "prefix": s.head.prefix,
         "d_account": snap.d_account,
         "d_storage": snap.d_storage,
-        "prefetch": o.prefetch,
+        "prefetch": o.prefetch.map(|h| serde_json::json!({"below": h.below, "above": h.above, "merge": h.merge})),
+        "top_levels": o.top_levels,
         "wrong_values": wrong,
         "unexpected_reads": unexpected,
         "wall_ms": t_all.elapsed().as_millis() as u64,

@@ -10,7 +10,7 @@
 use crate::{Bucket, Prefetch};
 use csl_run::{Error, Source};
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -92,16 +92,25 @@ pub struct HttpRun {
     agent: ureq::Agent,
     url: String,
     parallel: usize,
-    ready: Mutex<HashMap<(u64, usize), Vec<u8>>>,
+    /// Ranges fetched this read, by offset; a read is served from any range
+    /// that covers it, so a merged hint of several pages answers each.
+    ready: Mutex<BTreeMap<u64, Vec<u8>>>,
     requests: Arc<AtomicU64>,
     bytes: Arc<AtomicU64>,
     hinted: Arc<AtomicU64>,
 }
 
+/// The bytes of `[off, off + len)` from the fetched range that covers them.
+fn covered(ready: &BTreeMap<u64, Vec<u8>>, off: u64, len: usize) -> Option<Vec<u8>> {
+    let (start, v) = ready.range(..=off).next_back()?;
+    let lo = (off - start) as usize;
+    v.get(lo..lo + len).map(<[u8]>::to_vec)
+}
+
 impl Source for HttpRun {
     fn read_at(&self, off: u64, len: usize) -> Result<Vec<u8>, Error> {
-        if let Some(v) = self.ready.lock().unwrap().get(&(off, len)) {
-            return Ok(v.clone());
+        if let Some(v) = covered(&self.ready.lock().unwrap(), off, len) {
+            return Ok(v);
         }
         let v = get_range(&self.agent, &self.url, off, len)?;
         self.requests.fetch_add(1, Ordering::Relaxed);
@@ -109,7 +118,7 @@ impl Source for HttpRun {
         // Kept for the rest of this round: the depths of one path share
         // pages, and the walk from a predicted page lands on neighbours
         // another depth may predict.
-        self.ready.lock().unwrap().insert((off, len), v.clone());
+        self.ready.lock().unwrap().insert(off, v.clone());
         Ok(v)
     }
 }
@@ -127,7 +136,7 @@ impl Prefetch for HttpRun {
             ranges
                 .iter()
                 .copied()
-                .filter(|r| !ready.contains_key(r))
+                .filter(|&(off, len)| covered(&ready, off, len).is_none())
                 .collect()
         };
         self.hinted
@@ -146,7 +155,7 @@ impl Prefetch for HttpRun {
                             if let Ok(v) = get_range(&self.agent, &self.url, off, len) {
                                 self.requests.fetch_add(1, Ordering::Relaxed);
                                 self.bytes.fetch_add(v.len() as u64, Ordering::Relaxed);
-                                got.push(((off, len), v));
+                                got.push((off, v));
                             }
                         }
                         got
@@ -171,7 +180,7 @@ impl Bucket for HttpBucket {
             agent: self.agent.clone(),
             url: self.url(rel),
             parallel: self.parallel,
-            ready: Mutex::new(HashMap::new()),
+            ready: Mutex::new(BTreeMap::new()),
             requests: self.requests.clone(),
             bytes: self.bytes.clone(),
             hinted: self.hinted.clone(),
@@ -194,5 +203,30 @@ impl Bucket for HttpBucket {
         self.requests.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(v.len() as u64, Ordering::Relaxed);
         Ok(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::covered;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_read_is_served_from_any_range_that_covers_it() {
+        let mut ready = BTreeMap::new();
+        ready.insert(4096u64, (0u8..=255).cycle().take(3 * 4096).collect::<Vec<u8>>());
+        ready.insert(40960, vec![7u8; 4096]);
+        // Each page of the merged range, by its own offset.
+        for p in 1..=3u64 {
+            let v = covered(&ready, p * 4096, 4096).unwrap();
+            assert_eq!(v.len(), 4096);
+            assert_eq!(v[0], ((p - 1) * 4096 % 256) as u8);
+        }
+        assert_eq!(covered(&ready, 40960, 4096).unwrap(), vec![7u8; 4096]);
+        // Past the end of a range, before any, or straddling two: not covered.
+        assert!(covered(&ready, 4 * 4096, 4096).is_none());
+        assert!(covered(&ready, 0, 4096).is_none());
+        assert!(covered(&ready, 3 * 4096 + 1, 4096).is_none());
+        assert!(covered(&ready, 36864, 4096).is_none());
     }
 }

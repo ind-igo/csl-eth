@@ -5,7 +5,7 @@
 //! pages, never in an answer.
 
 use alloy_primitives::{keccak256, B256, U256};
-use csl_eth_client::{DirBucket, Read, Reason, Snapshot};
+use csl_eth_client::{DirBucket, Hint, Read, Reason, Snapshot};
 use csl_eth_store::{produce_with, AccountLeaf, Head, ProduceError, ProduceOptions};
 use csl_eth_trie::{build::build_all, encode_word, path_of, proof_for, verify_range, Account, Nibbles, Sealed, EMPTY_ROOT, KECCAK_EMPTY};
 use std::{collections::HashMap, path::PathBuf};
@@ -191,5 +191,54 @@ fn a_wrong_or_missing_boundary_fails_the_root_check() {
     bad.remove(bad.len() / 2);
     let r = produce_with(&dir, &head, "7", inside.iter().cloned(), &w.code, ProduceOptions { epsilon: 4, boundary: bad });
     assert!(matches!(r, Err(ProduceError::StateRoot { .. })), "{r:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The top-level cache and the merged hint change what is fetched, never
+/// what is answered: every read agrees with the plain client, and once the
+/// top of the trie is known a read costs fewer requests.
+#[test]
+fn cached_top_levels_answer_the_same_for_fewer_requests() {
+    let w = world(4000);
+    let (inside, boundary) = slice_of(&w);
+    let head = Head { block_hash: B256::repeat_byte(0xAD), block_number: 1, timestamp: 1, state_root: w.root };
+    let dir = scratch("cache");
+    produce_with(&dir, &head, "7", inside.iter().cloned(), &w.code, ProduceOptions { epsilon: 4, boundary }).unwrap();
+    let mut plain = Snapshot::open(DirBucket::new(&dir), None, w.root).unwrap();
+    let mut cached = Snapshot::open(DirBucket::new(&dir), None, w.root).unwrap();
+    cached.prefetch = Some(Hint::symmetric(1));
+    cached.top_levels = 3;
+
+    let mut keys: Vec<B256> = inside.iter().map(|a| a.hashed).collect();
+    for i in 0..200u32 {
+        let mut k = keccak256([0xEE, i as u8, (i >> 8) as u8]);
+        k.0[0] = (PREFIX << 4) | (k.0[0] & 0x0f);
+        keys.push(k);
+    }
+    for a in w.accounts.iter().filter(|a| a.hashed.0[0] >> 4 != PREFIX).step_by(50) {
+        keys.push(a.hashed);
+    }
+    let (mut req_plain, mut req_cached) = (0u64, 0u64);
+    for (i, k) in keys.iter().enumerate() {
+        let (p, cp) = plain.account(k);
+        let (c, cc) = cached.account(k);
+        match (&p, &c) {
+            (Read::Verified(x), Read::Verified(y)) => assert_eq!(x, y),
+            (Read::VerifiedAbsent(x), Read::VerifiedAbsent(y)) => assert_eq!(x, y),
+            (Read::Insufficient(Reason::Missing { .. }), Read::Insufficient(Reason::Missing { .. })) => {}
+            other => panic!("{k}: {other:?}"),
+        }
+        if i > 0 {
+            req_plain += cp.requests;
+            req_cached += cc.requests;
+            assert!(cc.requests <= cp.requests, "{k}: cached {} > plain {}", cc.requests, cp.requests);
+        }
+    }
+    assert!(req_cached < req_plain, "cached {req_cached} plain {req_plain}");
+    // Storage and code are untouched by the account cache.
+    for a in inside.iter().filter(|a| !a.storage.is_empty()).take(20) {
+        let (slot, value) = &a.storage[0];
+        assert!(matches!(cached.storage(&a.hashed, slot).0, Read::Verified(v) if v == *value));
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

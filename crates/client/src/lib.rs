@@ -184,6 +184,27 @@ impl Cost {
 /// missed, bounded by the walk's own node limit.
 pub const MAX_REPAIRS: u32 = csl_eth_trie::MAX_WALK_NODES as u32;
 
+/// How a speculative round is hinted to the source: the predicted page of
+/// every depth, widened `below` and `above` pages, and whether pages that
+/// touch are asked for as one range (one request) or one each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hint {
+    pub below: u64,
+    pub above: u64,
+    pub merge: bool,
+}
+
+impl Hint {
+    /// The prediction and `span` pages each side, touching pages merged.
+    pub fn symmetric(span: u64) -> Hint {
+        Hint {
+            below: span,
+            above: span,
+            merge: true,
+        }
+    }
+}
+
 pub struct Snapshot<B: Bucket> {
     bucket: B,
     manifest: Manifest,
@@ -191,10 +212,17 @@ pub struct Snapshot<B: Bucket> {
     sources: Vec<Option<Arc<B::Run>>>,
     pub d_account: usize,
     pub d_storage: usize,
-    /// Before a speculative round, hint the table's source with the
-    /// predicted page of every depth, widened by this many pages each
-    /// side (`Some(0)`: the prediction only; `None`: no hint).
-    pub prefetch: Option<u64>,
+    /// Before a speculative round, hint the table's source with the pages
+    /// the model predicts (`None`: no hint, the reader fetches as it walks).
+    pub prefetch: Option<Hint>,
+    /// Account-trie nodes at depths below this are kept across reads of
+    /// this snapshot once a verified walk has passed them, and neither
+    /// hinted nor fetched again (`0`: off). Every block rewrites the top of
+    /// the trie, so the cache is the snapshot's and dies with it.
+    pub top_levels: usize,
+    /// `Some(node)` or `None` for "no node at this depth, an extension
+    /// spans it", both verified by the walk that stored them.
+    top: HashMap<NodeKey, Option<Vec<u8>>>,
 }
 
 impl<B: Bucket> Snapshot<B> {
@@ -255,6 +283,8 @@ impl<B: Bucket> Snapshot<B> {
             d_account: D_ACCOUNT,
             d_storage: D_STORAGE,
             prefetch: None,
+            top_levels: 0,
+            top: HashMap::new(),
         })
     }
 
@@ -309,9 +339,11 @@ impl<B: Bucket> Snapshot<B> {
     }
 
     /// Hand the table's source the byte ranges of the pages the model
-    /// predicts for `keys`, `span` pages each side. Errors here are not
-    /// errors: the reads that follow report them.
-    fn hint(&mut self, table: u16, keys: &[[u8; 32]], span: u64) {
+    /// predicts for `keys`, widened as the hint says. Pages that touch are
+    /// one range when the hint merges: the depths of one path share pages
+    /// in a pre-order table, so a read's pages come in a few runs. Errors
+    /// here are not errors: the reads that follow report them.
+    fn hint(&mut self, table: u16, keys: &[[u8; 32]], h: Hint) {
         let (Some(reader), Some(src)) = (
             self.tables[table as usize].as_mut(),
             self.sources[table as usize].as_ref(),
@@ -324,20 +356,51 @@ impl<B: Bucket> Snapshot<B> {
         let Ok(model) = reader.load_model() else {
             return;
         };
-        let mut ranges = Vec::with_capacity(keys.len() * (2 * span as usize + 1));
+        let mut pages = Vec::with_capacity(keys.len() * (h.below + h.above + 1) as usize);
         for k in keys {
             let p = model.predict(csl_run::k64(k));
-            let lo = p.saturating_sub(span).max(1);
-            let hi = (p + span).min(layout.page_count);
-            for q in lo..=hi {
-                if let Some(off) = layout.checked_record_off(q) {
-                    ranges.push((off, layout.record_bytes as usize));
-                }
+            let lo = p.saturating_sub(h.below).max(1);
+            let hi = (p + h.above).min(layout.page_count);
+            pages.extend(lo..=hi);
+        }
+        pages.sort_unstable();
+        pages.dedup();
+        let len = layout.record_bytes as usize;
+        let mut ranges: Vec<(u64, usize)> = Vec::with_capacity(pages.len());
+        for q in pages {
+            let Some(off) = layout.checked_record_off(q) else {
+                continue;
+            };
+            match ranges.last_mut() {
+                Some((o, l)) if h.merge && *o + *l as u64 == off => *l += len,
+                _ => ranges.push((off, len)),
             }
         }
-        ranges.sort_unstable();
-        ranges.dedup();
         src.prefetch(&ranges);
+    }
+
+    /// The cached answer for an account-trie node, when the cache applies.
+    fn top_get(&self, cache: bool, nk: &NodeKey) -> Option<&Option<Vec<u8>>> {
+        if cache && nk.depth() < self.top_levels {
+            self.top.get(nk)
+        } else {
+            None
+        }
+    }
+
+    /// After a verified walk: every node (and every gap) above the deepest
+    /// node fetched lies on the path and was hashed by the walk, so those
+    /// at the cached depths are kept for the snapshot's later reads.
+    fn top_keep<F: Fn(&NodeKey) -> [u8; 32]>(&mut self, path: &Nibbles, nodes: &Nodes<'_, F>, max_depth: usize) {
+        let Some(leaf) = nodes.map.keys().map(NodeKey::depth).max() else {
+            return;
+        };
+        for d in 0..leaf.min(self.top_levels).min(max_depth + 1) {
+            let nk = NodeKey::prefix(path, d);
+            if !self.top.contains_key(&nk) {
+                self.top.insert(nk, nodes.map.get(&nk).cloned());
+            }
+        }
     }
 
     /// The walk of profile §2 over `table`: speculate `0..=max_depth`,
@@ -349,6 +412,7 @@ impl<B: Bucket> Snapshot<B> {
         path: &Nibbles,
         key_of: impl Fn(&NodeKey) -> [u8; 32],
         max_depth: usize,
+        cache: bool,
     ) -> (Read<Vec<u8>>, Cost) {
         let mut cost = Cost::default();
         if root == EMPTY_ROOT_HASH {
@@ -360,17 +424,25 @@ impl<B: Bucket> Snapshot<B> {
             map: HashMap::new(),
             key_of: &key_of,
         };
-        // Speculative round: every depth, errors deferred to the repair
-        // that would need the node.
+        // Speculative round: every depth not already known from the cache,
+        // errors deferred to the repair that would need the node.
         cost.rounds = 1;
-        if let Some(span) = self.prefetch {
-            let keys: Vec<[u8; 32]> = (0..=max_depth)
-                .map(|d| key_of(&NodeKey::prefix(path, d)))
-                .collect();
-            self.hint(table, &keys, span);
-        }
+        let mut wanted: Vec<NodeKey> = Vec::with_capacity(max_depth + 1);
         for d in 0..=max_depth {
             let nk = NodeKey::prefix(path, d);
+            match self.top_get(cache, &nk) {
+                Some(Some(v)) => {
+                    nodes.map.insert(nk, v.clone());
+                }
+                Some(None) => {}
+                None => wanted.push(nk),
+            }
+        }
+        if let Some(h) = self.prefetch {
+            let keys: Vec<[u8; 32]> = wanted.iter().map(&key_of).collect();
+            self.hint(table, &keys, h);
+        }
+        for nk in wanted {
             let tk = key_of(&nk);
             if let Ok(Some(v)) = self.fetch(table, &tk) {
                 nodes.map.insert(nk, v);
@@ -406,6 +478,9 @@ impl<B: Bucket> Snapshot<B> {
                 }
             }
         };
+        if cache && self.top_levels > 0 && !outcome.is_insufficient() {
+            self.top_keep(path, &nodes, max_depth);
+        }
         let (r1, b1) = self.requests_so_far();
         cost.requests = r1 - r0;
         cost.bytes = b1 - b0;
@@ -422,6 +497,7 @@ impl<B: Bucket> Snapshot<B> {
             &path,
             |nk| nk.table_key().expect("walk depth ≤ 62"),
             d,
+            true,
         );
         let r = match r {
             Read::Verified(v) => match Account::decode(&v) {
@@ -470,6 +546,7 @@ impl<B: Bucket> Snapshot<B> {
             &path,
             |nk| nk.storage_table_key(&owner).expect("walk depth ≤ 62"),
             d,
+            false,
         );
         let r = match r {
             Read::Verified(v) => match decode_word(&v) {
