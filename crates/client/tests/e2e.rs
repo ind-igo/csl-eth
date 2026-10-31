@@ -143,6 +143,13 @@ fn random_absent(rng: &mut ChaCha8Rng, present: &BTreeMap<B256, ()>) -> B256 {
     }
 }
 
+/// The rounds a read with no repairs takes: one, plus one when the read
+/// had to fetch a model page first (a cold neighbourhood: the model page
+/// round, then the data pages it predicts).
+fn warm_rounds(c: &Cost) -> u32 {
+    1 + u32::from(c.model_pages > 0)
+}
+
 #[test]
 fn every_shape_reads_correctly_and_within_budget() {
     let w = world(3000, 1);
@@ -181,7 +188,7 @@ fn every_shape_reads_correctly_and_within_budget() {
             repaired += 1;
             continue;
         }
-        assert_eq!((c.repairs, c.rounds), (0, 1), "{}: {c:?}", a.hashed);
+        assert_eq!((c.repairs, c.rounds), (0, warm_rounds(&c)), "{}: {c:?}", a.hashed);
         max_cost.requests = max_cost.requests.max(c.requests);
         max_cost.bytes = max_cost.bytes.max(c.bytes);
     }
@@ -199,7 +206,7 @@ fn every_shape_reads_correctly_and_within_budget() {
             panic!("absent {k} gave {r:?}")
         };
         *shapes.entry(by).or_default() += 1;
-        assert_eq!(c.rounds, 1, "{k}: {c:?}");
+        assert_eq!(c.rounds, warm_rounds(&c), "{k}: {c:?}");
     }
     // Through the extension: a key sharing the pair's first byte but not
     // the next 61 nibbles.
@@ -243,7 +250,7 @@ fn every_shape_reads_correctly_and_within_budget() {
             assert_eq!(r, Read::Verified(*v));
             storage_max.requests = storage_max.requests.max(c.requests);
             storage_max.bytes = storage_max.bytes.max(c.bytes);
-            storage_max.rounds = storage_max.rounds.max(c.rounds);
+            storage_max.rounds = storage_max.rounds.max(c.rounds - (warm_rounds(&c) - 1));
             slots_read += 1;
         }
         let absent_slot =
@@ -257,7 +264,7 @@ fn every_shape_reads_correctly_and_within_budget() {
     eprintln!("storage present: {slots_read} reads, max {storage_max:?}");
     assert_eq!(
         storage_max.rounds, 1,
-        "storage speculation to depth 7 covers every synthetic trie"
+        "storage speculation to depth 7 covers every synthetic trie (model pages aside)"
     );
     let empty = w.accounts.iter().find(|a| a.storage.is_empty()).unwrap();
     let (r, c) = snap.storage(&empty.hashed, &B256::repeat_byte(9));

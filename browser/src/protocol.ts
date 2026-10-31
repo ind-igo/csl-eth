@@ -53,6 +53,9 @@ export interface Cost {
   rounds: number;
   repairs: number;
   nodes: number;
+  /// Model pages this read fetched: the cold part of a read, zero once
+  /// the key's neighbourhoods are known.
+  model_pages: number;
 }
 
 export interface ReadResult {

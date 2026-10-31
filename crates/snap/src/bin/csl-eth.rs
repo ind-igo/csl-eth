@@ -428,6 +428,7 @@ struct Series {
     bytes: Vec<u64>,
     rounds: Vec<u64>,
     nodes: Vec<u64>,
+    model_pages: Vec<u64>,
     micros: Vec<u64>,
 }
 
@@ -437,6 +438,7 @@ impl Series {
         self.bytes.push(c.bytes);
         self.rounds.push(c.rounds as u64);
         self.nodes.push(c.nodes as u64);
+        self.model_pages.push(c.model_pages);
         self.micros.push(wall.as_micros() as u64);
     }
 
@@ -461,6 +463,7 @@ impl Series {
             "bytes": stats(&self.bytes),
             "rounds": stats(&self.rounds),
             "nodes_walked": stats(&self.nodes),
+            "model_pages": stats(&self.model_pages),
             "ms": stats(&self.micros.iter().map(|u| u / 1000).collect::<Vec<_>>()),
         })
     }

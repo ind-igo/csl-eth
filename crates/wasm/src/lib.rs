@@ -66,7 +66,7 @@ fn slot_key(s: &str) -> Result<B256, String> {
 }
 
 fn cost_json(c: &Cost) -> serde_json::Value {
-    serde_json::json!({ "requests": c.requests, "bytes": c.bytes, "rounds": c.rounds, "repairs": c.repairs, "nodes": c.nodes })
+    serde_json::json!({ "requests": c.requests, "bytes": c.bytes, "rounds": c.rounds, "repairs": c.repairs, "nodes": c.nodes, "model_pages": c.model_pages })
 }
 
 fn status_json<T>(r: &Read<T>) -> (&'static str, serde_json::Value) {

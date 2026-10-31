@@ -105,8 +105,14 @@ cd browser && bun install && bun run serve      # http://127.0.0.1:8791/
 bun run site && (cd deploy && cf deploy)        # assemble browser/site and deploy it
 ```
 
-Not yet built, in order: the model section fetched by key (the
-per-snapshot budget for a following client), the content-addressed baseline
-client, the milestone 1 workload and fault table, a visualizer of the rounds
-(the `need` lists are its event stream), the head's period updates batched
-into one round.
+The model is fetched by key (2026-10-31): `csl-run` pages the model section
+under a tree with a top model on page 0, so a client reads 4 KB of model per
+key neighbourhood instead of the whole model (45 MB per snapshot at full
+state), and a cold neighbourhood costs one round before its data pages.
+Measured against R2: accounts 2.7 requests, 37 KB, one round (two when cold),
+135 ms p50; the page shows the model pages a read fetched.
+
+Not yet built, in order: the content-addressed baseline client, the
+milestone 1 workload and fault table, a visualizer of the rounds (the `need`
+lists are its event stream), the head's period updates batched into one
+round, a producer loop that follows finality.

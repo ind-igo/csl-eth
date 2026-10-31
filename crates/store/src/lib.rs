@@ -29,7 +29,16 @@ pub use producer::{
     Stats as ProduceStats,
 };
 
-pub const FORMAT_VERSION: u32 = 1;
+/// Bumped to 2 on 2026-10-31 when the run format paged its model
+/// (core §4.1): `model_root` became `blake3` of page 0 and the model
+/// section a tree of model pages. A client reading a manifest of another
+/// version refuses it.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// The format every table is written and read in: variable layout, no
+/// inline proofs (the trie proves values), the model paged so a client
+/// reads one model page per key neighbourhood instead of the whole model.
+pub const RUN_FORMAT: csl_run::Format = csl_run::Format::variable().paged();
 
 /// Tables, profile §1, plus the content-addressed baseline of §9.
 pub const TABLE_ACCOUNT_NODES: u16 = 0;

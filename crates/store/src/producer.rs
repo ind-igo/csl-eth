@@ -14,14 +14,14 @@
 //! behind the same `produce` call.
 
 use crate::{
-    blob_path, manifest_path, profile_id, snapshot_dir, Manifest, TableRef, CODE_BLOB_THRESHOLD, EPSILON, FORMAT_VERSION, LATEST_FILE, TABLE_ACCOUNT_NODES,
+    blob_path, manifest_path, profile_id, snapshot_dir, Manifest, TableRef, CODE_BLOB_THRESHOLD, EPSILON, FORMAT_VERSION, LATEST_FILE, RUN_FORMAT, TABLE_ACCOUNT_NODES,
     TABLE_CODE, TABLE_COUNT, TABLE_FILES, TABLE_NODES_BY_HASH, TABLE_STORAGE_NODES,
 };
 use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{Nibbles, KECCAK_EMPTY};
 use csl_eth_trie::Sealed;
 use csl_eth_trie::{code_key, encode_word, path_of, Account, BuildError, Builder, NodeKey, TooDeep, EMPTY_ROOT, MAX_NODE_BYTES};
-use csl_run::{Config, Entry, Format, Writer};
+use csl_run::{Config, Entry, Writer};
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
@@ -340,7 +340,7 @@ where
         }
         let path = dir.join(TABLE_FILES[table_id as usize]);
         let file = File::options().read(true).write(true).create(true).truncate(true).open(&path)?;
-        let mut w = Writer::with_format(file, cfg(table_id), Format::variable(), rows.len() as u64)?;
+        let mut w = Writer::with_format(file, cfg(table_id), RUN_FORMAT, rows.len() as u64)?;
         for (k, v) in rows {
             w.push(Entry::value(*k, v.clone()))?;
         }
@@ -366,7 +366,7 @@ where
     if !code_rows.is_empty() {
         let path = dir.join(TABLE_FILES[TABLE_CODE as usize]);
         let file = File::options().read(true).write(true).create(true).truncate(true).open(&path)?;
-        let mut w = Writer::with_format(file, cfg(TABLE_CODE), Format::variable(), code_rows.len() as u64)?;
+        let mut w = Writer::with_format(file, cfg(TABLE_CODE), RUN_FORMAT, code_rows.len() as u64)?;
         for (k, v) in &code_rows {
             if v.len() > CODE_BLOB_THRESHOLD {
                 let h = *blake3::hash(v).as_bytes();

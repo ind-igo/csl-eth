@@ -24,11 +24,11 @@
 use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{Nibbles, EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use csl_eth_store::{
-    blob_path, manifest_path, table_path, Manifest, D_ACCOUNT, D_STORAGE, LATEST_FILE,
-    TABLE_ACCOUNT_NODES, TABLE_CODE, TABLE_COUNT, TABLE_STORAGE_NODES,
+    blob_path, manifest_path, table_path, Manifest, D_ACCOUNT, D_STORAGE, FORMAT_VERSION,
+    LATEST_FILE, RUN_FORMAT, TABLE_ACCOUNT_NODES, TABLE_CODE, TABLE_COUNT, TABLE_STORAGE_NODES,
 };
 use csl_eth_trie::{decode_word, path_of, walk, AbsentBy, Account, Invalid, NodeKey, Outcome};
-use csl_run::{Format, Reader};
+use csl_run::Reader;
 use std::{collections::HashMap, fmt, sync::Arc};
 
 pub mod store;
@@ -136,6 +136,9 @@ pub struct Cost {
     pub repairs: u32,
     /// Trie nodes decoded on the final walk(s).
     pub nodes: usize,
+    /// Model pages this read fetched (page 0 is the open's): the cold part
+    /// of a read, zero once the key's neighbourhoods are known.
+    pub model_pages: u64,
 }
 
 /// Repairs a single read may take: one per node the speculative round
@@ -248,17 +251,24 @@ impl<D: Driver> Opener<D> {
         if manifest.block_hash != hash {
             return Ok(Err("manifest names a different block".into()));
         }
+        if manifest.format_version != FORMAT_VERSION {
+            return Ok(Err(format!(
+                "manifest format version {}, this client reads {FORMAT_VERSION}",
+                manifest.format_version
+            )));
+        }
         if manifest.state_root != self.state_root {
             return Ok(Err(format!(
                 "snapshot claims state_root {}, caller verified {}",
                 manifest.state_root, self.state_root
             )));
         }
-        // Every table's model in one round: each is a range the store may
-        // lack, and a reader's `load_model` is the read that wants it. A
-        // table that fails here (a model that does not hash, a truncated
-        // file) does not refuse the snapshot: its reads are `Insufficient`
-        // with that reason, and the other tables still serve.
+        // Every table's page 0 (the top model and the model tree's root) in
+        // one round: each is a range the store may lack, and a reader's
+        // `prepare` is the read that wants it. A table that fails here (a
+        // page 0 that does not hash, a truncated file) does not refuse the
+        // snapshot: its reads are `Insufficient` with that reason, and the
+        // other tables still serve.
         let mut readers = Vec::with_capacity(TABLE_COUNT);
         let mut pending = false;
         for t in 0..TABLE_COUNT as u16 {
@@ -277,7 +287,7 @@ impl<D: Driver> Opener<D> {
             let mut reader = match Reader::try_with_format(
                 view,
                 tr.run_ref(manifest.block_number),
-                Format::variable(),
+                RUN_FORMAT,
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -285,8 +295,8 @@ impl<D: Driver> Opener<D> {
                     continue;
                 }
             };
-            match reader.load_model() {
-                Ok(_) => readers.push(Ok(reader)),
+            match reader.prepare() {
+                Ok(()) => readers.push(Ok(reader)),
                 Err(e) if is_pending(&e) => {
                     pending = true;
                     readers.push(Ok(reader));
@@ -308,6 +318,7 @@ impl<D: Driver> Opener<D> {
             hint: Hint::default(),
             top_levels: 0,
             top: HashMap::new(),
+            model_at_begin: 0,
         }))
     }
 }
@@ -329,6 +340,8 @@ pub struct Snapshot<D> {
     /// `Some(node)` or `None` for "no node at this depth, an extension
     /// spans it", both verified by the walk that stored them.
     top: HashMap<NodeKey, Option<Vec<u8>>>,
+    /// The readers' model requests when the current read began.
+    model_at_begin: u64,
 }
 
 /// Nodes fetched so far, by position.
@@ -372,8 +385,19 @@ impl<D: Driver> Snapshot<D> {
     /// A read is starting: the store drops the last read's pages. The
     /// `try_` methods compute from the store; call this before the first
     /// attempt of a read, not between its rounds.
-    pub fn begin_read(&self) {
+    pub fn begin_read(&mut self) {
         self.store.begin_read();
+        self.model_at_begin = self.model_requests();
+    }
+
+    /// Model section reads so far: page 0 per table at open, then one per
+    /// model page fetched.
+    pub fn model_requests(&self) -> u64 {
+        self.readers
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|r| r.stats.model_requests)
+            .sum()
     }
 
     /// One synchronous round through the driver.
@@ -399,6 +423,7 @@ impl<D: Driver> Snapshot<D> {
             rounds,
             repairs,
             nodes,
+            model_pages: self.model_requests().saturating_sub(self.model_at_begin),
         }
     }
 
@@ -431,7 +456,11 @@ impl<D: Driver> Snapshot<D> {
 
     /// Want the pages the model predicts for `keys`, widened as the hint
     /// says, so the round fetches them together with whatever else it
-    /// finds missing. Pages the store holds are not wanted again.
+    /// finds missing. Pages the store holds are not wanted again. A key
+    /// whose model page the store lacks wants that page instead (the
+    /// reader's prediction is the read that notes it) and its data pages
+    /// come in the next round: a cold neighbourhood is two rounds, a warm
+    /// one is one.
     fn want_pages(&mut self, table: u16, keys: &[[u8; 32]]) {
         let h = self.hint;
         let Ok(reader) = self.readers[table as usize].as_mut() else {
@@ -440,13 +469,12 @@ impl<D: Driver> Snapshot<D> {
         let Some(layout) = reader.layout().copied() else {
             return;
         };
-        let Ok(model) = reader.load_model() else {
-            return;
-        };
         let rel = table_path(&self.manifest.block_hash, table);
         let len = layout.record_bytes as usize;
         for k in keys {
-            let p = model.predict(csl_run::k64(k));
+            let Ok(p) = reader.predict_page(csl_run::k64(k)) else {
+                continue;
+            };
             let lo = p.saturating_sub(h.below).max(1);
             let hi = (p + h.above).min(layout.page_count);
             for q in lo..=hi {
