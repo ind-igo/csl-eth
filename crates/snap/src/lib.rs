@@ -9,12 +9,15 @@
 //! - [`slice`]: the fetched slice on disk, the producer's input.
 //!
 //! The `csl-eth` binary drives it: `fetch` a prefix, `build` a bucket
-//! from a slice, `peers` to probe connectivity.
+//! from a slice, `check` a bucket, `peers` to probe connectivity, and the
+//! milestone 1 exit tests: [`workload`] and [`faults`].
 
 pub mod discovery;
+pub mod faults;
 pub mod fetch;
 pub mod peer;
 pub mod slice;
+pub mod workload;
 
 pub use fetch::{fetch, probe, Config as FetchConfig, FetchError};
 pub use peer::{Peer, PeerError};

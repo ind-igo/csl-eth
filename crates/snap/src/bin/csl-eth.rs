@@ -59,6 +59,12 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         max_secs: u64,
     },
+    /// The milestone 1 workload: fixed reads of every shape through both
+    /// clients, scored, one JSON report.
+    Workload(csl_eth_snap::workload::Args),
+    /// The milestone 1 fault table: every named corruption applied to a
+    /// copy of a bucket, read through, tabulated.
+    Faults(csl_eth_snap::faults::Args),
     /// Build a bucket (snapshot runs, blobs, manifest) from a slice.
     Build {
         #[arg(long)]
@@ -228,6 +234,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
     match Cli::parse().cmd {
+        Cmd::Workload(args) => {
+            let out = csl_eth_snap::workload::run(args)?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Cmd::Faults(args) => {
+            let out = csl_eth_snap::faults::run(args)?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
         Cmd::Fetch {
             prefix,
             out,
