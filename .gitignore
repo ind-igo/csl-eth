@@ -3,3 +3,4 @@
 /results/*.json
 !/results/*.md
 /data
+!/results/m1-*.json

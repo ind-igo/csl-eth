@@ -118,6 +118,8 @@ and the page's "baseline (by hash, serial)" toggle. Against R2, uncached:
 8.9 rounds, 106 KB, 1162 ms p50 per account against 1 round, 48 KB, 118 ms
 path-keyed; the baseline uses fewer bytes only on storage (76 against 130 KB).
 
-Not yet built, in order: the milestone 1 workload and fault table, a visualizer of the rounds (the `need`
+Milestone 1 is closed: `csl-eth workload` and `csl-eth faults` are its exit tests, and `results/m1.md` walks the PoC spec's exit table row by row (zero false answers in 86,368 workload reads and 23 aimed faults; path-keyed account reads 40 KB and one round at p95 on R2).
+
+Not yet built, in order: a visualizer of the rounds (the `need`
 lists are its event stream), the head's period updates batched into one
 round, a producer loop that follows finality.

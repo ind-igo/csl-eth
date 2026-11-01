@@ -1,0 +1,2663 @@
+{
+  "allow_short": false,
+  "attestation": "Every leaf in the slice (accounts, slots, code hashes) was proven to state_root by mainnet peers' snap range proofs when fetched (crates/snap/src/fetch.rs, verify_range), independently of the bucket under test; the expected values here are those leaves.",
+  "block_hash": "0x1a1956b0cc5d96bca0666e0e3d2617edff72199aff9f87ad34e15438cef14af7",
+  "block_number": 26311778,
+  "budget": {
+    "applies": true,
+    "bytes_p95": 40960,
+    "judged": true,
+    "rounds_p95": 1,
+    "rule": "path-keyed account_present and account_absent p95: bytes <= 51200, rounds <= 2",
+    "series": {
+      "account_absent": {
+        "bytes_p95": 40960,
+        "n": 500,
+        "rounds_p95": 1,
+        "within": true
+      },
+      "account_present": {
+        "bytes_p95": 40960,
+        "n": 500,
+        "rounds_p95": 1,
+        "within": true
+      }
+    },
+    "within": true
+  },
+  "complete": true,
+  "d_account": 9,
+  "d_storage": 7,
+  "failed_rules": [],
+  "head": {
+    "block_hash": "0x1a1956b0cc5d96bca0666e0e3d2617edff72199aff9f87ad34e15438cef14af7",
+    "block_number": 26311778,
+    "checkpoint": "0xe59d78041964322427cc209a44edcad243487378b78895a6cc0bfa7a7577cf0b",
+    "finality_lag_secs": 76252,
+    "state_root": "0xe255290f80d8369ba1c2dbac80f43f3e61a4fc74e2b3b034c0126b8426e5335c"
+  },
+  "hint": {
+    "above": 1,
+    "below": 1,
+    "merge": true
+  },
+  "host": "https://pub-a977a488180546bfb335de69b6f2e207.r2.dev",
+  "incomplete": [],
+  "modes": [
+    "path",
+    "baseline"
+  ],
+  "oracle": null,
+  "pass": true,
+  "plan": {
+    "account_leaf_depths": {
+      "10": 634,
+      "11": 36,
+      "12": 2,
+      "7": 21029,
+      "8": 73561,
+      "9": 9149
+    },
+    "accounts_beyond_d": 672,
+    "accounts_through_extension": 2794,
+    "complete": true,
+    "deep_storage_depth": 4,
+    "drawn": {
+      "accounts_absent": 500,
+      "accounts_present": 500,
+      "codes": 69,
+      "outside": 100,
+      "slots_absent_in_tries": 100,
+      "slots_of_absent_accounts": 100,
+      "slots_of_empty_storage": 100,
+      "slots_present": 300,
+      "total": 1769
+    },
+    "incomplete": [],
+    "largest_tries_slots": [
+      15528,
+      9824,
+      7616,
+      7144,
+      5749,
+      4759,
+      4327,
+      4310,
+      3904,
+      3840,
+      3426,
+      2953,
+      2901,
+      2754,
+      1722,
+      1450,
+      1388,
+      1351,
+      1322,
+      1275
+    ],
+    "requested": {
+      "accounts_absent": 500,
+      "accounts_present": 500,
+      "outside": 100,
+      "slots_absent_in_tries": 100,
+      "slots_of_absent_accounts": 100,
+      "slots_of_empty_storage": 100,
+      "slots_present": 300
+    },
+    "required_shapes": {
+      "account_absent_empty_slot": 217,
+      "account_absent_extension_mismatch": 102,
+      "account_absent_leaf_mismatch": 181,
+      "account_present_beyond_d": 10,
+      "account_present_extension": 37,
+      "code_blob": 13,
+      "code_inline": 56,
+      "outside": 100,
+      "storage_absent_account": 100,
+      "storage_absent_empty_slot": 34,
+      "storage_absent_extension_mismatch": 16,
+      "storage_absent_leaf_mismatch": 50,
+      "storage_empty_trie": 100,
+      "storage_present_deep": 149,
+      "storage_present_extension": 7,
+      "storage_present_largest": 204
+    },
+    "seed": 1,
+    "slice_accounts": 104411,
+    "slice_codes": 2172,
+    "slice_slots": 133753,
+    "slice_storage_tries": 3369
+  },
+  "plan_ms": 67,
+  "prefix": "1a7",
+  "remote": true,
+  "results": [
+    {
+      "failures": [],
+      "false_absent": 0,
+      "false_present": 0,
+      "mode": "path",
+      "ok": 1769,
+      "reads": 1769,
+      "shape_mismatch": 0,
+      "shape_mismatches": [],
+      "shapes": {
+        "account_absent": {
+          "bytes": {
+            "max": 45056,
+            "mean": 37552.1,
+            "p50": 40960,
+            "p95": 40960
+          },
+          "depths": {
+            "10": 7,
+            "6": 61,
+            "7": 295,
+            "8": 114,
+            "9": 23
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 802,
+            "mean": 129.6,
+            "p50": 115,
+            "p95": 195
+          },
+          "n": 500,
+          "nodes_walked": {
+            "max": 11,
+            "mean": 8.2,
+            "p50": 8,
+            "p95": 10
+          },
+          "repairs": {
+            "max": 1,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 3,
+            "mean": 2.7,
+            "p50": 3,
+            "p95": 3
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 37
+        },
+        "account_absent_crafted": {
+          "bytes": {
+            "max": 45056,
+            "mean": 37273.6,
+            "p50": 40960,
+            "p95": 40960
+          },
+          "depths": {
+            "10": 7,
+            "6": 20,
+            "7": 159,
+            "8": 92,
+            "9": 22
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 802,
+            "mean": 131.2,
+            "p50": 115,
+            "p95": 203
+          },
+          "n": 300,
+          "nodes_walked": {
+            "max": 11,
+            "mean": 8.5,
+            "p50": 8,
+            "p95": 10
+          },
+          "repairs": {
+            "max": 1,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 3,
+            "mean": 2.7,
+            "p50": 3,
+            "p95": 3
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 35
+        },
+        "account_absent_empty_slot": {
+          "bytes": {
+            "max": 45056,
+            "mean": 37732.3,
+            "p50": 40960,
+            "p95": 40960
+          },
+          "depths": {
+            "10": 1,
+            "6": 61,
+            "7": 129,
+            "8": 20,
+            "9": 6
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 802,
+            "mean": 133.7,
+            "p50": 116,
+            "p95": 195
+          },
+          "n": 217,
+          "nodes_walked": {
+            "max": 10,
+            "mean": 7.9,
+            "p50": 8,
+            "p95": 9
+          },
+          "repairs": {
+            "max": 1,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 3,
+            "mean": 2.7,
+            "p50": 3,
+            "p95": 3
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 20
+        },
+        "account_absent_extension_mismatch": {
+          "bytes": {
+            "max": 45056,
+            "mean": 36582.9,
+            "p50": 36864,
+            "p95": 45056
+          },
+          "depths": {
+            "7": 86,
+            "8": 16
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 300,
+            "mean": 129.2,
+            "p50": 117,
+            "p95": 194
+          },
+          "n": 102,
+          "nodes_walked": {
+            "max": 9,
+            "mean": 8.2,
+            "p50": 8,
+            "p95": 9
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 3,
+            "mean": 2.7,
+            "p50": 3,
+            "p95": 3
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 0
+        },
+        "account_absent_leaf_mismatch": {
+          "bytes": {
+            "max": 45056,
+            "mean": 37882.3,
+            "p50": 40960,
+            "p95": 40960
+          },
+          "depths": {
+            "10": 6,
+            "7": 80,
+            "8": 78,
+            "9": 17
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 282,
+            "mean": 124.9,
+            "p50": 114,
+            "p95": 178
+          },
+          "n": 181,
+          "nodes_walked": {
+            "max": 11,
+            "mean": 8.7,
+            "p50": 9,
+            "p95": 10
+          },
+          "repairs": {
+            "max": 1,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 3,
+            "mean": 2.8,
+            "p50": 3,
+            "p95": 3
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 17
+        },
+        "account_present": {
+          "bytes": {
+            "max": 53248,
+            "mean": 37650.4,
+            "p50": 40960,
+            "p95": 40960
+          },
+          "depths": {
+            "10": 8,
+            "11": 2,
+            "7": 94,
+            "8": 337,
+            "9": 59
+          },
+          "model_pages": {
+            "max": 1,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 1115,
+            "mean": 132.5,
+            "p50": 116,
+            "p95": 203
+          },
+          "n": 500,
+          "nodes_walked": {
+            "max": 11,
+            "mean": 9.0,
+            "p50": 9,
+            "p95": 10
+          },
+          "repairs": {
+            "max": 2,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 5,
+            "mean": 2.7,
+            "p50": 3,
+            "p95": 3
+          },
+          "rounds": {
+            "max": 2,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 37
+        },
+        "account_present_beyond_d": {
+          "bytes": {
+            "max": 40960,
+            "mean": 36454.4,
+            "p50": 40960,
+            "p95": 40960
+          },
+          "depths": {
+            "10": 8,
+            "11": 2
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 193,
+            "mean": 125.5,
+            "p50": 121,
+            "p95": 193
+          },
+          "n": 10,
+          "nodes_walked": {
+            "max": 11,
+            "mean": 10.9,
+            "p50": 11,
+            "p95": 11
+          },
+          "repairs": {
+            "max": 2,
+            "mean": 1.2,
+            "p50": 1,
+            "p95": 2
+          },
+          "requests": {
+            "max": 3,
+            "mean": 2.7,
+            "p50": 3,
+            "p95": 3
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 10
+        },
+        "account_present_extension": {
+          "bytes": {
+            "max": 40960,
+            "mean": 37085.4,
+            "p50": 40960,
+            "p95": 40960
+          },
+          "depths": {
+            "10": 8,
+            "11": 2,
+            "9": 27
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 230,
+            "mean": 130.8,
+            "p50": 122,
+            "p95": 193
+          },
+          "n": 37,
+          "nodes_walked": {
+            "max": 11,
+            "mean": 10.2,
+            "p50": 10,
+            "p95": 11
+          },
+          "repairs": {
+            "max": 2,
+            "mean": 0.3,
+            "p50": 0,
+            "p95": 2
+          },
+          "requests": {
+            "max": 3,
+            "mean": 2.7,
+            "p50": 3,
+            "p95": 3
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 37
+        },
+        "account_present_largest": {
+          "bytes": {
+            "max": 45056,
+            "mean": 36249.6,
+            "p50": 36864,
+            "p95": 45056
+          },
+          "depths": {
+            "7": 7,
+            "8": 11,
+            "9": 2
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 223,
+            "mean": 134.4,
+            "p50": 127,
+            "p95": 223
+          },
+          "n": 20,
+          "nodes_walked": {
+            "max": 10,
+            "mean": 8.8,
+            "p50": 9,
+            "p95": 10
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 3,
+            "mean": 2.6,
+            "p50": 3,
+            "p95": 3
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 0
+        },
+        "code": {
+          "bytes": {
+            "max": 33141,
+            "mean": 14247.9,
+            "p50": 12288,
+            "p95": 22826
+          },
+          "depths": {
+            "0": 69
+          },
+          "model_pages": {
+            "max": 1,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 383,
+            "mean": 135.6,
+            "p50": 108,
+            "p95": 275
+          },
+          "n": 69,
+          "nodes_walked": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 2,
+            "mean": 1.2,
+            "p50": 1,
+            "p95": 2
+          },
+          "rounds": {
+            "max": 2,
+            "mean": 1.2,
+            "p50": 1,
+            "p95": 2
+          },
+          "through_extension": 0
+        },
+        "code_blob": {
+          "bytes": {
+            "max": 33141,
+            "mean": 22375.5,
+            "p50": 21516,
+            "p95": 33141
+          },
+          "depths": {
+            "0": 13
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 383,
+            "mean": 231.2,
+            "p50": 212,
+            "p95": 383
+          },
+          "n": 13,
+          "nodes_walked": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 2,
+            "mean": 2.0,
+            "p50": 2,
+            "p95": 2
+          },
+          "rounds": {
+            "max": 2,
+            "mean": 2.0,
+            "p50": 2,
+            "p95": 2
+          },
+          "through_extension": 0
+        },
+        "code_inline": {
+          "bytes": {
+            "max": 16384,
+            "mean": 12361.1,
+            "p50": 12288,
+            "p95": 12288
+          },
+          "depths": {
+            "0": 56
+          },
+          "model_pages": {
+            "max": 1,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 296,
+            "mean": 113.4,
+            "p50": 103,
+            "p95": 166
+          },
+          "n": 56,
+          "nodes_walked": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 2,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "rounds": {
+            "max": 2,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 0
+        },
+        "outside": {
+          "bytes": {
+            "max": 8192,
+            "mean": 8192.0,
+            "p50": 8192,
+            "p95": 8192
+          },
+          "depths": {
+            "0": 100
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 256,
+            "mean": 109.0,
+            "p50": 103,
+            "p95": 166
+          },
+          "n": 100,
+          "nodes_walked": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "repairs": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "requests": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 0
+        },
+        "storage_absent": {
+          "bytes": {
+            "max": 143360,
+            "mean": 135004.2,
+            "p50": 135168,
+            "p95": 139264
+          },
+          "depths": {
+            "0": 40,
+            "1": 8,
+            "2": 8,
+            "3": 34,
+            "4": 7,
+            "5": 3
+          },
+          "model_pages": {
+            "max": 1,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 809,
+            "mean": 174.3,
+            "p50": 155,
+            "p95": 267
+          },
+          "n": 100,
+          "nodes_walked": {
+            "max": 15,
+            "mean": 11.5,
+            "p50": 12,
+            "p95": 14
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 11,
+            "mean": 10.6,
+            "p50": 11,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 2,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 0
+        },
+        "storage_absent_account": {
+          "bytes": {
+            "max": 143360,
+            "mean": 135290.9,
+            "p50": 135168,
+            "p95": 139264
+          },
+          "depths": {
+            "6": 34,
+            "7": 60,
+            "8": 6
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 452,
+            "mean": 167.2,
+            "p50": 152,
+            "p95": 282
+          },
+          "n": 100,
+          "nodes_walked": {
+            "max": 9,
+            "mean": 7.7,
+            "p50": 8,
+            "p95": 9
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 11,
+            "mean": 10.7,
+            "p50": 11,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 1
+        },
+        "storage_absent_empty_slot": {
+          "bytes": {
+            "max": 143360,
+            "mean": 135408.9,
+            "p50": 135168,
+            "p95": 143360
+          },
+          "depths": {
+            "0": 16,
+            "1": 2,
+            "2": 7,
+            "3": 9
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 267,
+            "mean": 168.2,
+            "p50": 167,
+            "p95": 253
+          },
+          "n": 34,
+          "nodes_walked": {
+            "max": 14,
+            "mean": 11.1,
+            "p50": 11,
+            "p95": 14
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 11,
+            "mean": 10.6,
+            "p50": 11,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 0
+        },
+        "storage_absent_extension_mismatch": {
+          "bytes": {
+            "max": 143360,
+            "mean": 134656.0,
+            "p50": 135168,
+            "p95": 143360
+          },
+          "depths": {
+            "3": 15,
+            "4": 1
+          },
+          "model_pages": {
+            "max": 1,
+            "mean": 0.1,
+            "p50": 0,
+            "p95": 1
+          },
+          "ms": {
+            "max": 765,
+            "mean": 196.8,
+            "p50": 148,
+            "p95": 765
+          },
+          "n": 16,
+          "nodes_walked": {
+            "max": 15,
+            "mean": 12.8,
+            "p50": 13,
+            "p95": 15
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 11,
+            "mean": 10.6,
+            "p50": 11,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 2,
+            "mean": 1.1,
+            "p50": 1,
+            "p95": 2
+          },
+          "through_extension": 0
+        },
+        "storage_absent_largest": {
+          "bytes": {
+            "max": 143360,
+            "mean": 134348.8,
+            "p50": 135168,
+            "p95": 139264
+          },
+          "depths": {
+            "2": 7,
+            "3": 34,
+            "4": 6,
+            "5": 3
+          },
+          "model_pages": {
+            "max": 1,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 765,
+            "mean": 172.2,
+            "p50": 149,
+            "p95": 267
+          },
+          "n": 50,
+          "nodes_walked": {
+            "max": 15,
+            "mean": 12.9,
+            "p50": 13,
+            "p95": 15
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 11,
+            "mean": 10.6,
+            "p50": 11,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 2,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 0
+        },
+        "storage_absent_leaf_mismatch": {
+          "bytes": {
+            "max": 143360,
+            "mean": 134840.3,
+            "p50": 139264,
+            "p95": 139264
+          },
+          "depths": {
+            "0": 24,
+            "1": 6,
+            "2": 1,
+            "3": 10,
+            "4": 6,
+            "5": 3
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 809,
+            "mean": 171.2,
+            "p50": 151,
+            "p95": 260
+          },
+          "n": 50,
+          "nodes_walked": {
+            "max": 15,
+            "mean": 11.4,
+            "p50": 11,
+            "p95": 15
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 11,
+            "mean": 10.6,
+            "p50": 11,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 0
+        },
+        "storage_empty_trie": {
+          "bytes": {
+            "max": 143360,
+            "mean": 135700.5,
+            "p50": 135168,
+            "p95": 143360
+          },
+          "depths": {
+            "0": 100
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 388,
+            "mean": 161.6,
+            "p50": 150,
+            "p95": 254
+          },
+          "n": 100,
+          "nodes_walked": {
+            "max": 10,
+            "mean": 8.9,
+            "p50": 9,
+            "p95": 10
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 11,
+            "mean": 10.7,
+            "p50": 11,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 0
+        },
+        "storage_present": {
+          "bytes": {
+            "max": 143360,
+            "mean": 135263.6,
+            "p50": 135168,
+            "p95": 139264
+          },
+          "depths": {
+            "0": 7,
+            "1": 26,
+            "2": 29,
+            "3": 89,
+            "4": 128,
+            "5": 18,
+            "6": 3
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 1464,
+            "mean": 180.0,
+            "p50": 162,
+            "p95": 273
+          },
+          "n": 300,
+          "nodes_walked": {
+            "max": 16,
+            "mean": 13.2,
+            "p50": 13,
+            "p95": 15
+          },
+          "repairs": {
+            "max": 1,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 11,
+            "mean": 10.7,
+            "p50": 11,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 7
+        },
+        "storage_present_deep": {
+          "bytes": {
+            "max": 139264,
+            "mean": 135442.9,
+            "p50": 139264,
+            "p95": 139264
+          },
+          "depths": {
+            "4": 128,
+            "5": 18,
+            "6": 3
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 736,
+            "mean": 176.2,
+            "p50": 160,
+            "p95": 275
+          },
+          "n": 149,
+          "nodes_walked": {
+            "max": 16,
+            "mean": 14.2,
+            "p50": 14,
+            "p95": 16
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 11,
+            "mean": 10.7,
+            "p50": 11,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 7
+        },
+        "storage_present_extension": {
+          "bytes": {
+            "max": 139264,
+            "mean": 134582.9,
+            "p50": 135168,
+            "p95": 139264
+          },
+          "depths": {
+            "4": 1,
+            "5": 4,
+            "6": 2
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 284,
+            "mean": 188.6,
+            "p50": 172,
+            "p95": 284
+          },
+          "n": 7,
+          "nodes_walked": {
+            "max": 15,
+            "mean": 14.4,
+            "p50": 14,
+            "p95": 15
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 11,
+            "mean": 10.7,
+            "p50": 11,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 7
+        },
+        "storage_present_largest": {
+          "bytes": {
+            "max": 143360,
+            "mean": 134907.0,
+            "p50": 135168,
+            "p95": 139264
+          },
+          "depths": {
+            "3": 61,
+            "4": 123,
+            "5": 17,
+            "6": 3
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 1464,
+            "mean": 182.0,
+            "p50": 160,
+            "p95": 275
+          },
+          "n": 204,
+          "nodes_walked": {
+            "max": 16,
+            "mean": 13.7,
+            "p50": 14,
+            "p95": 15
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 11,
+            "mean": 10.6,
+            "p50": 11,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 5
+        }
+      },
+      "unexpected": 0,
+      "wall_ms": 256508,
+      "wrong_values": 0
+    },
+    {
+      "failures": [],
+      "false_absent": 0,
+      "false_present": 0,
+      "mode": "baseline",
+      "ok": 1769,
+      "reads": 1769,
+      "shape_mismatch": 0,
+      "shape_mismatches": [],
+      "shapes": {
+        "account_absent": {
+          "bytes": {
+            "max": 86016,
+            "mean": 52043.8,
+            "p50": 49152,
+            "p95": 73728
+          },
+          "depths": {
+            "10": 7,
+            "6": 61,
+            "7": 295,
+            "8": 114,
+            "9": 23
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 1124,
+            "mean": 543.0,
+            "p50": 524,
+            "p95": 774
+          },
+          "n": 500,
+          "nodes_walked": {
+            "max": 11,
+            "mean": 8.2,
+            "p50": 8,
+            "p95": 10
+          },
+          "repairs": {
+            "max": 7,
+            "mean": 4.2,
+            "p50": 4,
+            "p95": 6
+          },
+          "requests": {
+            "max": 7,
+            "mean": 4.2,
+            "p50": 4,
+            "p95": 6
+          },
+          "rounds": {
+            "max": 7,
+            "mean": 4.2,
+            "p50": 4,
+            "p95": 6
+          },
+          "through_extension": 37
+        },
+        "account_absent_crafted": {
+          "bytes": {
+            "max": 86016,
+            "mean": 54708.9,
+            "p50": 49152,
+            "p95": 73728
+          },
+          "depths": {
+            "10": 7,
+            "6": 20,
+            "7": 159,
+            "8": 92,
+            "9": 22
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 1124,
+            "mean": 572.5,
+            "p50": 548,
+            "p95": 819
+          },
+          "n": 300,
+          "nodes_walked": {
+            "max": 11,
+            "mean": 8.5,
+            "p50": 8,
+            "p95": 10
+          },
+          "repairs": {
+            "max": 7,
+            "mean": 4.5,
+            "p50": 4,
+            "p95": 6
+          },
+          "requests": {
+            "max": 7,
+            "mean": 4.5,
+            "p50": 4,
+            "p95": 6
+          },
+          "rounds": {
+            "max": 7,
+            "mean": 4.5,
+            "p50": 4,
+            "p95": 6
+          },
+          "through_extension": 35
+        },
+        "account_absent_empty_slot": {
+          "bytes": {
+            "max": 73728,
+            "mean": 47623.1,
+            "p50": 49152,
+            "p95": 61440
+          },
+          "depths": {
+            "10": 1,
+            "6": 61,
+            "7": 129,
+            "8": 20,
+            "9": 6
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 937,
+            "mean": 497.9,
+            "p50": 490,
+            "p95": 728
+          },
+          "n": 217,
+          "nodes_walked": {
+            "max": 10,
+            "mean": 7.9,
+            "p50": 8,
+            "p95": 9
+          },
+          "repairs": {
+            "max": 6,
+            "mean": 3.9,
+            "p50": 4,
+            "p95": 5
+          },
+          "requests": {
+            "max": 6,
+            "mean": 3.9,
+            "p50": 4,
+            "p95": 5
+          },
+          "rounds": {
+            "max": 6,
+            "mean": 3.9,
+            "p50": 4,
+            "p95": 5
+          },
+          "through_extension": 20
+        },
+        "account_absent_extension_mismatch": {
+          "bytes": {
+            "max": 61440,
+            "mean": 51079.5,
+            "p50": 49152,
+            "p95": 61440
+          },
+          "depths": {
+            "7": 86,
+            "8": 16
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 851,
+            "mean": 529.6,
+            "p50": 523,
+            "p95": 735
+          },
+          "n": 102,
+          "nodes_walked": {
+            "max": 9,
+            "mean": 8.2,
+            "p50": 8,
+            "p95": 9
+          },
+          "repairs": {
+            "max": 5,
+            "mean": 4.2,
+            "p50": 4,
+            "p95": 5
+          },
+          "requests": {
+            "max": 5,
+            "mean": 4.2,
+            "p50": 4,
+            "p95": 5
+          },
+          "rounds": {
+            "max": 5,
+            "mean": 4.2,
+            "p50": 4,
+            "p95": 5
+          },
+          "through_extension": 0
+        },
+        "account_absent_leaf_mismatch": {
+          "bytes": {
+            "max": 86016,
+            "mean": 57887.1,
+            "p50": 61440,
+            "p95": 73728
+          },
+          "depths": {
+            "10": 6,
+            "7": 80,
+            "8": 78,
+            "9": 17
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 1124,
+            "mean": 604.6,
+            "p50": 611,
+            "p95": 833
+          },
+          "n": 181,
+          "nodes_walked": {
+            "max": 11,
+            "mean": 8.7,
+            "p50": 9,
+            "p95": 10
+          },
+          "repairs": {
+            "max": 7,
+            "mean": 4.7,
+            "p50": 5,
+            "p95": 6
+          },
+          "requests": {
+            "max": 7,
+            "mean": 4.7,
+            "p50": 5,
+            "p95": 6
+          },
+          "rounds": {
+            "max": 7,
+            "mean": 4.7,
+            "p50": 5,
+            "p95": 6
+          },
+          "through_extension": 17
+        },
+        "account_present": {
+          "bytes": {
+            "max": 106560,
+            "mean": 61137.0,
+            "p50": 61440,
+            "p95": 73728
+          },
+          "depths": {
+            "10": 8,
+            "11": 2,
+            "7": 94,
+            "8": 337,
+            "9": 59
+          },
+          "model_pages": {
+            "max": 2,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 1882,
+            "mean": 640.6,
+            "p50": 616,
+            "p95": 892
+          },
+          "n": 500,
+          "nodes_walked": {
+            "max": 11,
+            "mean": 9.0,
+            "p50": 9,
+            "p95": 10
+          },
+          "repairs": {
+            "max": 8,
+            "mean": 5.0,
+            "p50": 5,
+            "p95": 6
+          },
+          "requests": {
+            "max": 10,
+            "mean": 5.0,
+            "p50": 5,
+            "p95": 6
+          },
+          "rounds": {
+            "max": 10,
+            "mean": 5.0,
+            "p50": 5,
+            "p95": 6
+          },
+          "through_extension": 37
+        },
+        "account_present_beyond_d": {
+          "bytes": {
+            "max": 86016,
+            "mean": 84787.2,
+            "p50": 86016,
+            "p95": 86016
+          },
+          "depths": {
+            "10": 8,
+            "11": 2
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 1047,
+            "mean": 891.6,
+            "p50": 949,
+            "p95": 1047
+          },
+          "n": 10,
+          "nodes_walked": {
+            "max": 11,
+            "mean": 10.9,
+            "p50": 11,
+            "p95": 11
+          },
+          "repairs": {
+            "max": 7,
+            "mean": 6.9,
+            "p50": 7,
+            "p95": 7
+          },
+          "requests": {
+            "max": 7,
+            "mean": 6.9,
+            "p50": 7,
+            "p95": 7
+          },
+          "rounds": {
+            "max": 7,
+            "mean": 6.9,
+            "p50": 7,
+            "p95": 7
+          },
+          "through_extension": 10
+        },
+        "account_present_extension": {
+          "bytes": {
+            "max": 86016,
+            "mean": 76717.0,
+            "p50": 73728,
+            "p95": 86016
+          },
+          "depths": {
+            "10": 8,
+            "11": 2,
+            "9": 27
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 1882,
+            "mean": 848.0,
+            "p50": 809,
+            "p95": 1080
+          },
+          "n": 37,
+          "nodes_walked": {
+            "max": 11,
+            "mean": 10.2,
+            "p50": 10,
+            "p95": 11
+          },
+          "repairs": {
+            "max": 7,
+            "mean": 6.2,
+            "p50": 6,
+            "p95": 7
+          },
+          "requests": {
+            "max": 7,
+            "mean": 6.2,
+            "p50": 6,
+            "p95": 7
+          },
+          "rounds": {
+            "max": 7,
+            "mean": 6.2,
+            "p50": 6,
+            "p95": 7
+          },
+          "through_extension": 37
+        },
+        "account_present_largest": {
+          "bytes": {
+            "max": 73728,
+            "mean": 58368.0,
+            "p50": 61440,
+            "p95": 73728
+          },
+          "depths": {
+            "7": 7,
+            "8": 11,
+            "9": 2
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 873,
+            "mean": 583.6,
+            "p50": 555,
+            "p95": 873
+          },
+          "n": 20,
+          "nodes_walked": {
+            "max": 10,
+            "mean": 8.8,
+            "p50": 9,
+            "p95": 10
+          },
+          "repairs": {
+            "max": 6,
+            "mean": 4.8,
+            "p50": 5,
+            "p95": 6
+          },
+          "requests": {
+            "max": 6,
+            "mean": 4.8,
+            "p50": 5,
+            "p95": 6
+          },
+          "rounds": {
+            "max": 6,
+            "mean": 4.8,
+            "p50": 5,
+            "p95": 6
+          },
+          "through_extension": 0
+        },
+        "code": {
+          "bytes": {
+            "max": 33141,
+            "mean": 14247.9,
+            "p50": 12288,
+            "p95": 22826
+          },
+          "depths": {
+            "0": 69
+          },
+          "model_pages": {
+            "max": 1,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 349,
+            "mean": 145.6,
+            "p50": 116,
+            "p95": 285
+          },
+          "n": 69,
+          "nodes_walked": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 2,
+            "mean": 1.2,
+            "p50": 1,
+            "p95": 2
+          },
+          "rounds": {
+            "max": 2,
+            "mean": 1.2,
+            "p50": 1,
+            "p95": 2
+          },
+          "through_extension": 0
+        },
+        "code_blob": {
+          "bytes": {
+            "max": 33141,
+            "mean": 22375.5,
+            "p50": 21516,
+            "p95": 33141
+          },
+          "depths": {
+            "0": 13
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 349,
+            "mean": 250.2,
+            "p50": 227,
+            "p95": 349
+          },
+          "n": 13,
+          "nodes_walked": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 2,
+            "mean": 2.0,
+            "p50": 2,
+            "p95": 2
+          },
+          "rounds": {
+            "max": 2,
+            "mean": 2.0,
+            "p50": 2,
+            "p95": 2
+          },
+          "through_extension": 0
+        },
+        "code_inline": {
+          "bytes": {
+            "max": 16384,
+            "mean": 12361.1,
+            "p50": 12288,
+            "p95": 12288
+          },
+          "depths": {
+            "0": 56
+          },
+          "model_pages": {
+            "max": 1,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 227,
+            "mean": 121.3,
+            "p50": 114,
+            "p95": 190
+          },
+          "n": 56,
+          "nodes_walked": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "repairs": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "requests": {
+            "max": 2,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "rounds": {
+            "max": 2,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 0
+        },
+        "outside": {
+          "bytes": {
+            "max": 12288,
+            "mean": 12288.0,
+            "p50": 12288,
+            "p95": 12288
+          },
+          "depths": {
+            "0": 100
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 307,
+            "mean": 131.8,
+            "p50": 116,
+            "p95": 224
+          },
+          "n": 100,
+          "nodes_walked": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "repairs": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "requests": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "rounds": {
+            "max": 1,
+            "mean": 1.0,
+            "p50": 1,
+            "p95": 1
+          },
+          "through_extension": 0
+        },
+        "storage_absent": {
+          "bytes": {
+            "max": 135168,
+            "mean": 92282.9,
+            "p50": 98304,
+            "p95": 122880
+          },
+          "depths": {
+            "0": 40,
+            "1": 8,
+            "2": 8,
+            "3": 34,
+            "4": 7,
+            "5": 3
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 1448,
+            "mean": 963.1,
+            "p50": 948,
+            "p95": 1401
+          },
+          "n": 100,
+          "nodes_walked": {
+            "max": 15,
+            "mean": 11.5,
+            "p50": 12,
+            "p95": 14
+          },
+          "repairs": {
+            "max": 11,
+            "mean": 7.5,
+            "p50": 8,
+            "p95": 10
+          },
+          "requests": {
+            "max": 11,
+            "mean": 7.5,
+            "p50": 8,
+            "p95": 10
+          },
+          "rounds": {
+            "max": 11,
+            "mean": 7.5,
+            "p50": 8,
+            "p95": 10
+          },
+          "through_extension": 0
+        },
+        "storage_absent_account": {
+          "bytes": {
+            "max": 61440,
+            "mean": 45670.4,
+            "p50": 49152,
+            "p95": 61440
+          },
+          "depths": {
+            "6": 34,
+            "7": 60,
+            "8": 6
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 962,
+            "mean": 475.0,
+            "p50": 453,
+            "p95": 679
+          },
+          "n": 100,
+          "nodes_walked": {
+            "max": 9,
+            "mean": 7.7,
+            "p50": 8,
+            "p95": 9
+          },
+          "repairs": {
+            "max": 5,
+            "mean": 3.7,
+            "p50": 4,
+            "p95": 5
+          },
+          "requests": {
+            "max": 5,
+            "mean": 3.7,
+            "p50": 4,
+            "p95": 5
+          },
+          "rounds": {
+            "max": 5,
+            "mean": 3.7,
+            "p50": 4,
+            "p95": 5
+          },
+          "through_extension": 1
+        },
+        "storage_absent_empty_slot": {
+          "bytes": {
+            "max": 122880,
+            "mean": 87100.2,
+            "p50": 86016,
+            "p95": 122880
+          },
+          "depths": {
+            "0": 16,
+            "1": 2,
+            "2": 7,
+            "3": 9
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 1289,
+            "mean": 892.0,
+            "p50": 874,
+            "p95": 1265
+          },
+          "n": 34,
+          "nodes_walked": {
+            "max": 14,
+            "mean": 11.1,
+            "p50": 11,
+            "p95": 14
+          },
+          "repairs": {
+            "max": 10,
+            "mean": 7.1,
+            "p50": 7,
+            "p95": 10
+          },
+          "requests": {
+            "max": 10,
+            "mean": 7.1,
+            "p50": 7,
+            "p95": 10
+          },
+          "rounds": {
+            "max": 10,
+            "mean": 7.1,
+            "p50": 7,
+            "p95": 10
+          },
+          "through_extension": 0
+        },
+        "storage_absent_extension_mismatch": {
+          "bytes": {
+            "max": 135168,
+            "mean": 108288.0,
+            "p50": 110592,
+            "p95": 135168
+          },
+          "depths": {
+            "3": 15,
+            "4": 1
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 1402,
+            "mean": 1128.6,
+            "p50": 1175,
+            "p95": 1402
+          },
+          "n": 16,
+          "nodes_walked": {
+            "max": 15,
+            "mean": 12.8,
+            "p50": 13,
+            "p95": 15
+          },
+          "repairs": {
+            "max": 11,
+            "mean": 8.8,
+            "p50": 9,
+            "p95": 11
+          },
+          "requests": {
+            "max": 11,
+            "mean": 8.8,
+            "p50": 9,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 11,
+            "mean": 8.8,
+            "p50": 9,
+            "p95": 11
+          },
+          "through_extension": 0
+        },
+        "storage_absent_largest": {
+          "bytes": {
+            "max": 135168,
+            "mean": 108871.7,
+            "p50": 110592,
+            "p95": 135168
+          },
+          "depths": {
+            "2": 7,
+            "3": 34,
+            "4": 6,
+            "5": 3
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 1428,
+            "mean": 1146.1,
+            "p50": 1175,
+            "p95": 1402
+          },
+          "n": 50,
+          "nodes_walked": {
+            "max": 15,
+            "mean": 12.9,
+            "p50": 13,
+            "p95": 15
+          },
+          "repairs": {
+            "max": 11,
+            "mean": 8.9,
+            "p50": 9,
+            "p95": 11
+          },
+          "requests": {
+            "max": 11,
+            "mean": 8.9,
+            "p50": 9,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 11,
+            "mean": 8.9,
+            "p50": 9,
+            "p95": 11
+          },
+          "through_extension": 0
+        },
+        "storage_absent_leaf_mismatch": {
+          "bytes": {
+            "max": 135168,
+            "mean": 90685.4,
+            "p50": 86016,
+            "p95": 135168
+          },
+          "depths": {
+            "0": 24,
+            "1": 6,
+            "2": 1,
+            "3": 10,
+            "4": 6,
+            "5": 3
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 1448,
+            "mean": 958.6,
+            "p50": 910,
+            "p95": 1417
+          },
+          "n": 50,
+          "nodes_walked": {
+            "max": 15,
+            "mean": 11.4,
+            "p50": 11,
+            "p95": 15
+          },
+          "repairs": {
+            "max": 11,
+            "mean": 7.4,
+            "p50": 7,
+            "p95": 11
+          },
+          "requests": {
+            "max": 11,
+            "mean": 7.4,
+            "p50": 7,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 11,
+            "mean": 7.4,
+            "p50": 7,
+            "p95": 11
+          },
+          "through_extension": 0
+        },
+        "storage_empty_trie": {
+          "bytes": {
+            "max": 73728,
+            "mean": 60211.2,
+            "p50": 61440,
+            "p95": 73728
+          },
+          "depths": {
+            "0": 100
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 860,
+            "mean": 620.7,
+            "p50": 615,
+            "p95": 825
+          },
+          "n": 100,
+          "nodes_walked": {
+            "max": 10,
+            "mean": 8.9,
+            "p50": 9,
+            "p95": 10
+          },
+          "repairs": {
+            "max": 6,
+            "mean": 4.9,
+            "p50": 5,
+            "p95": 6
+          },
+          "requests": {
+            "max": 6,
+            "mean": 4.9,
+            "p50": 5,
+            "p95": 6
+          },
+          "rounds": {
+            "max": 6,
+            "mean": 4.9,
+            "p50": 5,
+            "p95": 6
+          },
+          "through_extension": 0
+        },
+        "storage_present": {
+          "bytes": {
+            "max": 147456,
+            "mean": 112380.6,
+            "p50": 110592,
+            "p95": 135168
+          },
+          "depths": {
+            "0": 7,
+            "1": 26,
+            "2": 29,
+            "3": 89,
+            "4": 128,
+            "5": 18,
+            "6": 3
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 2004,
+            "mean": 1178.6,
+            "p50": 1171,
+            "p95": 1565
+          },
+          "n": 300,
+          "nodes_walked": {
+            "max": 16,
+            "mean": 13.2,
+            "p50": 13,
+            "p95": 15
+          },
+          "repairs": {
+            "max": 12,
+            "mean": 9.2,
+            "p50": 9,
+            "p95": 11
+          },
+          "requests": {
+            "max": 12,
+            "mean": 9.2,
+            "p50": 9,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 12,
+            "mean": 9.1,
+            "p50": 9,
+            "p95": 11
+          },
+          "through_extension": 7
+        },
+        "storage_present_deep": {
+          "bytes": {
+            "max": 147456,
+            "mean": 124556.9,
+            "p50": 122880,
+            "p95": 139264
+          },
+          "depths": {
+            "4": 128,
+            "5": 18,
+            "6": 3
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 2004,
+            "mean": 1283.6,
+            "p50": 1255,
+            "p95": 1601
+          },
+          "n": 149,
+          "nodes_walked": {
+            "max": 16,
+            "mean": 14.2,
+            "p50": 14,
+            "p95": 16
+          },
+          "repairs": {
+            "max": 12,
+            "mean": 10.2,
+            "p50": 10,
+            "p95": 12
+          },
+          "requests": {
+            "max": 12,
+            "mean": 10.1,
+            "p50": 10,
+            "p95": 12
+          },
+          "rounds": {
+            "max": 12,
+            "mean": 10.1,
+            "p50": 10,
+            "p95": 11
+          },
+          "through_extension": 7
+        },
+        "storage_present_extension": {
+          "bytes": {
+            "max": 135168,
+            "mean": 125805.7,
+            "p50": 122880,
+            "p95": 135168
+          },
+          "depths": {
+            "4": 1,
+            "5": 4,
+            "6": 2
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 1537,
+            "mean": 1240.7,
+            "p50": 1238,
+            "p95": 1537
+          },
+          "n": 7,
+          "nodes_walked": {
+            "max": 15,
+            "mean": 14.4,
+            "p50": 14,
+            "p95": 15
+          },
+          "repairs": {
+            "max": 11,
+            "mean": 10.4,
+            "p50": 10,
+            "p95": 11
+          },
+          "requests": {
+            "max": 11,
+            "mean": 10.3,
+            "p50": 10,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 11,
+            "mean": 10.3,
+            "p50": 10,
+            "p95": 11
+          },
+          "through_extension": 7
+        },
+        "storage_present_largest": {
+          "bytes": {
+            "max": 147456,
+            "mean": 119165.5,
+            "p50": 122880,
+            "p95": 135168
+          },
+          "depths": {
+            "3": 61,
+            "4": 123,
+            "5": 17,
+            "6": 3
+          },
+          "model_pages": {
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0,
+            "p95": 0
+          },
+          "ms": {
+            "max": 2004,
+            "mean": 1240.1,
+            "p50": 1218,
+            "p95": 1581
+          },
+          "n": 204,
+          "nodes_walked": {
+            "max": 16,
+            "mean": 13.7,
+            "p50": 14,
+            "p95": 15
+          },
+          "repairs": {
+            "max": 12,
+            "mean": 9.7,
+            "p50": 10,
+            "p95": 11
+          },
+          "requests": {
+            "max": 12,
+            "mean": 9.7,
+            "p50": 10,
+            "p95": 11
+          },
+          "rounds": {
+            "max": 12,
+            "mean": 9.7,
+            "p50": 10,
+            "p95": 11
+          },
+          "through_extension": 5
+        }
+      },
+      "unexpected": 0,
+      "wall_ms": 1175376,
+      "wrong_values": 0
+    }
+  ],
+  "safe": true,
+  "sizes": {
+    "absent": 500,
+    "absent_slots": 300,
+    "accounts": 500,
+    "outside": 100,
+    "slots": 300
+  },
+  "state_root": "0xe255290f80d8369ba1c2dbac80f43f3e61a4fc74e2b3b034c0126b8426e5335c",
+  "top_levels": 4,
+  "totals": {
+    "http": [
+      {
+        "bytes": 120582209,
+        "mode": "path",
+        "open_bytes": 134892,
+        "open_requests": 9,
+        "requests": 9315
+      },
+      {
+        "bytes": 112332929,
+        "mode": "baseline",
+        "open_bytes": 134892,
+        "open_requests": 9,
+        "requests": 9150
+      }
+    ],
+    "reads": 3538,
+    "wall_ms": 1431884
+  }
+}
