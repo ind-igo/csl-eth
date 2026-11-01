@@ -63,7 +63,8 @@ enum Cmd {
     /// clients, scored, one JSON report.
     Workload(csl_eth_snap::workload::Args),
     /// The milestone 1 fault table: every named corruption applied to a
-    /// copy of a bucket, read through, tabulated.
+    /// bucket's responses by a lying host, read through, tabulated; passes
+    /// when safe (no false answer) and exercised (every fault fired).
     Faults(csl_eth_snap::faults::Args),
     /// Build a bucket (snapshot runs, blobs, manifest) from a slice.
     Build {

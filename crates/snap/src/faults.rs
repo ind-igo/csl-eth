@@ -25,11 +25,39 @@
 //! across the plan (root, middle and deepest account node; every storage
 //! depth for slot reads), and the driver corrupts only the response that
 //! holds that node's page, leaving every other response clean. The row
-//! reports which (table, trie, depth) each read aimed at, and the reads
-//! whose aim the fault could not land ("untargeted"). Faults that are about
-//! a whole file or region (page 0, model pages, the manifest, `latest`,
+//! reports which (table, trie, depth) each read aimed at (`aimed_at`) and
+//! where the aim landed (`coverage`: a response holding the aimed node's
+//! page was changed), and the reads it did not: no node on the walk the
+//! fault can use (`no_aim`: `forged_fence` needs a node the model does not
+//! predict exactly, `fence_gap` a page whose fences are not already tight,
+//! and some walks offer neither) or an aim the fault could not change
+//! (`missed`); `untargeted` is their sum. So not every read is aimed, and
+//! not every aim is guaranteed to land: the table measures both and
+//! requires each to clear a floor (below). Faults that are about a
+//! whole file or region (page 0, model pages, the manifest, `latest`,
 //! blobs) and `bit_flip` (random bits in every data response) are not
 //! aimed.
+//!
+//! With the account trie's top levels kept across reads (`--top-levels`),
+//! a node at a cached depth is answered from the cache, so a response
+//! holding it can change without the client consuming it. Aims therefore
+//! skip account depths below `top_levels`, and coverage counts only nodes
+//! the client must fetch. The default is 0: every node comes through the
+//! faulty driver on every read.
+//!
+//! The table judges two things and passes only on both. `safe`: the
+//! control row read every key right, and no row has a wrong value, a
+//! false absence or presence, an answered outside key, or a walk the
+//! shape model did not predict. `exercised`: every fault that should fire
+//! changed some response in every mode it applies to, and an aimed fault
+//! had a node to aim at on at least [`Fault::min_aimed`] of the reads the
+//! rate does not spare and landed on at least [`Fault::min_landed`] of
+//! its aims, overall and within each (table, trie) it aimed at. A fault
+//! that cannot apply to a mode (`truncated_blob` in the baseline, which
+//! reads no code, or in a plan with no blob-sized code) is listed as not
+//! applicable to it, decided from the mode and the plan rather than from
+//! what the driver saw. A run that injects nothing (`--rate 0`, or an
+//! aiming regression) is therefore safe and fails.
 //!
 //! The format carries no Bloom filter (pages route by chained fences and
 //! the learned model), so the spec's "zeroed Bloom" has nothing to zero;
@@ -94,7 +122,8 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = Mode::Both)]
     pub mode: Mode,
     /// Account-trie depths kept across reads (0: every node comes through
-    /// the faulty driver on every read).
+    /// the faulty driver on every read). Aimed faults never aim at a
+    /// cached depth (module doc).
     #[arg(long, default_value_t = 0)]
     pub top_levels: usize,
     /// Run only these faults (repeatable); every fault when absent. The
@@ -201,13 +230,13 @@ impl Fault {
             Fault::NodeOmitted => "the page holding the aimed node re-encoded without it; fences and count stay consistent, so the node is silently missing",
             Fault::PageMalformed => "the page holding the aimed node re-encoded without it but the header's count left as it was: the offset table no longer matches",
             Fault::ForgedFence => "the page the model predicts for the aimed node, when that is not the page holding it, re-encoded with fences [0^32, FF^32]: it claims to cover the node, so the node is found absent from it instead of on its neighbour (a node the model predicts exactly cannot be misrouted this way, and is aimed past)",
-            Fault::FenceGap => "the page holding the aimed node re-encoded with fences narrowed to its first entry and the successor of its last: keys in the former gaps fall between pages, but every node a walk needs is an entry and stays covered, so this cannot misroute a read (a negative control)",
+            Fault::FenceGap => "the page holding the aimed node re-encoded with fences narrowed to its first entry and the successor of its last: keys in the former gaps fall between pages, but every node a walk needs is an entry and stays covered, so this cannot misroute a read (a negative control). A page whose fences are already that tight cannot be narrowed and is aimed past: in the pre-order account table a node's nibble-0 child has the node's key plus one, so a page that ends on a node and is followed by its 0-child (page 1, holding the root, always is) has no gap",
             Fault::FenceExcludes => "the page holding the aimed node re-encoded with its upper fence lowered onto its last entry, so a key the page holds is outside its fences; the page's own validation rejects it (not aimable on the table's last page, whose upper fence must stay FF^32)",
             Fault::TruncatedPage => "the range response holding the aimed node's page answered with half the bytes asked",
             Fault::TruncatedLatest => "snapshots/latest answered with its first half",
             Fault::TruncatedManifest => "the manifest answered with its first half (latest served whole)",
             Fault::TruncatedBlob => "blob files answered with their first half",
-            Fault::WrongRunPage => "the range response holding the aimed node's page answered with the same range of another table (account_nodes from storage_nodes and back, nodes_by_hash from code and back)",
+            Fault::WrongRunPage => "in the range response holding the aimed node's page, that page replaced by one whole data page of another table (account_nodes from storage_nodes and back, nodes_by_hash from code and back; the same page number modulo the other table's page count), the rest of the response intact",
             Fault::WrongRange => "the range response holding the aimed node's page answered from one page further into the same file",
             Fault::BitFlip => "unaimed: one random bit flipped in every data range response",
             Fault::BitFlipPage => "one random bit flipped in the page holding the aimed node",
@@ -245,9 +274,54 @@ impl Fault {
     }
 
     /// The fault should change some response; a row where it changed none
-    /// is flagged (its reads say nothing about the fault).
+    /// in a mode it applies to is not exercised (its reads say nothing
+    /// about the fault).
     pub fn fires(self) -> bool {
         self != Fault::None
+    }
+
+    /// Why the fault cannot apply to a mode over a plan, when it cannot:
+    /// the mode makes no request the fault rewrites. Decided from the mode
+    /// and the plan, not from what the driver saw, so a regression that
+    /// stops a fault firing is "not exercised", never "not applicable".
+    pub fn not_applicable(self, baseline: bool, plan: &Plan) -> Option<&'static str> {
+        match self {
+            Fault::None => Some("the control row changes nothing"),
+            Fault::TruncatedBlob if baseline => {
+                Some("the baseline reads no code (code is one read, made in the path mode only), so no blob is fetched")
+            }
+            Fault::TruncatedBlob
+                if !plan
+                    .draws
+                    .iter()
+                    .any(|d| d.series.iter().any(|s| s == "code_blob")) =>
+            {
+                Some("the plan draws no code above the blob threshold, so no blob is fetched")
+            }
+            _ => None,
+        }
+    }
+
+    /// For an aimed fault, the share of the reads not spared by the rate
+    /// that must have a node to aim at, for the row to count as exercised.
+    /// Almost every read has one; two faults need something of the node or
+    /// its page that not every walk offers, and aim past nodes without it:
+    /// `forged_fence` a node the model does not predict exactly, and
+    /// `fence_gap` a page whose fences are not already as tight as its
+    /// entries (see [`Fault::describe`]). A read whose walk has no such
+    /// node is not aimed (`no_aim`).
+    pub fn min_aimed(self) -> f64 {
+        match self {
+            Fault::ForgedFence | Fault::FenceGap => 0.5,
+            _ => 0.98,
+        }
+    }
+
+    /// For an aimed fault, the share of aims that must land (change a
+    /// response holding the aimed node's page), overall and within each
+    /// (table, trie) aimed at.
+    pub fn min_landed(self) -> f64 {
+        0.98
     }
 
     fn qualifies(self, k: &Kind) -> bool {
@@ -395,17 +469,22 @@ pub struct Aim {
     /// The data page the model predicts for its key: the first the reader
     /// visits.
     pub predicted: u64,
+    /// The page's fences are already as tight as its entries (the lower
+    /// fence is its first key, the upper the successor of its last or
+    /// `FF^32`): `fence_gap` has nothing to narrow.
+    pub tight: bool,
 }
 
 impl Aim {
     /// The coverage label: table, trie and depth.
     pub fn label(&self) -> String {
-        format!(
-            "table {} {} depth {}",
-            self.table,
-            self.trie.name(),
-            self.depth
-        )
+        format!("{} depth {}", self.group(), self.depth)
+    }
+
+    /// The (table, trie) the node is in: the unit the landing rate is
+    /// judged over.
+    pub fn group(&self) -> String {
+        format!("table {} {}", self.table, self.trie.name())
     }
 }
 
@@ -594,16 +673,33 @@ impl<D: Driver> FaultDriver<D> {
                 return truncate(got);
             }
             Fault::WrongRunPage => {
-                at(aim.page)?;
+                // One whole data page of the partner table, spliced over
+                // the aimed page; the rest of the response stays intact.
+                // The foreign page is fetched inside the partner's data
+                // pages, so this is never a short read or a refusal.
+                let b = at(aim.page)?;
                 let partner = self.geometry.by_table(g.table ^ 1)?;
-                let span = partner.layout.page_count * PAGE as u64;
-                let off2 = PAGE as u64 + (off - PAGE as u64) % span;
+                let pl = &partner.layout;
+                if pl.record_bytes != l.record_bytes || pl.page_count == 0 {
+                    return None;
+                }
+                let rb = l.record_bytes as usize;
+                let q2 = (aim.page - 1) % pl.page_count + 1;
                 let w = Want::Range {
                     rel: partner.rel.clone(),
-                    off: off2,
-                    len,
+                    off: pl.checked_record_off(q2)?,
+                    len: rb,
                 };
-                return Some(self.inner.fetch(&[w]).remove(0));
+                let foreign = self
+                    .inner
+                    .fetch(&[w])
+                    .remove(0)
+                    .ok()
+                    .flatten()
+                    .filter(|v| v.len() == rb)?;
+                let mut bytes = got.clone().ok().flatten()?;
+                bytes.get_mut(b..b + rb)?.copy_from_slice(&foreign);
+                return Some(Ok(Some(bytes)));
             }
             Fault::WrongRange => {
                 at(aim.page)?;
@@ -823,7 +919,13 @@ impl Clean {
 
     fn aim(&mut self, table: u16, trie: Trie, depth: usize, key: [u8; 32]) -> Result<Aim, String> {
         let r = self.reader(table)?;
-        let (page, _, _) = r.locate(&key).map_err(|e| format!("table {table}: {e}"))?;
+        let (page, held, _) = r.locate(&key).map_err(|e| format!("table {table}: {e}"))?;
+        let tight = match (held.entries.first(), held.entries.last()) {
+            (Some(first), Some(last)) => {
+                held.lo == first.key && (held.hi == KEY_MAX || Some(held.hi) == succ(last.key))
+            }
+            _ => true,
+        };
         let predicted = r
             .predict_page(csl_run::k64(&key))
             .map_err(|e| format!("table {table}: {e}"))?;
@@ -834,6 +936,7 @@ impl Clean {
             key,
             page,
             predicted,
+            tight,
         })
     }
 
@@ -955,15 +1058,22 @@ pub fn routes(bucket: &Path, m: &Manifest, plan: &Plan) -> Result<Vec<Route>, St
 struct Aimer {
     account: usize,
     storage: usize,
+    /// The snapshot's `top_levels`: account-trie depths below it may be
+    /// answered from the client's cache, so a response holding such a node
+    /// can change without the client consuming it. They are never aimed
+    /// at, and coverage counts only nodes the client must fetch.
+    top_levels: usize,
 }
 
 impl Aimer {
     /// The node this read aims at: a slot read with a storage walk aims at
     /// the storage trie, each depth in turn; any other read at the root,
     /// the middle or the deepest node of its account walk (or its code
-    /// entry). `forged_fence` needs a node the model does not predict
-    /// exactly, and takes the nearest one on the same walk when the chosen
-    /// depth has none.
+    /// entry), among the account depths the cache cannot answer.
+    /// `forged_fence` needs a node the model does not predict exactly and
+    /// `fence_gap` a node on a page whose fences are not already tight;
+    /// each takes the nearest such node on the same walk when the chosen
+    /// depth is not one, and aims at nothing when the walk has none.
     fn choose(&mut self, nodes: &[Aim], fault: Fault) -> Option<Aim> {
         let storage: Vec<&Aim> = nodes.iter().filter(|a| a.trie == Trie::Storage).collect();
         let (pool, i) = if !storage.is_empty() {
@@ -972,7 +1082,10 @@ impl Aimer {
             let n = storage.len();
             (storage, c % n)
         } else {
-            let pool: Vec<&Aim> = nodes.iter().collect();
+            let pool: Vec<&Aim> = nodes
+                .iter()
+                .filter(|a| a.trie != Trie::Account || a.depth >= self.top_levels)
+                .collect();
             if pool.is_empty() {
                 return None;
             }
@@ -986,11 +1099,13 @@ impl Aimer {
             };
             (pool, i)
         };
-        if fault != Fault::ForgedFence {
-            return Some(*pool[i]);
-        }
+        let usable = |a: &Aim| match fault {
+            Fault::ForgedFence => a.predicted != a.page,
+            Fault::FenceGap => !a.tight,
+            _ => true,
+        };
         (0..pool.len())
-            .filter(|j| pool[*j].predicted != pool[*j].page)
+            .filter(|j| usable(pool[*j]))
             .min_by_key(|j| j.abs_diff(i))
             .map(|j| *pool[j])
     }
@@ -1126,14 +1241,30 @@ pub struct ModeRow {
     pub total: Counts,
     /// `Reason` classes seen, with counts: how the fault was caught.
     pub reasons: BTreeMap<String, u64>,
+    /// Aimed faults: the (table, trie, depth) of each read aimed at.
+    pub aimed_at: BTreeMap<String, u64>,
     /// Aimed faults: the (table, trie, depth) of each read whose aim
-    /// landed.
+    /// landed (a response holding the aimed node's page was changed).
     pub coverage: BTreeMap<String, u64>,
-    /// Aimed faults: reads with no node to aim at, or whose aimed node the
-    /// fault could not reach (see each fault's description).
+    /// Aimed faults: reads with no node to aim at (`no_aim`) plus reads
+    /// whose aimed node the fault could not reach (`missed`; see each
+    /// fault's description).
     pub untargeted: u64,
+    pub no_aim: u64,
+    pub missed: u64,
     /// Reads the rate spared.
     pub spared: u64,
+    /// Why the fault cannot apply to this mode (see
+    /// [`Fault::not_applicable`]); `None` when it applies.
+    pub not_applicable: Option<&'static str>,
+    /// The fault applies to this mode and did what the row needs to say
+    /// something about it: changed a response, and for an aimed fault had
+    /// a node to aim at on [`Fault::min_aimed`] of the reads and landed on
+    /// [`Fault::min_landed`] of its aims, overall and within each (table,
+    /// trie) it aimed at. `true` when not applicable.
+    pub exercised: bool,
+    /// Why `exercised` is false.
+    pub not_exercised: Vec<String>,
     /// Insufficient reads by the trie nodes their last walk decoded before
     /// it stopped: a refusal mid-walk stops below the root.
     pub caught_after_nodes: BTreeMap<usize, u64>,
@@ -1152,9 +1283,11 @@ pub struct Row {
     /// Summed over the modes run.
     pub responses: u64,
     pub faulted: u64,
-    /// Expected to fire but changed no response: its reads say nothing
-    /// about the fault.
-    pub flagged: bool,
+    /// No wrong value, false absence or presence, answered outside key,
+    /// or walk the shape model did not predict.
+    pub safe: bool,
+    /// Exercised in every mode it applies to (see [`ModeRow::exercised`]).
+    pub exercised: bool,
     pub total: Counts,
     /// Summed over the modes; per mode in `modes`.
     pub reasons: BTreeMap<String, u64>,
@@ -1162,8 +1295,9 @@ pub struct Row {
 }
 
 impl Row {
+    /// Safe and exercised.
     pub fn pass(&self) -> bool {
-        self.total.failures() == 0 && self.total.shape_mismatch == 0
+        self.safe && self.exercised
     }
 
     pub fn mode(&self, mode: &str) -> Option<&ModeRow> {
@@ -1189,13 +1323,19 @@ pub struct Table {
     pub plan: Value,
     /// Reads per shape.
     pub shapes: BTreeMap<String, usize>,
+    /// `safe` and `exercised`.
+    pub pass: bool,
     /// The control row read every key right, and no row has a wrong value,
     /// a false absence or presence, an answered outside key, or a walk the
     /// shape model did not predict.
-    pub pass: bool,
+    pub safe: bool,
+    /// Every firing fault was exercised in every mode it applies to.
+    pub exercised: bool,
     pub control_correct: bool,
-    /// Rows expected to fire that changed no response.
-    pub flagged: Vec<String>,
+    /// `fault mode: why` for each (fault, mode) not exercised.
+    pub not_exercised: Vec<String>,
+    /// `fault mode: why` for each (fault, mode) the fault cannot apply to.
+    pub not_applicable: Vec<String>,
     pub faults: Vec<Row>,
     /// Every failing read, in full (empty when `pass`).
     pub failures: Vec<Failure>,
@@ -1230,15 +1370,22 @@ impl Default for Options {
     }
 }
 
-/// The plan the table reads: the workload's, at `keys` per kind.
+/// The plan the table reads: the workload's, at `keys` per kind (a
+/// quarter as many outside the prefix, none for a whole-trie slice, which
+/// has no outside).
 pub fn plan_for(slice: &Slice, keys: usize, seed: u64) -> Result<Plan, String> {
     let keys = keys.max(1);
+    let outside = if slice.head.prefix.trim_start_matches("0x").is_empty() {
+        0
+    } else {
+        (keys / 4).max(1)
+    };
     let sizes = Sizes {
         accounts: keys,
         absent: keys,
         slots: keys,
         absent_slots: keys,
-        outside: (keys / 4).max(1),
+        outside,
         d_account: csl_eth_store::D_ACCOUNT,
         d_storage: csl_eth_store::D_STORAGE,
     };
@@ -1282,7 +1429,8 @@ pub fn run_table_plan(
             open_error: None,
             responses: 0,
             faulted: 0,
-            flagged: false,
+            safe: false,
+            exercised: false,
             total: Counts::default(),
             reasons: BTreeMap::new(),
             modes: BTreeMap::new(),
@@ -1322,6 +1470,13 @@ pub fn run_table_plan(
                 }
             }
             (mr.responses, mr.faulted) = handle.stats();
+            mr.not_applicable = fault.not_applicable(baseline, plan);
+            mr.not_exercised = if mr.not_applicable.is_some() {
+                Vec::new()
+            } else {
+                exercise_gaps(fault, &mr)
+            };
+            mr.exercised = mr.not_exercised.is_empty();
             row.responses += mr.responses;
             row.faulted += mr.faulted;
             row.total.merge(&mr.total);
@@ -1330,18 +1485,31 @@ pub fn run_table_plan(
             }
             row.modes.insert(mode, mr);
         }
-        row.flagged = fault.fires() && row.faulted == 0;
+        row.safe = row.total.failures() == 0 && row.total.shape_mismatch == 0;
+        row.exercised = row.modes.values().all(|m| m.exercised);
         rows.push(row);
     }
     let control_correct = rows.first().is_some_and(|r| {
         r.open_error.is_none() && r.total.reads > 0 && r.total.correct == r.total.reads
     });
-    let pass = control_correct && rows.iter().all(Row::pass);
-    let flagged = rows
-        .iter()
-        .filter(|r| r.flagged)
-        .map(|r| r.name.clone())
-        .collect();
+    let safe = control_correct && rows.iter().all(|r| r.safe);
+    let exercised = rows.iter().all(|r| r.exercised);
+    // The control row is "not applicable" by definition; not listed.
+    let per_mode = |f: &dyn Fn(&ModeRow) -> Vec<String>| -> Vec<String> {
+        rows.iter()
+            .filter(|r| r.name != Fault::None.name())
+            .flat_map(|r| {
+                r.modes.iter().flat_map(move |(m, mr)| {
+                    f(mr)
+                        .into_iter()
+                        .map(move |why| format!("{} {m}: {why}", r.name))
+                })
+            })
+            .collect()
+    };
+    let not_exercised = per_mode(&|mr| mr.not_exercised.clone());
+    let not_applicable =
+        per_mode(&|mr| mr.not_applicable.map(str::to_string).into_iter().collect());
     Ok(Table {
         block_number: slice.head.block_number,
         state_root: slice.head.state_root,
@@ -1354,9 +1522,12 @@ pub fn run_table_plan(
         bloom: "this format has no Bloom filter (pages route by chained fences and the learned model); nothing to zero",
         plan: plan.meta.clone(),
         shapes,
-        pass,
+        pass: safe && exercised,
+        safe,
+        exercised,
         control_correct,
-        flagged,
+        not_exercised,
+        not_applicable,
         faults: rows,
         failures,
     })
@@ -1365,6 +1536,69 @@ pub fn run_table_plan(
 /// A draw's shape for the table: its first series (the read's kind).
 fn shape(d: &Draw) -> &str {
     d.series.first().map_or("unknown", String::as_str)
+}
+
+/// Why a fault that applies to a mode was not exercised there (empty:
+/// it was). A firing fault must change some response; an aimed one must
+/// also have a node to aim at on [`Fault::min_aimed`] of the reads the
+/// rate does not spare, and land on [`Fault::min_landed`] of its aims,
+/// overall and within every (table, trie) it aimed at, so that a coverage
+/// hole in one table is not hidden by hits in another.
+fn exercise_gaps(fault: Fault, mr: &ModeRow) -> Vec<String> {
+    let mut gaps = Vec::new();
+    if !fault.fires() {
+        return gaps;
+    }
+    if mr.faulted == 0 {
+        gaps.push("changed no response".to_string());
+    }
+    if !fault.aimed() || mr.open_error.is_some() {
+        return gaps;
+    }
+    let landed: u64 = mr.coverage.values().sum();
+    let unspared = mr.total.reads - mr.spared;
+    if unspared == 0 {
+        gaps.push("every read was spared by the rate: nothing aimed".to_string());
+        return gaps;
+    }
+    let aimed = unspared - mr.no_aim;
+    let min_aimed = fault.min_aimed();
+    if (aimed as f64) < min_aimed * unspared as f64 {
+        gaps.push(format!(
+            "aimed at a node on {aimed} of {unspared} reads (needs {:.0}%)",
+            min_aimed * 100.0
+        ));
+    }
+    let min = fault.min_landed();
+    if (landed as f64) < min * aimed as f64 || landed == 0 {
+        gaps.push(format!(
+            "landed on {landed} of {aimed} aims (missed {}; needs {:.0}%)",
+            mr.missed,
+            min * 100.0
+        ));
+    }
+    let group = |label: &str| {
+        label
+            .rsplit_once(" depth ")
+            .map_or(label, |(g, _)| g)
+            .to_string()
+    };
+    let mut by_group: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for (label, n) in &mr.aimed_at {
+        by_group.entry(group(label)).or_default().0 += n;
+    }
+    for (label, n) in &mr.coverage {
+        by_group.entry(group(label)).or_default().1 += n;
+    }
+    for (g, (aimed, landed)) in by_group {
+        if (landed as f64) < min * aimed as f64 {
+            gaps.push(format!(
+                "{g}: landed on {landed} of {aimed} aims (needs {:.0}%)",
+                min * 100.0
+            ));
+        }
+    }
+    gaps
 }
 
 /// Every draw of the plan through one faulted snapshot, aimed and scored.
@@ -1382,7 +1616,10 @@ fn read_all<D: Driver>(
     failures: &mut Vec<Failure>,
 ) {
     let mode = workload::mode_label(baseline);
-    let mut aimer = Aimer::default();
+    let mut aimer = Aimer {
+        top_levels: o.top_levels,
+        ..Aimer::default()
+    };
     let mut rng = ChaCha8Rng::seed_from_u64(fault.seed(o.seed, mode) ^ 0x5eed);
     for (draw, route) in plan.draws.iter().zip(routes) {
         // The baseline changes only the trie walks; code is the same read.
@@ -1401,18 +1638,20 @@ fn read_all<D: Driver>(
                 aim = None;
                 mr.spared += 1;
             } else if aim.is_none() {
-                mr.untargeted += 1;
+                mr.no_aim += 1;
             }
         }
         handle.set_aim(aim);
         let (answer, cost) = workload::read_draw(snap, baseline, draw);
         if let Some(a) = &aim {
+            *mr.aimed_at.entry(a.label()).or_default() += 1;
             if handle.take_hit() {
                 *mr.coverage.entry(a.label()).or_default() += 1;
             } else {
-                mr.untargeted += 1;
+                mr.missed += 1;
             }
         }
+        mr.untargeted = mr.no_aim + mr.missed;
         let v = workload::score(draw, slice, &answer);
         let outside = matches!(draw.expect, Expect::Insufficient);
         let mismatches = if v == Verdict::Correct {
@@ -1487,6 +1726,9 @@ pub fn run(args: Args) -> Result<Value, String> {
                         *m,
                         json!({
                             "open_error": mr.open_error,
+                            "not_applicable": mr.not_applicable,
+                            "exercised": mr.exercised,
+                            "not_exercised": mr.not_exercised,
                             "faulted": mr.faulted,
                             "reads": mr.total.reads,
                             "correct": mr.total.correct,
@@ -1499,14 +1741,17 @@ pub fn run(args: Args) -> Result<Value, String> {
                     )
                 })
                 .collect();
-            json!({"fault": r.name, "flagged": r.flagged, "modes": modes})
+            json!({"fault": r.name, "safe": r.safe, "exercised": r.exercised, "modes": modes})
         })
         .collect();
     let out = json!({
         "out": args.out,
         "pass": table.pass,
+        "safe": table.safe,
+        "exercised": table.exercised,
         "control_correct": table.control_correct,
-        "flagged": table.flagged,
+        "not_exercised": table.not_exercised,
+        "not_applicable": table.not_applicable,
         "shapes": table.shapes,
         "wall_ms": t.elapsed().as_millis() as u64,
         "faults": summary,
@@ -1514,9 +1759,12 @@ pub fn run(args: Args) -> Result<Value, String> {
     });
     if !table.pass {
         return Err(format!(
-            "fault table failed (control row all correct: {}, {} failing reads); report at {}",
+            "fault table failed (safe: {}, control row all correct: {}, {} failing reads; exercised: {}, not exercised: {:?}); report at {}",
+            table.safe,
             table.control_correct,
             table.failures.len(),
+            table.exercised,
+            table.not_exercised,
             args.out.display()
         ));
     }

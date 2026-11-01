@@ -19,10 +19,22 @@
 //! of the two is wrong about the trie, and an account wrongly proven absent
 //! during an absent-slot read would show only here (both say "absent").
 //!
+//! The plan draws each kind to the count asked for: forced picks (the
+//! largest tries, keys through extensions) come first and the strided
+//! rest is drawn from the candidates not yet chosen, so a forced pick
+//! never costs a draw. The plan then checks itself ([`plan`]'s
+//! `complete` and `incomplete`): every kind drawn to its request and
+//! every shape the spec names present (see `required_shapes`). A slice
+//! that cannot supply one is reported, never padded.
+//!
 //! Pass or fail follows the spec's rows: a false absence or a wrong value
-//! fails outright; on a remote host, the warmed account read (present and
-//! absent) must stay within 50 KB and two dependent rounds at the 95th
-//! percentile.
+//! fails outright, as does any other unexpected outcome or a walk the
+//! shape model did not predict (`safe` in the report); on a remote host,
+//! the warmed account read (present and absent) must stay within 50 KB
+//! and two dependent rounds at the 95th percentile; and the plan must be
+//! complete, unless `--allow-short` marks the run as a reduced
+//! measurement (the report then says `complete: false` and passes on the
+//! other rules).
 //!
 //! The scorer ([`score`]) and the read itself ([`read_draw`]) are shared
 //! with the fault table, which reads a small plan of the same shapes
@@ -126,6 +138,12 @@ pub struct Args {
     /// Keys outside the prefix, which must end Insufficient.
     #[arg(long, default_value_t = 1_000)]
     pub outside: usize,
+    /// A reduced measurement: pass on safety alone when the slice cannot
+    /// supply a requested count or shape (the report still says
+    /// `complete: false` and lists what is missing). Without it an
+    /// incomplete plan fails the run.
+    #[arg(long)]
+    pub allow_short: bool,
     #[arg(long, default_value_t = 1)]
     pub seed: u64,
     /// Pages each side of the predicted page in the speculative round.
@@ -553,10 +571,19 @@ fn slot_key(t: &(B256, U256)) -> &B256 {
     &t.0
 }
 
-/// Evenly spaced indices: `n` of `len`.
+/// Evenly spaced indices: `n` of `len` (all of them when `n >= len`).
 fn strided(len: usize, n: usize) -> impl Iterator<Item = usize> {
     let stride = len.checked_div(n).unwrap_or(len).max(1);
     (0..len).step_by(stride).take(n)
+}
+
+/// `n` more of `0..len`, evenly spaced over those `taken` does not
+/// already hold: a quota filled from the unselected candidates, so picks
+/// forced in earlier never cost the strided rest a draw. Fewer only when
+/// fewer are free.
+fn fill(len: usize, n: usize, taken: impl Fn(usize) -> bool) -> Vec<usize> {
+    let free: Vec<usize> = (0..len).filter(|i| !taken(*i)).collect();
+    strided(free.len(), n).map(|k| free[k]).collect()
 }
 
 /// Draw the workload from the slice. Deterministic for a seed.
@@ -617,24 +644,20 @@ pub fn plan(s: &Slice, sizes: &Sizes, seed: u64) -> Result<Plan, String> {
     let mut draws: Vec<Draw> = Vec::new();
 
     // Present accounts: the largest contracts, a twentieth through
-    // extensions, the rest strided over the slice.
+    // extensions, the rest strided over the accounts not yet chosen, so
+    // the count is the one asked for whenever the slice holds that many.
     let mut chosen: Vec<usize> = Vec::new();
     let mut seen: HashSet<usize> = HashSet::new();
-    let mut take = |i: usize, chosen: &mut Vec<usize>| {
-        if seen.insert(i) {
+    let forced = largest.iter().copied().chain(
+        strided(ext_idx.len(), (sizes.accounts / 20).min(ext_idx.len())).map(|i| ext_idx[i]),
+    );
+    for i in forced {
+        if chosen.len() < sizes.accounts && seen.insert(i) {
             chosen.push(i);
         }
-    };
-    for i in &largest {
-        take(*i, &mut chosen);
     }
-    for i in strided(ext_idx.len(), (sizes.accounts / 20).min(ext_idx.len())) {
-        take(ext_idx[i], &mut chosen);
-    }
-    let rest = sizes.accounts.saturating_sub(chosen.len());
-    for i in strided(s.accounts.len(), rest) {
-        take(i, &mut chosen);
-    }
+    let rest = sizes.accounts - chosen.len();
+    chosen.extend(fill(s.accounts.len(), rest, |i| seen.contains(&i)));
     let account_draw = |i: usize| -> Draw {
         let (h, a) = &s.accounts[i];
         let sh = &shapes[i];
@@ -800,17 +823,17 @@ pub fn plan(s: &Slice, sizes: &Sizes, seed: u64) -> Result<Plan, String> {
         for i in &largest {
             let n = slots_of(*i).map_or(0, Vec::len);
             for j in strided(n, per.min(n)) {
-                if seen_pairs.insert((*i, j)) {
+                if seen_pairs.len() < sizes.slots && seen_pairs.insert((*i, j)) {
                     draws.push(slot_present_draw(*i, j));
                 }
             }
         }
     }
-    let rest = sizes.slots.saturating_sub(seen_pairs.len());
-    for p in strided(pairs.len(), rest) {
-        if seen_pairs.insert(pairs[p]) {
-            draws.push(slot_present_draw(pairs[p].0, pairs[p].1));
-        }
+    // The rest strided over the pairs not yet drawn, as for accounts.
+    let rest = sizes.slots - seen_pairs.len();
+    for p in fill(pairs.len(), rest, |p| seen_pairs.contains(&pairs[p])) {
+        seen_pairs.insert(pairs[p]);
+        draws.push(slot_present_draw(pairs[p].0, pairs[p].1));
     }
     let slots_drawn = seen_pairs.len();
 
@@ -941,6 +964,36 @@ pub fn plan(s: &Slice, sizes: &Sizes, seed: u64) -> Result<Plan, String> {
         .iter()
         .map(|i| slots_of(*i).map_or(0, Vec::len))
         .collect();
+
+    // Completeness: every kind drawn to its request, and every shape the
+    // spec asks for present among the draws of a kind that was requested.
+    let requested = [
+        ("accounts_present", sizes.accounts, present_accounts.len()),
+        ("accounts_absent", sizes.absent, absent_made),
+        ("slots_present", sizes.slots, slots_drawn),
+        ("slots_absent_in_tries", third, in_tries),
+        ("slots_of_empty_storage", third, empty_tries),
+        ("slots_of_absent_accounts", want, of_absent),
+        ("outside", sizes.outside, outside),
+    ];
+    let mut incomplete: Vec<String> = Vec::new();
+    for (kind, asked, got) in requested {
+        if got != asked {
+            incomplete.push(format!("{kind}: requested {asked}, drawn {got}"));
+        }
+    }
+    let mut series_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for d in &draws {
+        for s in &d.series {
+            *series_counts.entry(s.as_str()).or_default() += 1;
+        }
+    }
+    let required = required_shapes(sizes, third, want);
+    for shape in &required {
+        if !series_counts.contains_key(shape.as_str()) {
+            incomplete.push(format!("shape {shape}: none drawn"));
+        }
+    }
     let meta = json!({
         "seed": seed,
         "slice_accounts": s.accounts.len(),
@@ -965,9 +1018,64 @@ pub fn plan(s: &Slice, sizes: &Sizes, seed: u64) -> Result<Plan, String> {
             "outside": outside,
             "total": draws.len(),
         },
+        "requested": requested.iter().map(|(k, asked, _)| (k.to_string(), *asked)).collect::<BTreeMap<_, _>>(),
+        "required_shapes": required.iter().map(|s| (s.clone(), series_counts.get(s.as_str()).copied().unwrap_or(0))).collect::<BTreeMap<_, _>>(),
+        "complete": incomplete.is_empty(),
+        "incomplete": incomplete,
         "deep_storage_depth": DEEP_STORAGE,
     });
     Ok(Plan { draws, meta })
+}
+
+/// The shapes the spec's workload must contain, for the kinds requested:
+/// present accounts through an extension and with the leaf below the
+/// speculated depth, inline and blob-sized code, each kind of absence in
+/// the account trie and in storage tries, deep slots and slots of the
+/// largest tries, slots of accounts with empty storage and of absent
+/// accounts, and keys outside the prefix. A storage leaf below the
+/// speculated storage depth (7) is not required: the largest tries a
+/// 1/4096 slice holds end at depth 6 (see [`DEEP_STORAGE`]); it is drawn
+/// and reported when the slice has one.
+fn required_shapes(sizes: &Sizes, third: usize, of_absent: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |names: &[&str]| out.extend(names.iter().map(|s| s.to_string()));
+    if sizes.accounts > 0 {
+        add(&[
+            ACCOUNT_PRESENT_EXTENSION,
+            ACCOUNT_PRESENT_BEYOND_D,
+            CODE_INLINE,
+            CODE_BLOB,
+        ]);
+    }
+    if sizes.absent > 0 {
+        add(&[
+            "account_absent_empty_slot",
+            "account_absent_leaf_mismatch",
+            "account_absent_extension_mismatch",
+        ]);
+    }
+    if sizes.slots > 0 {
+        add(&[
+            STORAGE_PRESENT_EXTENSION,
+            STORAGE_PRESENT_DEEP,
+            STORAGE_PRESENT_LARGEST,
+        ]);
+    }
+    if third > 0 {
+        add(&[
+            "storage_absent_empty_slot",
+            "storage_absent_leaf_mismatch",
+            "storage_absent_extension_mismatch",
+            STORAGE_EMPTY_TRIE,
+        ]);
+    }
+    if of_absent > 0 {
+        add(&[STORAGE_ABSENT_ACCOUNT]);
+    }
+    if sizes.outside > 0 {
+        add(&[OUTSIDE]);
+    }
+    out
 }
 
 // ----------------------------------------------------------------------
@@ -1718,7 +1826,17 @@ pub fn run(args: Args) -> Result<Value, String> {
             ));
         }
     }
+    // No wrong value, false absence or presence, unexpected outcome or
+    // unpredicted walk in any mode (the budget is judged beside it).
+    let safe = scored.iter().all(|sc| !sc.failed());
     let budget = budget(&scored, remote, &mut failed);
+    let complete = plan.meta["complete"].as_bool().unwrap_or(false);
+    if !complete && !args.allow_short {
+        failed.push(format!(
+            "incomplete plan (the slice cannot supply what was requested; --allow-short for a reduced measurement): {}",
+            plan.meta["incomplete"]
+        ));
+    }
     let pass = failed.is_empty();
 
     let report = json!({
@@ -1741,6 +1859,10 @@ pub fn run(args: Args) -> Result<Value, String> {
         "plan": plan.meta,
         "plan_ms": plan_ms,
         "pass": pass,
+        "safe": safe,
+        "complete": complete,
+        "incomplete": plan.meta["incomplete"],
+        "allow_short": args.allow_short,
         "failed_rules": failed,
         "budget": budget,
         "totals": {
@@ -2023,15 +2145,34 @@ mod tests {
             absent: 300,
             slots: 300,
             absent_slots: 300,
-            outside: 50,
+            outside: 0,
             d_account: csl_eth_store::D_ACCOUNT,
             d_storage: csl_eth_store::D_STORAGE,
         };
         let plan = plan(&slice, &sizes, 7).unwrap();
         eprintln!("plan: {}", plan.meta);
+        // Every kind drawn to its size and every required shape present.
+        assert_eq!(plan.meta["complete"], true, "{}", plan.meta["incomplete"]);
+        for (kind, asked) in plan.meta["requested"].as_object().unwrap() {
+            assert_eq!(&plan.meta["drawn"][kind], asked, "{kind}");
+        }
+        // A whole-trie slice has no outside: asking for one is reported.
+        let short = super::plan(
+            &slice,
+            &Sizes {
+                outside: 50,
+                ..sizes
+            },
+            7,
+        )
+        .unwrap();
+        assert_eq!(short.meta["complete"], false);
         assert_eq!(
-            plan.meta["drawn"]["outside"], 0,
-            "a whole-trie slice has no outside"
+            short.meta["incomplete"],
+            json!([
+                "outside: requested 50, drawn 0",
+                "shape outside: none drawn"
+            ])
         );
         let tuning = Tuning {
             hint: Hint::symmetric(1),

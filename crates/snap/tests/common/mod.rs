@@ -280,3 +280,12 @@ pub fn prefix(n: u32, seed: u64) -> World {
         head,
     }
 }
+
+/// Every kind in a plan's meta drawn to the count requested.
+pub fn drawn_as_requested(meta: &serde_json::Value) {
+    let requested = meta["requested"].as_object().expect("requested counts");
+    assert!(!requested.is_empty());
+    for (kind, asked) in requested {
+        assert_eq!(&meta["drawn"][kind], asked, "{kind}: {}", meta["drawn"]);
+    }
+}

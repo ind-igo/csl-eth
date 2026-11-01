@@ -70,15 +70,23 @@ fn every_fault_is_caught_where_it_was_aimed_and_none_becomes_a_false_answer() {
     };
     let t = run_table(&w.slice, &dir, &o).unwrap();
     print(&t);
-    assert!(t.pass, "a fault produced a wrong value or a false absence");
+    assert!(t.safe, "a fault produced a wrong value or a false absence");
     assert!(t.control_correct);
     assert!(t.failures.is_empty(), "{:?}", t.failures);
-    assert!(t.flagged.is_empty(), "never fired: {:?}", t.flagged);
+    assert!(t.exercised, "not exercised: {:?}", t.not_exercised);
+    assert!(t.pass);
+    // The one (fault, mode) that cannot apply: the baseline reads no code.
+    assert_eq!(t.not_applicable.len(), 1, "{:?}", t.not_applicable);
+    assert!(
+        t.not_applicable[0].starts_with("truncated_blob baseline: "),
+        "{:?}",
+        t.not_applicable
+    );
     assert_eq!(t.faults.len(), Fault::ALL.len());
-    // The plan's strided picks can repeat a largest or extension account,
-    // so a kind may come in a draw or two under its size.
-    for s in ["account_present", "storage_present"] {
-        assert!((37..=40).contains(&t.shapes[s]), "{s}: {:?}", t.shapes);
+    // Every kind is drawn to its size: forced picks never cost a draw.
+    common::drawn_as_requested(&t.plan);
+    for s in ["account_present", "account_absent", "storage_present"] {
+        assert_eq!(t.shapes[s], 40, "{s}: {:?}", t.shapes);
     }
     for s in [
         "account_absent",
@@ -122,17 +130,27 @@ fn every_fault_is_caught_where_it_was_aimed_and_none_becomes_a_false_answer() {
         }
     }
 
-    // Aimed faults: the aim lands on almost every read (`forged_fence`
-    // needs a node the model mispredicts and `fence_gap` a page whose
-    // fences are not already tight), reaches every storage depth in the
-    // path mode and the hash-keyed table in the baseline, and the catch is
-    // in that table.
+    // Aimed faults: almost every read is aimed (`forged_fence` needs a
+    // node the model mispredicts and `fence_gap` a page whose fences are
+    // not already tight, and aim past nodes without), almost every aim
+    // lands, the aims reach every storage depth in the path mode and the
+    // hash-keyed table in the baseline, and the catch is in that table.
     for f in Fault::ALL.iter().filter(|f| f.aimed()) {
         let r = t.row(f.name()).unwrap();
         for m in ["path", "baseline"] {
             let mr = r.mode(m).unwrap();
             let landed: u64 = mr.coverage.values().sum();
             assert_eq!(landed + mr.untargeted, mr.total.reads, "{} {m}", r.name);
+            assert_eq!(mr.untargeted, mr.no_aim + mr.missed, "{} {m}", r.name);
+            let aimed: u64 = mr.aimed_at.values().sum();
+            assert_eq!(aimed, landed + mr.missed, "{} {m}", r.name);
+            assert!(mr.exercised, "{} {m}: {:?}", r.name, mr.not_exercised);
+            assert!(
+                mr.missed * 50 <= aimed,
+                "{} {m}: {} of {aimed} aims missed",
+                r.name,
+                mr.missed
+            );
             if !matches!(f, Fault::ForgedFence | Fault::FenceGap) {
                 assert!(
                     mr.untargeted * 50 <= mr.total.reads,
@@ -207,6 +225,18 @@ fn every_fault_is_caught_where_it_was_aimed_and_none_becomes_a_false_answer() {
         "path",
         "Code(bytecode does not hash",
     );
+    // A page from the other run is one whole foreign page spliced into an
+    // intact response: the client rejects the page itself, never sees a
+    // short read or a refusal.
+    for m in ["path", "baseline"] {
+        let reasons = &t.row("wrong_run_page").unwrap().mode(m).unwrap().reasons;
+        for k in reasons.keys() {
+            assert!(
+                !k.contains("ShortRead") && !k.contains("short range") && !k.contains("io:"),
+                "wrong_run_page {m}: an I/O outcome, not a foreign page: {reasons:?}"
+            );
+        }
+    }
     // A refusal aimed below the root lands mid-walk: most insufficient
     // reads decoded nodes before it.
     for name in ["missing_range", "http_error"] {
@@ -338,6 +368,109 @@ fn a_flaky_host_splits_reads_between_right_and_insufficient() {
         );
         if r.aimed {
             assert!(r.mode("path").unwrap().spared > 0);
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A table that injects nothing is safe and does not pass: at rate 0
+/// every read is right, and no firing fault is exercised. The command
+/// fails on it, with the report saying which half held.
+#[test]
+fn a_table_that_injects_nothing_is_safe_but_fails() {
+    let w = common::whole(300, 4);
+    let dir = w.produce("rate0");
+    let o = Options {
+        keys: 20,
+        rate: 0.0,
+        mode: Mode::Both,
+        ..Options::default()
+    };
+    let t = run_table(&w.slice, &dir, &o).unwrap();
+    assert!(t.safe && t.control_correct, "{:?}", t.failures);
+    assert!(!t.exercised);
+    assert!(!t.pass);
+    for r in t.faults.iter().filter(|r| r.name != "none") {
+        assert!(!r.exercised, "{}", r.name);
+        assert_eq!(r.faulted, 0, "{}", r.name);
+        for (m, mr) in &r.modes {
+            if mr.not_applicable.is_none() {
+                assert!(!mr.exercised, "{} {m}", r.name);
+                assert!(
+                    t.not_exercised
+                        .iter()
+                        .any(|s| s.starts_with(&format!("{} {m}: ", r.name))),
+                    "{} {m} not listed: {:?}",
+                    r.name,
+                    t.not_exercised
+                );
+            }
+        }
+    }
+
+    let slice_dir = common::scratch("rate0-slice");
+    w.slice.write(&slice_dir).unwrap();
+    let out = slice_dir.join("faults.json");
+    let r = csl_eth_snap::faults::run(csl_eth_snap::faults::Args {
+        slice: slice_dir.clone(),
+        bucket: dir.clone(),
+        out: out.clone(),
+        keys: 20,
+        rate: 0.0,
+        seed: 1,
+        mode: Mode::Path,
+        top_levels: 0,
+        faults: vec!["node_omitted".into(), "bit_flip".into()],
+    });
+    assert!(r.is_err(), "{r:?}");
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+    assert_eq!(report["pass"], false);
+    assert_eq!(report["safe"], true);
+    assert_eq!(report["exercised"], false);
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&slice_dir).ok();
+}
+
+/// With the top levels kept across reads, a response holding a cached
+/// node can change without the client consuming it, so no aim is at a
+/// cached account depth and coverage counts only nodes the client
+/// fetches; the aimed faults are still exercised and caught.
+#[test]
+fn with_top_levels_cached_no_aim_is_at_a_cached_depth() {
+    let w = common::whole(900, 6);
+    let dir = w.produce("top");
+    let o = Options {
+        keys: 30,
+        mode: Mode::Both,
+        top_levels: 2,
+        faults: vec![Fault::NodeOmitted, Fault::MissingRange, Fault::StaleValue],
+        ..Options::default()
+    };
+    let t = run_table(&w.slice, &dir, &o).unwrap();
+    print(&t);
+    assert!(t.pass, "{:?} {:?}", t.not_exercised, t.failures);
+    for r in t.faults.iter().filter(|r| r.aimed) {
+        for m in ["path", "baseline"] {
+            let mr = r.mode(m).unwrap();
+            for label in mr.aimed_at.keys().chain(mr.coverage.keys()) {
+                for d in 0..o.top_levels {
+                    assert!(
+                        !label.ends_with(&format!("account depth {d}")),
+                        "{} {m}: aimed at a cached depth: {label}",
+                        r.name
+                    );
+                }
+            }
+            assert!(
+                covered(
+                    r,
+                    m,
+                    &format!("table {} account depth ", if m == "path" { 0 } else { 3 })
+                ) > 0,
+                "{} {m}: {:?}",
+                r.name,
+                mr.coverage
+            );
         }
     }
     std::fs::remove_dir_all(&dir).ok();

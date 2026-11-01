@@ -187,6 +187,7 @@ fn both_commands_fail_on_a_slice_that_disagrees_with_the_bucket() {
         slots: 20,
         absent_slots: 20,
         outside: 0,
+        allow_short: false,
         seed: 1,
         prefetch: 1,
         top_levels: 4,
@@ -199,6 +200,70 @@ fn both_commands_fail_on_a_slice_that_disagrees_with_the_bucket() {
     assert!(r.is_err(), "{r:?}");
     let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
     assert_eq!(report["pass"], false);
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&slice_dir).ok();
+}
+
+/// The workload fails a plan the slice cannot fill, saying what is
+/// short, and passes it as a reduced measurement only when asked to.
+#[test]
+fn the_workload_fails_an_incomplete_plan_unless_allowed_short() {
+    let w = common::whole(400, 24);
+    let dir = w.produce("short");
+    let slice_dir = common::scratch("short-slice");
+    w.slice.write(&slice_dir).unwrap();
+    let args = |allow_short: bool, out: std::path::PathBuf| workload::Args {
+        slice: slice_dir.clone(),
+        bucket: Some(dir.clone()),
+        url: None,
+        proxy: None,
+        checkpoint: None,
+        out,
+        mode: Mode::Path,
+        // More present accounts than the slice holds, and outside keys
+        // from a slice with no outside.
+        accounts: 500,
+        absent: 20,
+        slots: 20,
+        absent_slots: 20,
+        outside: 5,
+        allow_short,
+        seed: 1,
+        prefetch: 1,
+        top_levels: 4,
+        d_account: None,
+        d_storage: None,
+        oracle: None,
+        oracle_samples: 0,
+        oracle_blocks: 300,
+    };
+    let out = slice_dir.join("short.json");
+    let r = workload::run(args(false, out.clone()));
+    assert!(r.is_err(), "{r:?}");
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+    assert_eq!(report["pass"], false);
+    assert_eq!(report["safe"], true, "{}", report["failed_rules"]);
+    assert_eq!(report["complete"], false);
+    let incomplete: Vec<&str> = report["incomplete"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        incomplete.contains(&"accounts_present: requested 500, drawn 400"),
+        "{incomplete:?}"
+    );
+    assert!(
+        incomplete.contains(&"outside: requested 5, drawn 0"),
+        "{incomplete:?}"
+    );
+
+    let out = slice_dir.join("short-allowed.json");
+    let report = workload::run(args(true, out)).unwrap();
+    assert_eq!(report["pass"], true);
+    assert_eq!(report["complete"], false);
+    assert_eq!(report["allow_short"], true);
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&slice_dir).ok();
 }

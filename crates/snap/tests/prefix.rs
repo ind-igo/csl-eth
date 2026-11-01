@@ -32,8 +32,9 @@ fn the_workload_scores_a_prefix_slice_and_its_outside() {
         .iter()
         .filter(|d| matches!(d.expect, Expect::Insufficient))
         .count();
-    assert!(outside >= 50, "{outside} outside keys drawn");
+    assert_eq!(outside, 60, "outside keys drawn");
     assert_eq!(p.meta["drawn"]["outside"], outside);
+    common::drawn_as_requested(&p.meta);
     for baseline in [false, true] {
         let mut snap = Snapshot::open(DirDriver::new(&dir), None, w.head.state_root).unwrap();
         snap.hint = Hint::symmetric(1);
@@ -86,18 +87,39 @@ fn the_fault_table_passes_on_a_prefix_slice_with_outside_keys() {
         .iter()
         .filter(|d| d.series.iter().any(|s| s == "code_blob"))
         .count();
+    eprintln!("{blobs} blob-sized codes drawn");
+    common::drawn_as_requested(&p.meta);
     let t = run_table_plan(&w.slice, &dir, &p, &o).unwrap();
     for f in &t.failures {
         eprintln!("failure: {f:?}");
     }
-    assert!(t.pass && t.control_correct, "{:?}", t.failures);
-    // `truncated_blob` has nothing to cut when no blob-sized code was drawn.
-    let expected: Vec<String> = if blobs == 0 {
-        vec!["truncated_blob".into()]
+    assert!(t.safe && t.control_correct, "{:?}", t.failures);
+    assert!(t.exercised, "not exercised: {:?}", t.not_exercised);
+    assert!(t.pass);
+    // `truncated_blob` cuts blob files: the baseline reads no code, and
+    // neither mode fetches a blob when the plan drew no blob-sized code.
+    // Those (fault, mode) pairs are not applicable, said so in the table;
+    // every other pair applies and was exercised.
+    let blob = t.row("truncated_blob").unwrap();
+    let base = blob.mode("baseline").unwrap();
+    assert!(base.not_applicable.is_some() && base.faulted == 0);
+    let path = blob.mode("path").unwrap();
+    if blobs == 0 {
+        assert!(path.not_applicable.is_some() && path.faulted == 0);
     } else {
-        Vec::new()
-    };
-    assert_eq!(t.flagged, expected, "{blobs} blobs drawn");
+        assert!(path.not_applicable.is_none() && path.exercised && path.faulted > 0);
+    }
+    let n_a = if blobs == 0 { 2 } else { 1 };
+    assert_eq!(
+        t.not_applicable.len(),
+        n_a,
+        "{blobs} blobs: {:?}",
+        t.not_applicable
+    );
+    assert!(t
+        .not_applicable
+        .iter()
+        .all(|s| s.starts_with("truncated_blob ")));
     let n = t.shapes.get("outside").copied().unwrap_or(0);
     assert!(n > 0, "{:?}", t.shapes);
     let none = t.row("none").unwrap();
