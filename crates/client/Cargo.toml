@@ -21,5 +21,6 @@ ureq = { version = "3", optional = true, features = ["socks-proxy"] }
 http = ["dep:ureq"]
 
 [dev-dependencies]
+alloy-rlp.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true

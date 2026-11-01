@@ -5,12 +5,14 @@
 
 use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{HashBuilder, Nibbles, KECCAK_EMPTY};
-use csl_eth_client::{Cost, DirDriver, Driver, Got, Read, Reason, Snapshot, Want};
+use csl_eth_client::{
+    Cost, DirDriver, Driver, Got, Origin, Pending, Read, Reason, Snapshot, Trie, WalkTrace, Want,
+};
 use csl_eth_store::{
     produce, table_path, trie::AbsentBy, AccountLeaf, Head, TABLE_ACCOUNT_NODES,
     TABLE_STORAGE_NODES,
 };
-use csl_eth_trie::{encode_word, path_of, Account, Invalid};
+use csl_eth_trie::{encode_word, path_of, Account, Invalid, NodeKey, Shape, Step};
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::{
@@ -689,5 +691,400 @@ fn baseline_by_hash_agrees_and_costs_a_round_per_node() {
     }
     eprintln!("tampered nodes_by_hash: {ok} verified, {insufficient} insufficient");
     assert!(insufficient > 0, "400 flipped bytes hit something");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A directory host that records every want, so a test can check what a
+/// read put on the wire.
+struct Recording {
+    dir: DirDriver,
+    wants: std::sync::Mutex<Vec<Want>>,
+}
+
+impl Driver for Recording {
+    fn fetch(&self, wants: &[Want]) -> Vec<Got> {
+        self.wants.lock().unwrap().extend_from_slice(wants);
+        self.dir.fetch(wants)
+    }
+}
+
+/// The child a decoded node commits to for the step after it.
+fn committed_child(parent: &[u8], shape: &Shape) -> Option<alloy_trie::nodes::RlpNode> {
+    use alloy_rlp::Decodable;
+    use alloy_trie::nodes::TrieNode;
+    let mut b = parent;
+    match (TrieNode::decode(&mut b).ok()?, shape) {
+        (TrieNode::Branch(br), Shape::Branch { next, .. }) => br
+            .as_ref()
+            .children()
+            .find(|(i, _)| i == next)
+            .and_then(|(_, c)| c.cloned()),
+        (TrieNode::Extension(e), Shape::Extension { .. }) => Some(e.child),
+        _ => None,
+    }
+}
+
+/// Check one traced walk against the trie built independently from the
+/// world (`reference`), the wants the read made, and the pages on disk.
+#[allow(clippy::too_many_arguments)]
+fn check_walk(
+    wt: &WalkTrace,
+    reference: &HashMap<NodeKey, Vec<u8>>,
+    wants: &[Want],
+    dir: &std::path::Path,
+    snap: &Snapshot<Recording>,
+    owner: &B256,
+    rounds: u32,
+) {
+    if wt.root == alloy_trie::EMPTY_ROOT_HASH {
+        assert!(wt.nodes.is_empty());
+        return;
+    }
+    assert_eq!(wt.nodes[0].step.key, NodeKey::ROOT);
+    assert_eq!(
+        wt.nodes[0].step.hash,
+        Some(wt.root),
+        "the root is what the walk trusted"
+    );
+    let tables = snap.tables();
+    let mut embedded_bytes: HashMap<NodeKey, Vec<u8>> = HashMap::new();
+    for (i, n) in wt.nodes.iter().enumerate() {
+        let s = &n.step;
+        let failed = matches!(s.shape, Shape::Missing | Shape::Invalid { .. });
+        assert_eq!(n.checked_at.is_none(), failed, "{s:?}");
+        if let Some(a) = n.checked_at {
+            assert!(
+                a <= rounds,
+                "checked at attempt {a} of a {rounds}-round read"
+            );
+        }
+        let bytes = match s.hash {
+            Some(h) => {
+                let b = reference
+                    .get(&s.key)
+                    .unwrap_or_else(|| panic!("{:?} is in the trie", s.key));
+                assert_eq!(
+                    keccak256(b),
+                    h,
+                    "the node hashes to what its parent committed"
+                );
+                assert_eq!(s.len, b.len());
+                let tk = n.table_key.expect("a hashed node has a table key");
+                let expect_tk = if wt.by_hash {
+                    h.0
+                } else if wt.trie == Trie::Account {
+                    s.key.table_key().unwrap()
+                } else {
+                    s.key.storage_table_key(owner).unwrap()
+                };
+                assert_eq!(tk, expect_tk);
+                match n.origin {
+                    Origin::Page { table, page } => {
+                        assert_eq!(table, wt.table);
+                        let info = &tables[table as usize];
+                        let ro = 4096 + (page - 1) * info.record_bytes;
+                        let fetched = wants.iter().any(|w| match w {
+                            Want::Range { rel, off, len } => {
+                                *rel == info.path && *off <= ro && ro + 4096 <= off + *len as u64
+                            }
+                            _ => false,
+                        });
+                        assert!(
+                            fetched,
+                            "page {page} of {} was fetched by this read",
+                            info.name
+                        );
+                        let file = std::fs::read(dir.join(&info.path)).unwrap();
+                        let pg = csl_run::Page::decode_with(
+                            &file[ro as usize..ro as usize + 4096],
+                            csl_eth_store::RUN_FORMAT.layout,
+                            page == info.page_count,
+                            page,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            pg.find(&tk).map(|e| e.value.clone()),
+                            Some(b.clone()),
+                            "the page holds the node"
+                        );
+                    }
+                    Origin::Cache => {
+                        assert!(wt.trie == Trie::Account && s.key.depth() < snap.top_levels);
+                    }
+                    o => panic!("a verified hashed node from {o:?}"),
+                }
+                b.clone()
+            }
+            None => {
+                assert_eq!(n.origin, Origin::Embedded);
+                assert!(n.table_key.is_none());
+                embedded_bytes
+                    .get(&s.key)
+                    .cloned()
+                    .expect("an embedded node follows its parent")
+            }
+        };
+        // The next node is the child this one commits to.
+        if let Some(c) = wt.nodes.get(i + 1) {
+            let child =
+                committed_child(&bytes, &s.shape).expect("a node with a successor commits to it");
+            let depth = match &s.shape {
+                Shape::Branch { taken, .. } => {
+                    assert!(taken);
+                    s.key.depth() + 1
+                }
+                Shape::Extension { nibbles, follows } => {
+                    assert!(follows);
+                    s.key.depth() + nibbles.len()
+                }
+                other => panic!("a {other:?} has no successor"),
+            };
+            assert_eq!(c.step.key.depth(), depth);
+            match (child.as_hash(), c.step.hash) {
+                (Some(h), Some(ch)) => {
+                    assert_eq!(h, ch, "each child's hash is what its parent committed")
+                }
+                (None, None) => {
+                    embedded_bytes.insert(c.step.key, child.as_slice().to_vec());
+                }
+                (a, b) => panic!("parent commits {a:?}, child traced {b:?}"),
+            }
+        }
+    }
+}
+
+fn reference_trie(leaves: Vec<(Nibbles, Vec<u8>)>) -> HashMap<NodeKey, Vec<u8>> {
+    let mut leaves = leaves;
+    leaves.sort();
+    csl_eth_trie::build::build_all(&leaves)
+        .unwrap()
+        .1
+        .into_iter()
+        .collect()
+}
+
+fn steps_of(wt: &WalkTrace) -> Vec<Step> {
+    wt.nodes.iter().map(|n| n.step.clone()).collect()
+}
+
+#[test]
+fn traces_chain_name_fetched_pages_and_agree_across_modes() {
+    let w = world(1500, 21);
+    let dir = scratch("trace");
+    produce(&dir, &w.head, "", w.accounts.iter().cloned(), &w.code).unwrap();
+    let host = Recording {
+        dir: DirDriver::new(&dir),
+        wants: Default::default(),
+    };
+    let mut snap = Snapshot::open(host, None, w.head.state_root).unwrap();
+    let eps = snap
+        .manifest()
+        .table(TABLE_ACCOUNT_NODES)
+        .unwrap()
+        .epsilon_pages as u64;
+    snap.hint = csl_eth_client::Hint::symmetric(eps + 1);
+    snap.top_levels = 3;
+    let accounts = reference_trie(
+        w.accounts
+            .iter()
+            .map(|a| (path_of(&a.hashed), a.account.encode()))
+            .collect(),
+    );
+    let take =
+        |snap: &Snapshot<Recording>| std::mem::take(&mut *snap.driver().wants.lock().unwrap());
+
+    // The run layout the trace's page indices are numbered in.
+    for t in snap.tables() {
+        let len = std::fs::metadata(dir.join(&t.path)).unwrap().len();
+        assert_eq!(t.total_len, len, "{}", t.name);
+        assert_eq!(
+            t.model_off,
+            (t.page_count + 1) * 4096,
+            "data pages follow page 0"
+        );
+        assert_eq!(t.model_pages * t.model_record_bytes, t.model_bytes);
+        assert!(t.error.is_none());
+    }
+
+    // Accounts and absences, both modes: every trace chains and names the
+    // pages the read fetched; the two modes walk the same nodes.
+    let present: BTreeMap<B256, ()> = w.accounts.iter().map(|a| (a.hashed, ())).collect();
+    let mut rng = ChaCha8Rng::seed_from_u64(5);
+    let absent: Vec<B256> = (0..20).map(|_| random_absent(&mut rng, &present)).collect();
+    let keys: Vec<B256> = w
+        .accounts
+        .iter()
+        .step_by(37)
+        .map(|a| a.hashed)
+        .chain(absent)
+        .collect();
+    let (mut from_cache, mut absences) = (0, 0);
+    for k in &keys {
+        take(&snap);
+        let (p, pc) = snap.account(k);
+        let pt = snap.trace().clone();
+        let pw = take(&snap);
+        let (h, hc) = snap.account_by_hash(k);
+        let ht = snap.trace().clone();
+        let hw = take(&snap);
+        assert_eq!(p, h);
+        assert_eq!((pt.walks.len(), ht.walks.len()), (1, 1));
+        check_walk(&pt.walks[0], &accounts, &pw, &dir, &snap, k, pc.rounds);
+        check_walk(&ht.walks[0], &accounts, &hw, &dir, &snap, k, hc.rounds);
+        assert_eq!(
+            steps_of(&pt.walks[0]),
+            steps_of(&ht.walks[0]),
+            "{k}: path and baseline walk the same nodes"
+        );
+        assert!(!pt.walks[0].by_hash && ht.walks[0].by_hash);
+        assert_eq!(pt.walks[0].table, TABLE_ACCOUNT_NODES);
+        assert_eq!(ht.walks[0].table, csl_eth_store::TABLE_NODES_BY_HASH);
+        assert_eq!(
+            pt.walks[0].nodes.len(),
+            pc.nodes,
+            "every node walked is traced"
+        );
+        let last = &pt.walks[0].nodes.last().unwrap().step.shape;
+        match &p {
+            Read::Verified(_) => assert!(matches!(last, Shape::Leaf { matches: true, .. })),
+            Read::VerifiedAbsent(AbsentBy::EmptySlot) => {
+                assert!(matches!(last, Shape::Branch { taken: false, .. }))
+            }
+            Read::VerifiedAbsent(AbsentBy::ExtensionMismatch) => {
+                assert!(matches!(last, Shape::Extension { follows: false, .. }))
+            }
+            Read::VerifiedAbsent(AbsentBy::LeafMismatch) => {
+                assert!(matches!(last, Shape::Leaf { matches: false, .. }))
+            }
+            other => panic!("{k}: {other:?}"),
+        }
+        absences += usize::from(p.is_absent());
+        from_cache += pt.walks[0]
+            .nodes
+            .iter()
+            .filter(|n| n.origin == Origin::Cache)
+            .count();
+        // The baseline fetches one node per round: node k is first checked
+        // after the round that brought it, so checks only move forward.
+        let at: Vec<u32> = ht.walks[0]
+            .nodes
+            .iter()
+            .filter_map(|n| n.checked_at)
+            .collect();
+        assert!(at.windows(2).all(|p| p[0] <= p[1]), "{at:?}");
+    }
+    assert!(from_cache > 0, "the top-level cache shows in the trace");
+    assert_eq!(absences, 20);
+
+    // Storage: the account walk, then the storage walk from its root.
+    for a in w.accounts.iter().filter(|a| !a.storage.is_empty()).take(12) {
+        let storage = reference_trie(
+            a.storage
+                .iter()
+                .map(|(s, v)| (path_of(s), csl_eth_trie::encode_word(v)))
+                .collect(),
+        );
+        let (slot, v) = a.storage[a.storage.len() / 3];
+        for baseline in [false, true] {
+            take(&snap);
+            let (r, c) = if baseline {
+                snap.storage_by_hash(&a.hashed, &slot)
+            } else {
+                snap.storage(&a.hashed, &slot)
+            };
+            assert_eq!(r, Read::Verified(v));
+            let t = snap.trace().clone();
+            let wants = take(&snap);
+            assert_eq!(t.walks.len(), 2);
+            assert_eq!(
+                (t.walks[0].trie, t.walks[1].trie),
+                (Trie::Account, Trie::Storage)
+            );
+            assert_eq!(t.walks[1].root, a.account.storage_root);
+            assert_eq!(t.walks[1].key, slot);
+            check_walk(
+                &t.walks[0],
+                &accounts,
+                &wants,
+                &dir,
+                &snap,
+                &a.hashed,
+                c.rounds,
+            );
+            check_walk(
+                &t.walks[1],
+                &storage,
+                &wants,
+                &dir,
+                &snap,
+                &a.hashed,
+                c.rounds,
+            );
+        }
+    }
+    // An account with no storage: the storage walk is the empty trie.
+    let empty = w.accounts.iter().find(|a| a.storage.is_empty()).unwrap();
+    let (r, _) = snap.storage(&empty.hashed, &B256::repeat_byte(4));
+    assert_eq!(r, Read::VerifiedAbsent(AbsentBy::EmptyTrie));
+    assert!(snap.trace().walks[1].nodes.is_empty());
+
+    // Code: the entry's page, and the blob it names.
+    let (h, c) = w.code.iter().max_by_key(|(_, c)| c.len()).unwrap();
+    let (r, _) = snap.code(h);
+    assert_eq!(r.verified().as_ref(), Some(c));
+    let ct = snap.trace().code.clone().unwrap();
+    assert!(ct.page.is_some() && ct.blob.is_some() && ct.len == Some(c.len()));
+
+    // Tamper, as the page does: flip one byte inside the deepest node of
+    // the round's responses that the read asked for. The read stops at
+    // that node, insufficient, its hash failing; never a wrong answer.
+    let a = &w.accounts[700];
+    snap.begin_read();
+    let mut flipped: Option<csl_eth_client::EntryAt> = None;
+    let (r, _) = loop {
+        match snap.try_account(&a.hashed) {
+            Ok(done) => break done,
+            Err(Pending) => {
+                let wants = snap.store().take_wanted(true);
+                let mut got = snap.driver().fetch(&wants);
+                if flipped.is_none() {
+                    let mut best: Option<(usize, csl_eth_client::EntryAt)> = None;
+                    for (i, (w, g)) in wants.iter().zip(&got).enumerate() {
+                        if let (Want::Range { rel, off, .. }, Ok(Some(body))) = (w, g) {
+                            for e in snap.entries_in(rel, *off, body) {
+                                if best.as_ref().is_none_or(|(_, b)| e.at.depth > b.at.depth) {
+                                    best = Some((i, e));
+                                }
+                            }
+                        }
+                    }
+                    if let Some((i, e)) = best {
+                        if let Ok(Some(body)) = &mut got[i] {
+                            body[e.value_off + e.value_len / 2] ^= 0xff;
+                        }
+                        flipped = Some(e);
+                    }
+                }
+                for (w, g) in wants.iter().zip(got) {
+                    snap.store().supply(w, g);
+                }
+            }
+        }
+    };
+    let e = flipped.expect("the round carried the path's nodes");
+    match &r {
+        Read::Insufficient(Reason::Invalid {
+            what: Invalid::HashMismatch,
+            key,
+            ..
+        }) => assert_eq!(*key, e.at.key),
+        other => panic!("tampered read: {other:?}"),
+    }
+    let last = snap.trace().walks[0].nodes.last().unwrap();
+    assert_eq!(last.step.key.depth(), e.at.depth);
+    assert!(
+        matches!(last.step.shape, Shape::Invalid { what: Invalid::HashMismatch, got: Some(g) } if Some(g) != last.step.hash)
+    );
+    assert_eq!(last.checked_at, None);
     std::fs::remove_dir_all(&dir).ok();
 }

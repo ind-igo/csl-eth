@@ -34,7 +34,7 @@ pub use build::{BuildError, Builder, Built, Discard, Sink};
 pub use range::{proof_for, verify_range, ProofError, RangeError, Sealed, Verified};
 pub use key::{code_key, path_of, speculative_keys, NodeKey, TooDeep, MAX_DEPTH};
 pub use value::{decode_word, encode_word, Account, EMPTY_ROOT};
-pub use walk::{walk, AbsentBy, Invalid, NodeSource, Outcome, Walk};
+pub use walk::{walk, walk_traced, AbsentBy, Invalid, NodeSource, Outcome, Shape, Step, Walk};
 
 /// The profile's `max_entry_bytes`: the largest node RLP a client decodes.
 /// A full branch of hashed children is 532 bytes; an account leaf is about

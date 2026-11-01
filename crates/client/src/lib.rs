@@ -32,14 +32,20 @@ use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{Nibbles, EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use csl_eth_store::{
     blob_path, manifest_path, table_path, Manifest, D_ACCOUNT, D_STORAGE, FORMAT_VERSION,
-    LATEST_FILE, RUN_FORMAT, TABLE_ACCOUNT_NODES, TABLE_CODE, TABLE_COUNT, TABLE_NODES_BY_HASH,
-    TABLE_STORAGE_NODES,
+    LATEST_FILE, RUN_FORMAT, TABLE_COUNT,
 };
-use csl_eth_trie::{decode_word, path_of, walk, AbsentBy, Account, Invalid, NodeKey, Outcome};
-use csl_run::Reader;
+use csl_eth_trie::{
+    decode_word, path_of, walk_traced, AbsentBy, Account, Invalid, NodeKey, Outcome, Shape, Step,
+};
+use csl_run::{Reader, PAGE};
 use std::{collections::HashMap, fmt, sync::Arc};
 
 pub mod store;
+/// The trie crate the trace's steps come from.
+pub use csl_eth_store::{
+    TABLE_ACCOUNT_NODES, TABLE_CODE, TABLE_NODES_BY_HASH, TABLE_STORAGE_NODES,
+};
+pub use csl_eth_trie as trie;
 #[cfg(not(target_arch = "wasm32"))]
 pub use store::DirDriver;
 pub use store::{drive, is_pending, Driver, Got, NoDriver, Pending, RunView, Store, Want, PENDING};
@@ -147,6 +153,148 @@ pub struct Cost {
     /// Model pages this read fetched (page 0 is the open's): the cold part
     /// of a read, zero once the key's neighbourhoods are known.
     pub model_pages: u64,
+}
+
+/// Which trie a traced walk is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Trie {
+    Account,
+    Storage,
+}
+
+/// Where a node on a traced walk came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// The snapshot's top-level cache: bytes an earlier read's verified walk
+    /// kept (they are hashed again by this walk all the same).
+    Cache,
+    /// Read from data page `page` (1-based, as `csl-run` numbers records)
+    /// of `table`'s run file.
+    Page { table: u16, page: u64 },
+    /// Inside its parent's bytes, so covered by the parent's hash.
+    Embedded,
+    /// Not served. `searched` is the page whose fences cover the node's key
+    /// and which does not hold it, when the lookup got that far.
+    NotServed { searched: Option<(u16, u64)> },
+}
+
+/// One node of a traced walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceNode {
+    /// What the walk found there (see [`csl_eth_trie::Step`]).
+    pub step: Step,
+    /// The table key it was looked up by: its position's key, or for the
+    /// baseline the hash its parent committed to. `None` when embedded.
+    pub table_key: Option<[u8; 32]>,
+    pub origin: Origin,
+    /// The attempt whose walk first checked this node: 0 for the call that
+    /// began the read, `n` for the one after round `n`. `None` when no walk
+    /// accepted it (the node the walk stopped at, when it failed).
+    pub checked_at: Option<u32>,
+}
+
+/// The final walk over one trie, node by node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WalkTrace {
+    pub trie: Trie,
+    /// The table its nodes are read from: 0 or 1 path-keyed, 3 by hash.
+    pub table: u16,
+    pub by_hash: bool,
+    /// The root it starts from: `state_root`, or the account's storage root.
+    pub root: B256,
+    /// The hashed key (or hashed slot) whose path it follows.
+    pub key: B256,
+    pub nodes: Vec<TraceNode>,
+}
+
+/// A code read: the entry's page in the code table, and the blob it names
+/// when the code is above the inline size.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeTrace {
+    pub code_hash: B256,
+    /// The page whose fences cover the code hash, when the lookup got that
+    /// far.
+    pub page: Option<u64>,
+    pub blob: Option<String>,
+    /// The bytecode's length, when it was served.
+    pub len: Option<usize>,
+}
+
+/// What the last read did, for a host that shows it: the walk(s) whose
+/// outcome is the answer, in order (a storage read's account walk, then
+/// its storage walk), or the code lookup. Recording it changes nothing
+/// the client fetches or decides.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Trace {
+    pub walks: Vec<WalkTrace>,
+    pub code: Option<CodeTrace>,
+}
+
+/// A table key the current attempt asked for: the path's speculated or
+/// repaired positions, or the baseline's next hash. A host that alters a
+/// round's bytes on purpose (the page's tamper demonstration) uses these to
+/// find which entries in a response the read will walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoundKey {
+    pub table: u16,
+    pub trie: Trie,
+    /// The depth of the position (the baseline's: of the node it expects).
+    pub depth: usize,
+    pub key: [u8; 32],
+}
+
+/// One table's run file as the open snapshot sees it: where page 0, the
+/// data pages and the model pages sit (`csl_run::Layout` with the paged
+/// model, core §4.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableInfo {
+    pub table_id: u16,
+    pub name: &'static str,
+    pub path: String,
+    /// Data pages, numbered `1..=page_count`; page 0 is at offset 0.
+    pub page_count: u64,
+    pub entry_count: u64,
+    pub epsilon_pages: u16,
+    /// Data page `i` is `record_bytes` at `PAGE + (i - 1) * record_bytes`.
+    pub record_bytes: u64,
+    /// The model section: `model_pages` records of `model_record_bytes`
+    /// (a 4 KB model page and its inline proof) from `model_off`.
+    pub model_off: u64,
+    pub model_bytes: u64,
+    pub model_pages: u64,
+    pub model_record_bytes: u64,
+    pub total_len: u64,
+    /// Why the table cannot serve, if it cannot.
+    pub error: Option<String>,
+}
+
+/// Where an entry the current read asked for sits in a response body: a
+/// [`RoundKey`] found on a data page of a fetched range, with its value's
+/// bytes (the node, or the code) at `value_off..value_off + value_len` of
+/// the body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryAt {
+    pub at: RoundKey,
+    pub page: u64,
+    pub value_off: usize,
+    pub value_len: usize,
+}
+
+/// A table's name: its run file without the extension.
+pub fn trie_table_name(table: u16) -> &'static str {
+    csl_eth_store::TABLE_FILES
+        .get(table as usize)
+        .map_or("?", |f| f.trim_end_matches(".run"))
+}
+
+/// Model pages and their record size for a paged model section of
+/// `model_bytes`: `m` records of `PAGE + DIGEST * depth(m)` bytes, as
+/// `csl_run::Reader` checks on page 0.
+fn model_pages_of(model_bytes: u64) -> Option<(u64, u64)> {
+    (1..=model_bytes / PAGE as u64).find_map(|m| {
+        let rec = PAGE as u64 + (csl_run::DIGEST * csl_run::tree::depth(m)) as u64;
+        (m * rec == model_bytes).then_some((m, rec))
+    })
 }
 
 /// Repairs a single read may take: one per node the speculative round
@@ -327,6 +475,10 @@ impl<D: Driver> Opener<D> {
             top_levels: 0,
             top: HashMap::new(),
             model_at_begin: 0,
+            trace: Trace::default(),
+            attempts: 0,
+            checked: HashMap::new(),
+            round_keys: Vec::new(),
         }))
     }
 }
@@ -350,6 +502,14 @@ pub struct Snapshot<D> {
     top: HashMap<NodeKey, Option<Vec<u8>>>,
     /// The readers' model requests when the current read began.
     model_at_begin: u64,
+    /// The current attempt's trace; the last read's once it is answered.
+    trace: Trace,
+    /// Attempts of the current read so far (each `try_` call is one).
+    attempts: u32,
+    /// Per node, the attempt whose walk first accepted it, this read.
+    checked: HashMap<(Trie, bool, NodeKey), u32>,
+    /// The table keys the current attempt asked for.
+    round_keys: Vec<RoundKey>,
 }
 
 /// Nodes fetched so far, by position.
@@ -396,6 +556,134 @@ impl<D: Driver> Snapshot<D> {
     pub fn begin_read(&mut self) {
         self.store.begin_read();
         self.model_at_begin = self.model_requests();
+        self.attempts = 0;
+        self.checked.clear();
+        self.trace = Trace::default();
+        self.round_keys.clear();
+    }
+
+    /// One `try_` call of the current read is starting.
+    fn attempt(&mut self) {
+        self.attempts += 1;
+        self.trace = Trace::default();
+        self.round_keys.clear();
+    }
+
+    /// What the last read did, node by node (see [`Trace`]): complete once
+    /// a `try_` call has returned the answer.
+    pub fn trace(&self) -> &Trace {
+        &self.trace
+    }
+
+    /// The table keys the last attempt asked for (see [`RoundKey`]).
+    pub fn round_keys(&self) -> &[RoundKey] {
+        &self.round_keys
+    }
+
+    /// The entries of the last attempt's [`RoundKey`]s on the data pages
+    /// of `body`, the bytes of `rel` from offset `off`. Pages are parsed
+    /// with the run format's own decoder and nothing is verified: this is
+    /// for a host that alters a response on purpose to show the client
+    /// refusing it, never for reading.
+    pub fn entries_in(&self, rel: &str, off: u64, body: &[u8]) -> Vec<EntryAt> {
+        let mut out = Vec::new();
+        if RUN_FORMAT.layout != csl_run::EntryLayout::Variable {
+            return out;
+        }
+        let Some(t) =
+            (0..TABLE_COUNT as u16).find(|t| table_path(&self.manifest.block_hash, *t) == rel)
+        else {
+            return out;
+        };
+        let Some(info) = self.tables().into_iter().nth(t as usize) else {
+            return out;
+        };
+        if info.page_count == 0 || info.record_bytes != PAGE as u64 {
+            return out;
+        }
+        let end = off + body.len() as u64;
+        let first = off.saturating_sub(PAGE as u64).div_ceil(PAGE as u64) + 1;
+        for i in first..=info.page_count {
+            let ro = PAGE as u64 + (i - 1) * PAGE as u64;
+            if ro < off {
+                continue;
+            }
+            if ro + PAGE as u64 > end {
+                break;
+            }
+            let b = &body[(ro - off) as usize..(ro - off) as usize + PAGE];
+            let Ok(page) =
+                csl_run::Page::decode_with(b, RUN_FORMAT.layout, i == info.page_count, i)
+            else {
+                continue;
+            };
+            for (j, e) in page.entries.iter().enumerate() {
+                let Some(at) = self
+                    .round_keys
+                    .iter()
+                    .find(|k| k.table == t && k.key == e.key)
+                else {
+                    continue;
+                };
+                if e.tag != 0 {
+                    continue;
+                }
+                // Variable layout: `n`, the fences, `n` u16 entry offsets,
+                // then `key ‖ tag ‖ len: u16 ‖ value` per entry (the
+                // decoder above has checked every offset).
+                let at_off = csl_run::PAGE_HEADER + 2 * j;
+                let o = u16::from_le_bytes([b[at_off], b[at_off + 1]]) as usize;
+                out.push(EntryAt {
+                    at: *at,
+                    page: i,
+                    value_off: (ro - off) as usize + o + 32 + 1 + 2,
+                    value_len: e.value.len(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Every table's run file and where its pages sit.
+    pub fn tables(&self) -> Vec<TableInfo> {
+        let m = &self.manifest;
+        (0..TABLE_COUNT as u16)
+            .map(|t| {
+                let path = table_path(&m.block_hash, t);
+                let name = trie_table_name(t);
+                let tr = m.table(t);
+                let layout = tr.and_then(|tr| {
+                    csl_run::Layout::try_new_with(
+                        tr.page_count,
+                        u64::from(tr.model_bytes),
+                        RUN_FORMAT.inline_proofs,
+                    )
+                    .ok()
+                });
+                let (model_pages, model_record_bytes) = layout
+                    .and_then(|l| model_pages_of(l.model_bytes))
+                    .unwrap_or((0, 0));
+                let error = match &self.readers[t as usize] {
+                    Err(r) => Some(r.to_string()),
+                    Ok(_) => None,
+                };
+                TableInfo {
+                    table_id: t,
+                    name,
+                    path,
+                    page_count: tr.map_or(0, |tr| tr.page_count),
+                    entry_count: tr.map_or(0, |tr| tr.entry_count),
+                    epsilon_pages: tr.map_or(0, |tr| tr.epsilon_pages),
+                    record_bytes: layout.map_or(0, |l| l.record_bytes),
+                    model_off: layout.map_or(0, |l| l.model_off),
+                    model_bytes: layout.map_or(0, |l| l.model_bytes),
+                    model_pages,
+                    model_record_bytes,
+                    total_len: layout.map_or(0, |l| l.total_len),
+                    error,
+                }
+            })
+            .collect()
     }
 
     /// Model section reads so far: page 0 per table at open, then one per
@@ -435,31 +723,105 @@ impl<D: Driver> Snapshot<D> {
         }
     }
 
-    /// One table key from the store: `Ok(None)` when the table's page for
-    /// it holds no such entry (which the walk will report as `Missing`).
+    /// One table key from the store, with the data page whose fences
+    /// cover it: `None` when that page holds no such entry (which the walk
+    /// will report as `Missing`). The lookup is the reader's `get_entry`
+    /// (`locate`, then the entry on the page), keeping the page index.
+    #[allow(clippy::type_complexity)]
     fn fetch(
         &mut self,
         table: u16,
         key: &[u8; 32],
-    ) -> Result<Result<Option<Vec<u8>>, Reason>, Pending> {
+    ) -> Result<Result<(Option<Vec<u8>>, u64), Reason>, Pending> {
         let r = match self.readers[table as usize].as_mut() {
             Ok(r) => r,
             Err(why) => return Ok(Err(why.clone())),
         };
-        Ok(match r.get_entry(key) {
-            Ok((Some(e), _)) if e.tag == 0 => Ok(Some(e.value)),
-            Ok((Some(_), _)) => Err(Reason::Invalid {
-                table,
-                key: *key,
-                what: Invalid::Rlp,
-            }),
-            Ok((None, _)) => Ok(None),
+        Ok(match r.locate(key) {
+            Ok((page, p, _)) => match p.find(key) {
+                Some(e) if e.tag == 0 => Ok((Some(e.value.clone()), page)),
+                Some(_) => Err(Reason::Invalid {
+                    table,
+                    key: *key,
+                    what: Invalid::Rlp,
+                }),
+                None => Ok((None, page)),
+            },
             Err(e) if is_pending(&e) => return Err(Pending),
             Err(e) => Err(Reason::Run {
                 table,
                 error: e.to_string(),
             }),
         })
+    }
+
+    /// Note a key of this attempt (see [`RoundKey`]).
+    fn note_key(&mut self, table: u16, trie: Trie, depth: usize, key: [u8; 32]) {
+        self.round_keys.push(RoundKey {
+            table,
+            trie,
+            depth,
+            key,
+        });
+    }
+
+    /// After a walk: every node it accepted is checked as of this attempt,
+    /// unless an earlier attempt's walk already checked it.
+    fn mark_checked(&mut self, trie: Trie, by_hash: bool, steps: &[Step]) {
+        let at = self.attempts.saturating_sub(1);
+        for s in steps {
+            if !matches!(s.shape, Shape::Missing | Shape::Invalid { .. }) {
+                self.checked.entry((trie, by_hash, s.key)).or_insert(at);
+            }
+        }
+    }
+
+    /// The final walk's steps as a [`WalkTrace`], appended to the trace.
+    #[allow(clippy::too_many_arguments)]
+    fn keep_trace(
+        &mut self,
+        trie: Trie,
+        table: u16,
+        by_hash: bool,
+        root: B256,
+        key: B256,
+        steps: Vec<Step>,
+        origin: &HashMap<NodeKey, Origin>,
+        key_of: impl Fn(&Step) -> [u8; 32],
+    ) {
+        let nodes = steps
+            .into_iter()
+            .map(|s| {
+                let embedded = s.hash.is_none();
+                let origin = if embedded {
+                    Origin::Embedded
+                } else {
+                    origin
+                        .get(&s.key)
+                        .copied()
+                        .unwrap_or(Origin::NotServed { searched: None })
+                };
+                let failed = matches!(s.shape, Shape::Missing | Shape::Invalid { .. });
+                TraceNode {
+                    table_key: (!embedded).then(|| key_of(&s)),
+                    origin,
+                    checked_at: if failed {
+                        None
+                    } else {
+                        self.checked.get(&(trie, by_hash, s.key)).copied()
+                    },
+                    step: s,
+                }
+            })
+            .collect();
+        self.trace.walks.push(WalkTrace {
+            trie,
+            table,
+            by_hash,
+            root,
+            key,
+            nodes,
+        });
     }
 
     /// Want the pages the model predicts for `keys`, widened as the hint
@@ -539,20 +901,32 @@ impl<D: Driver> Snapshot<D> {
     /// walk, repair until the trie answers. `Pending` when the round needs
     /// pages; the next attempt starts over from the store, which now has
     /// them.
+    #[allow(clippy::too_many_arguments)]
     fn walk_table(
         &mut self,
+        trie: Trie,
         table: u16,
         root: B256,
+        key: B256,
         path: &Nibbles,
         key_of: impl Fn(&NodeKey) -> [u8; 32],
         max_depth: usize,
         cache: bool,
     ) -> Result<(Read<Vec<u8>>, u32, usize), Pending> {
         if root == EMPTY_ROOT_HASH {
+            let none = HashMap::new();
+            self.keep_trace(trie, table, false, root, key, Vec::new(), &none, |_| {
+                [0; 32]
+            });
             return Ok((Read::VerifiedAbsent(AbsentBy::EmptyTrie), 0, 0));
         }
         let (wanted, mut nodes) = self.speculative(path, max_depth, cache);
+        let mut origin: HashMap<NodeKey, Origin> =
+            nodes.keys().map(|nk| (*nk, Origin::Cache)).collect();
         let keys: Vec<[u8; 32]> = wanted.iter().map(&key_of).collect();
+        for (nk, tk) in wanted.iter().zip(&keys) {
+            self.note_key(table, trie, nk.depth(), *tk);
+        }
         self.want_pages(table, &keys);
         // Every depth of the round, errors deferred to the repair that
         // would need the node; a depth the store cannot answer yet does
@@ -560,10 +934,19 @@ impl<D: Driver> Snapshot<D> {
         let mut pending = false;
         for (nk, tk) in wanted.into_iter().zip(&keys) {
             match self.fetch(table, tk) {
-                Ok(Ok(Some(v))) => {
+                Ok(Ok((Some(v), page))) => {
                     nodes.insert(nk, v);
+                    origin.insert(nk, Origin::Page { table, page });
                 }
-                Ok(_) => {}
+                Ok(Ok((None, page))) => {
+                    origin.insert(
+                        nk,
+                        Origin::NotServed {
+                            searched: Some((table, page)),
+                        },
+                    );
+                }
+                Ok(Err(_)) => {}
                 Err(Pending) => pending = true,
             }
         }
@@ -571,8 +954,11 @@ impl<D: Driver> Snapshot<D> {
             return Err(Pending);
         }
         let mut repairs = 0u32;
+        let mut steps = Vec::new();
         let (outcome, walked) = loop {
-            let w = walk(root, path, &nodes);
+            steps.clear();
+            let w = walk_traced(root, path, &nodes, &mut steps);
+            self.mark_checked(trie, false, &steps);
             let walked = w.nodes;
             match w.outcome {
                 Outcome::Present(v) => break (Read::Verified(v), walked),
@@ -591,22 +977,33 @@ impl<D: Driver> Snapshot<D> {
                     }
                     repairs += 1;
                     let tk = key_of(&nk);
+                    self.note_key(table, trie, nk.depth(), tk);
                     self.want_pages(table, &[tk]);
                     match self.fetch(table, &tk)? {
-                        Ok(Some(v)) => {
+                        Ok((Some(v), page)) => {
                             nodes.insert(nk, v);
+                            origin.insert(nk, Origin::Page { table, page });
                         }
-                        Ok(None) => {
+                        Ok((None, page)) => {
+                            origin.insert(
+                                nk,
+                                Origin::NotServed {
+                                    searched: Some((table, page)),
+                                },
+                            );
                             break (
                                 Read::Insufficient(Reason::Missing { table, key: tk }),
                                 walked,
-                            )
+                            );
                         }
                         Err(r) => break (Read::Insufficient(r), walked),
                     }
                 }
             }
         };
+        self.keep_trace(trie, table, false, root, key, steps, &origin, |s| {
+            key_of(&s.key)
+        });
         if cache && self.top_levels > 0 && !outcome.is_insufficient() {
             self.top_keep(path, &nodes, max_depth);
         }
@@ -617,8 +1014,10 @@ impl<D: Driver> Snapshot<D> {
         let path = path_of(hashed);
         let d = self.d_account;
         let (r, repairs, nodes) = self.walk_table(
+            Trie::Account,
             TABLE_ACCOUNT_NODES,
             self.state_root(),
+            *hashed,
             &path,
             |nk| nk.table_key().expect("walk depth ≤ 62"),
             d,
@@ -641,8 +1040,10 @@ impl<D: Driver> Snapshot<D> {
         let owner = *hashed;
         let d = self.d_storage;
         let (r, repairs, nodes) = self.walk_table(
+            Trie::Storage,
             TABLE_STORAGE_NODES,
             account.storage_root,
+            *hashed_slot,
             &path,
             |nk| nk.storage_table_key(&owner).expect("walk depth ≤ 62"),
             d,
@@ -662,25 +1063,35 @@ impl<D: Driver> Snapshot<D> {
     /// walk, so the two are compared on equal terms.
     fn walk_by_hash(
         &mut self,
+        trie: Trie,
         root: B256,
-        path: &Nibbles,
+        key: B256,
         cache: bool,
     ) -> Result<(Read<Vec<u8>>, u32, usize), Pending> {
+        let path = &path_of(&key);
+        let table = TABLE_NODES_BY_HASH;
         if root == EMPTY_ROOT_HASH {
+            let none = HashMap::new();
+            self.keep_trace(trie, table, true, root, key, Vec::new(), &none, |_| [0; 32]);
             return Ok((Read::VerifiedAbsent(AbsentBy::EmptyTrie), 0, 0));
         }
         let mut nodes = Nodes::new();
+        let mut origin: HashMap<NodeKey, Origin> = HashMap::new();
         if cache {
             for d in 0..self.top_levels {
                 let nk = NodeKey::prefix(path, d);
                 if let Some(Some(v)) = self.top.get(&nk) {
                     nodes.insert(nk, v.clone());
+                    origin.insert(nk, Origin::Cache);
                 }
             }
         }
         let mut fetched = 0u32;
+        let mut steps = Vec::new();
         let (outcome, walked) = loop {
-            let w = walk(root, path, &nodes);
+            steps.clear();
+            let w = walk_traced(root, path, &nodes, &mut steps);
+            self.mark_checked(trie, true, &steps);
             let walked = w.nodes;
             match w.outcome {
                 Outcome::Present(v) => break (Read::Verified(v), walked),
@@ -700,12 +1111,20 @@ impl<D: Driver> Snapshot<D> {
                     }
                     let h = w.expected.expect("a missing node has the hash its parent committed to");
                     fetched += 1;
+                    self.note_key(table, trie, nk.depth(), h.0);
                     self.want_pages(TABLE_NODES_BY_HASH, &[h.0]);
                     match self.fetch(TABLE_NODES_BY_HASH, &h.0)? {
-                        Ok(Some(v)) => {
+                        Ok((Some(v), page)) => {
                             nodes.insert(nk, v);
+                            origin.insert(nk, Origin::Page { table, page });
                         }
-                        Ok(None) => {
+                        Ok((None, page)) => {
+                            origin.insert(
+                                nk,
+                                Origin::NotServed {
+                                    searched: Some((table, page)),
+                                },
+                            );
                             let r = Reason::Missing {
                                 table: TABLE_NODES_BY_HASH,
                                 key: h.0,
@@ -717,6 +1136,11 @@ impl<D: Driver> Snapshot<D> {
                 }
             }
         };
+        // The baseline looks a node up by the hash its parent committed to,
+        // which is the hash the step records.
+        self.keep_trace(trie, table, true, root, key, steps, &origin, |s| {
+            s.hash.map_or([0; 32], |h| h.0)
+        });
         if cache && self.top_levels > 0 && !outcome.is_insufficient() {
             self.top_keep(path, &nodes, self.top_levels);
         }
@@ -725,12 +1149,14 @@ impl<D: Driver> Snapshot<D> {
 
     /// The account under `hashed`, read the baseline's way (see the crate
     /// doc): the same answer as `try_account`, one round per node.
-    pub fn try_account_by_hash(
-        &mut self,
-        hashed: &B256,
-    ) -> Result<(Read<Account>, Cost), Pending> {
-        let path = path_of(hashed);
-        let (r, fetched, nodes) = self.walk_by_hash(self.state_root(), &path, true)?;
+    pub fn try_account_by_hash(&mut self, hashed: &B256) -> Result<(Read<Account>, Cost), Pending> {
+        self.attempt();
+        self.account_by_hash_inner(hashed)
+    }
+
+    fn account_by_hash_inner(&mut self, hashed: &B256) -> Result<(Read<Account>, Cost), Pending> {
+        let (r, fetched, nodes) =
+            self.walk_by_hash(Trie::Account, self.state_root(), *hashed, true)?;
         let r = r.map(|v| match Account::decode(&v) {
             Ok(a) => Read::Verified(a),
             Err(_) => Read::Insufficient(Reason::Value("account leaf")),
@@ -745,13 +1171,17 @@ impl<D: Driver> Snapshot<D> {
         hashed: &B256,
         hashed_slot: &B256,
     ) -> Result<(Read<U256>, Cost), Pending> {
-        let (acct, af, an) = self.try_account_by_hash(hashed).map(|(r, c)| (r, c.repairs, c.nodes))?;
+        self.attempt();
+        let (acct, af, an) = self
+            .account_by_hash_inner(hashed)
+            .map(|(r, c)| (r, c.repairs, c.nodes))?;
         let acct = match acct {
             Read::Verified(a) => a,
             Read::VerifiedAbsent(b) => return Ok((Read::VerifiedAbsent(b), self.cost(af, an))),
             Read::Insufficient(r) => return Ok((Read::Insufficient(r), self.cost(af, an))),
         };
-        let (r, sf, sn) = self.walk_by_hash(acct.storage_root, &path_of(hashed_slot), false)?;
+        let (r, sf, sn) =
+            self.walk_by_hash(Trie::Storage, acct.storage_root, *hashed_slot, false)?;
         let r = r.map(|v| match decode_word(&v) {
             Ok(w) => Read::Verified(w),
             Err(_) => Read::Insufficient(Reason::Value("storage leaf")),
@@ -761,6 +1191,7 @@ impl<D: Driver> Snapshot<D> {
 
     /// The account under `hashed = keccak(address)`, from the store.
     pub fn try_account(&mut self, hashed: &B256) -> Result<(Read<Account>, Cost), Pending> {
+        self.attempt();
         let (r, repairs, nodes) = self.account_walk(hashed)?;
         Ok((r, self.cost(repairs, nodes)))
     }
@@ -776,6 +1207,7 @@ impl<D: Driver> Snapshot<D> {
         hashed: &B256,
         hashed_slot: &B256,
     ) -> Result<(Read<U256>, Cost), Pending> {
+        self.attempt();
         let spath = path_of(hashed_slot);
         let owner = *hashed;
         let skeys: Vec<[u8; 32]> = (0..=self.d_storage)
@@ -785,6 +1217,9 @@ impl<D: Driver> Snapshot<D> {
                     .expect("walk depth ≤ 62")
             })
             .collect();
+        for (d, k) in skeys.iter().enumerate() {
+            self.note_key(TABLE_STORAGE_NODES, Trie::Storage, d, *k);
+        }
         self.want_pages(TABLE_STORAGE_NODES, &skeys);
         let (acct, ar, an) = self.account_walk(hashed)?;
         let acct = match acct {
@@ -804,6 +1239,7 @@ impl<D: Driver> Snapshot<D> {
         hashed: &B256,
         hashed_slot: &B256,
     ) -> Result<(Read<U256>, Cost), Pending> {
+        self.attempt();
         let (r, repairs, nodes) = self.storage_walk(account, hashed, hashed_slot)?;
         Ok((r, self.cost(repairs, nodes)))
     }
@@ -812,9 +1248,27 @@ impl<D: Driver> Snapshot<D> {
     /// `KECCAK_EMPTY` is empty code with no fetch; a blob (code above the
     /// inline size) is a second round.
     pub fn try_code(&mut self, code_hash: &B256) -> Result<(Read<Vec<u8>>, Cost), Pending> {
+        self.attempt();
+        let r = self.code_inner(code_hash);
+        if let Ok((Read::Verified(b), _)) = &r {
+            if let Some(c) = self.trace.code.as_mut() {
+                c.len = Some(b.len());
+            }
+        }
+        r
+    }
+
+    fn code_inner(&mut self, code_hash: &B256) -> Result<(Read<Vec<u8>>, Cost), Pending> {
+        self.trace.code = Some(CodeTrace {
+            code_hash: *code_hash,
+            page: None,
+            blob: None,
+            len: None,
+        });
         if *code_hash == KECCAK_EMPTY {
             return Ok((Read::Verified(Vec::new()), self.cost(0, 0)));
         }
+        self.note_key(TABLE_CODE, Trie::Account, 0, code_hash.0);
         self.want_pages(TABLE_CODE, &[code_hash.0]);
         let reader = match self.readers[TABLE_CODE as usize].as_mut() {
             Ok(r) => r,
@@ -823,8 +1277,14 @@ impl<D: Driver> Snapshot<D> {
                 return Ok((Read::Insufficient(why), self.cost(0, 0)));
             }
         };
-        let entry = match reader.get_entry(&code_hash.0) {
-            Ok((e, _)) => e,
+        // `get_entry`, keeping the page index for the trace.
+        let entry = match reader.locate(&code_hash.0) {
+            Ok((page, p, _)) => {
+                if let Some(c) = self.trace.code.as_mut() {
+                    c.page = Some(page);
+                }
+                p.find(&code_hash.0).cloned()
+            }
             Err(e) if is_pending(&e) => return Err(Pending),
             Err(e) => {
                 let r = Reason::Run {
@@ -845,6 +1305,9 @@ impl<D: Driver> Snapshot<D> {
             Some(e) if e.tag == 0 => e.value,
             Some(e) if e.tag == 2 => {
                 let h: [u8; 32] = e.value.as_slice().try_into().expect("tag 2 is 32 bytes");
+                if let Some(c) = self.trace.code.as_mut() {
+                    c.blob = Some(blob_path(&h));
+                }
                 match self.store.file(&blob_path(&h))? {
                     Ok(Some(b)) if *blake3::hash(&b).as_bytes() == h => b,
                     Ok(Some(_)) => {

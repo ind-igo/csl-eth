@@ -1539,6 +1539,7 @@ name = "csl-eth-client"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-rlp",
  "alloy-trie",
  "blake3",
  "csl-eth-head",

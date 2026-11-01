@@ -87,8 +87,72 @@ pub struct Walk {
     pub expected: Option<B256>,
 }
 
+/// One node a walk reached, in order, for a caller that shows its work
+/// ([`walk_traced`]). Nothing here changes what the walk decides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Step {
+    /// Where the node sits: the nibbles consumed to reach it.
+    pub key: NodeKey,
+    /// The hash its parent committed to (the root hash for the root), which
+    /// the node's bytes were checked against; `None` for a node embedded in
+    /// its parent, covered by the parent's hash.
+    pub hash: Option<B256>,
+    /// Its RLP length: the bytes served for a hashed node, the bytes inside
+    /// the parent for an embedded one; 0 when nothing was served.
+    pub len: usize,
+    pub shape: Shape,
+}
+
+/// What a walk found at one node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// A branch: the slots that hold a child (bit `i` for nibble `i`), the
+    /// path's next nibble, and whether that slot has a child (if not, the
+    /// key is absent: `AbsentBy::EmptySlot`).
+    Branch {
+        occupied: u16,
+        next: u8,
+        taken: bool,
+    },
+    /// An extension: its nibbles, and whether the path follows them (if
+    /// not, `AbsentBy::ExtensionMismatch`).
+    Extension { nibbles: Nibbles, follows: bool },
+    /// A leaf: the rest of the key it holds, whether that is the rest of
+    /// the path (if not, `AbsentBy::LeafMismatch`), and its value.
+    Leaf {
+        rest: Nibbles,
+        matches: bool,
+        value: Vec<u8>,
+    },
+    /// The source did not have it (`Outcome::Missing`).
+    Missing,
+    /// Served but rejected (`Outcome::Invalid`); `got` is the keccak of the
+    /// bytes served, when they were hashed.
+    Invalid { what: Invalid, got: Option<B256> },
+}
+
 /// Walk `path` (64 nibbles) from `root` over `src`.
 pub fn walk<S: NodeSource>(root: B256, path: &Nibbles, src: S) -> Walk {
+    walk_inner(root, path, src, None)
+}
+
+/// [`walk`], also recording every node it reached in `trace`, in order
+/// (the last one is where it stopped). The outcome is [`walk`]'s.
+pub fn walk_traced<S: NodeSource>(
+    root: B256,
+    path: &Nibbles,
+    src: S,
+    trace: &mut Vec<Step>,
+) -> Walk {
+    walk_inner(root, path, src, Some(trace))
+}
+
+fn walk_inner<S: NodeSource>(
+    root: B256,
+    path: &Nibbles,
+    src: S,
+    mut trace: Option<&mut Vec<Step>>,
+) -> Walk {
     debug_assert_eq!(path.len(), PATH_NIBBLES);
     let mut fetched = Vec::with_capacity(10);
     let mut nodes = 0usize;
@@ -97,6 +161,16 @@ pub fn walk<S: NodeSource>(root: B256, path: &Nibbles, src: S) -> Walk {
         nodes,
         fetched,
         expected,
+    };
+    let mut note = |key: NodeKey, hash: Option<B256>, len: usize, shape: Shape| {
+        if let Some(t) = trace.as_deref_mut() {
+            t.push(Step {
+                key,
+                hash,
+                len,
+                shape,
+            });
+        }
     };
     if root == EMPTY_ROOT_HASH {
         return done(Outcome::Absent(AbsentBy::EmptyTrie), 0, fetched, None);
@@ -107,46 +181,84 @@ pub fn walk<S: NodeSource>(root: B256, path: &Nibbles, src: S) -> Walk {
     loop {
         let key = NodeKey::prefix(path, depth);
         if nodes >= MAX_WALK_NODES {
-            return done(Outcome::Invalid(key, Invalid::TooManyNodes), nodes, fetched, expected);
+            let what = Invalid::TooManyNodes;
+            note(key, expect.as_hash(), 0, Shape::Invalid { what, got: None });
+            return done(Outcome::Invalid(key, what), nodes, fetched, expected);
         }
-        let bytes: &[u8] = if let Some(h) = expect.as_hash() {
+        let hash = expect.as_hash();
+        let bytes: &[u8] = if let Some(h) = hash {
             fetched.push(key);
             expected = Some(h);
             let Some(b) = src.node(&key) else {
+                note(key, hash, 0, Shape::Missing);
                 return done(Outcome::Missing(key), nodes, fetched, expected);
             };
             if b.len() > MAX_NODE_BYTES {
-                return done(
-                    Outcome::Invalid(key, Invalid::TooLarge(b.len())),
-                    nodes,
-                    fetched,
-                    expected,
-                );
+                let what = Invalid::TooLarge(b.len());
+                note(key, hash, b.len(), Shape::Invalid { what, got: None });
+                return done(Outcome::Invalid(key, what), nodes, fetched, expected);
             }
-            if keccak256(b) != h {
-                return done(Outcome::Invalid(key, Invalid::HashMismatch), nodes, fetched, expected);
+            let got = keccak256(b);
+            if got != h {
+                let what = Invalid::HashMismatch;
+                note(
+                    key,
+                    hash,
+                    b.len(),
+                    Shape::Invalid {
+                        what,
+                        got: Some(got),
+                    },
+                );
+                return done(Outcome::Invalid(key, what), nodes, fetched, expected);
             }
             b
         } else {
             // Embedded in the parent, already covered by the parent's hash.
             expect.as_slice()
         };
+        let len = bytes.len();
+        let rejected = |what| Shape::Invalid { what, got: None };
         nodes += 1;
         let mut rest = bytes;
         let Ok(node) = TrieNode::decode(&mut rest) else {
-            return done(Outcome::Invalid(key, Invalid::Rlp), nodes, fetched, expected);
+            note(key, hash, len, rejected(Invalid::Rlp));
+            return done(
+                Outcome::Invalid(key, Invalid::Rlp),
+                nodes,
+                fetched,
+                expected,
+            );
         };
         if !rest.is_empty() {
-            return done(Outcome::Invalid(key, Invalid::Rlp), nodes, fetched, expected);
+            note(key, hash, len, rejected(Invalid::Rlp));
+            return done(
+                Outcome::Invalid(key, Invalid::Rlp),
+                nodes,
+                fetched,
+                expected,
+            );
         }
         match node {
             // keccak(0x80) is EMPTY_ROOT_HASH, handled above; anywhere else it is malformed.
             TrieNode::EmptyRoot => {
-                return done(Outcome::Invalid(key, Invalid::Shape), nodes, fetched, expected)
+                note(key, hash, len, rejected(Invalid::Shape));
+                return done(
+                    Outcome::Invalid(key, Invalid::Shape),
+                    nodes,
+                    fetched,
+                    expected,
+                );
             }
             TrieNode::Branch(b) => {
                 if depth >= PATH_NIBBLES {
-                    return done(Outcome::Invalid(key, Invalid::Shape), nodes, fetched, expected);
+                    note(key, hash, len, rejected(Invalid::Shape));
+                    return done(
+                        Outcome::Invalid(key, Invalid::Shape),
+                        nodes,
+                        fetched,
+                        expected,
+                    );
                 }
                 let nib = path.get_unchecked(depth);
                 let child = b
@@ -154,8 +266,21 @@ pub fn walk<S: NodeSource>(root: B256, path: &Nibbles, src: S) -> Walk {
                     .children()
                     .find(|(i, _)| *i == nib)
                     .and_then(|(_, c)| c.cloned());
+                let shape = Shape::Branch {
+                    occupied: b.state_mask.get(),
+                    next: nib,
+                    taken: child.is_some(),
+                };
+                note(key, hash, len, shape);
                 match child {
-                    None => return done(Outcome::Absent(AbsentBy::EmptySlot), nodes, fetched, expected),
+                    None => {
+                        return done(
+                            Outcome::Absent(AbsentBy::EmptySlot),
+                            nodes,
+                            fetched,
+                            expected,
+                        )
+                    }
                     Some(c) => {
                         expect = c;
                         depth += 1;
@@ -165,17 +290,54 @@ pub fn walk<S: NodeSource>(root: B256, path: &Nibbles, src: S) -> Walk {
             TrieNode::Extension(e) => {
                 let n = e.key.len();
                 if n == 0 || depth + n > PATH_NIBBLES {
-                    return done(Outcome::Invalid(key, Invalid::Shape), nodes, fetched, expected);
+                    note(key, hash, len, rejected(Invalid::Shape));
+                    return done(
+                        Outcome::Invalid(key, Invalid::Shape),
+                        nodes,
+                        fetched,
+                        expected,
+                    );
                 }
-                if path.slice(depth..depth + n) != e.key {
-                    return done(Outcome::Absent(AbsentBy::ExtensionMismatch), nodes, fetched, expected);
+                let follows = path.slice(depth..depth + n) == e.key;
+                note(
+                    key,
+                    hash,
+                    len,
+                    Shape::Extension {
+                        nibbles: e.key,
+                        follows,
+                    },
+                );
+                if !follows {
+                    return done(
+                        Outcome::Absent(AbsentBy::ExtensionMismatch),
+                        nodes,
+                        fetched,
+                        expected,
+                    );
                 }
                 expect = e.child;
                 depth += n;
             }
             TrieNode::Leaf(l) => {
-                if path.slice(depth..) != l.key {
-                    return done(Outcome::Absent(AbsentBy::LeafMismatch), nodes, fetched, expected);
+                let matches = path.slice(depth..) == l.key;
+                note(
+                    key,
+                    hash,
+                    len,
+                    Shape::Leaf {
+                        rest: l.key,
+                        matches,
+                        value: l.value.clone(),
+                    },
+                );
+                if !matches {
+                    return done(
+                        Outcome::Absent(AbsentBy::LeafMismatch),
+                        nodes,
+                        fetched,
+                        expected,
+                    );
                 }
                 return done(Outcome::Present(l.value), nodes, fetched, expected);
             }
@@ -197,6 +359,58 @@ mod tests {
         let w = walk(EMPTY_ROOT_HASH, &Nibbles::unpack([0; 32]), HashMap::new());
         assert_eq!(w.outcome, Outcome::Absent(AbsentBy::EmptyTrie));
         assert!(w.fetched.is_empty());
+    }
+
+    #[test]
+    fn a_traced_walk_decides_as_the_walk_does_and_names_each_node() {
+        let k = Nibbles::unpack([7; 32]);
+        let other = Nibbles::unpack([
+            7, 7, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+            22, 23, 24, 25, 26, 27, 28,
+        ]);
+        let (b, nodes) = build_all(&[(k, vec![9; 40]), (other, vec![3; 40])]).unwrap();
+        let src = map(nodes);
+        for q in [
+            k,
+            other,
+            Nibbles::unpack([7, 7, 7, 9].repeat(8)),
+            Nibbles::unpack([1; 32]),
+        ] {
+            let mut t = Vec::new();
+            let w = walk_traced(b.root, &q, &src, &mut t);
+            assert_eq!(w, walk(b.root, &q, &src));
+            assert_eq!(t[0].hash, Some(b.root));
+            assert_eq!(t[0].key, NodeKey::ROOT);
+            for s in &t {
+                if let (Some(h), Some(v)) = (s.hash, src.get(&s.key)) {
+                    assert_eq!(keccak256(v), h);
+                    assert_eq!(s.len, v.len());
+                }
+            }
+        }
+        let mut t = Vec::new();
+        walk_traced(b.root, &k, &src, &mut t);
+        assert!(matches!(t[0].shape, Shape::Extension { follows: true, .. }));
+        assert!(matches!(
+            t[1].shape,
+            Shape::Branch {
+                taken: true,
+                next: 7,
+                ..
+            }
+        ));
+        assert!(
+            matches!(&t.last().unwrap().shape, Shape::Leaf { matches: true, value, .. } if *value == vec![9; 40])
+        );
+        let mut t = Vec::new();
+        walk_traced(B256::repeat_byte(1), &k, &src, &mut t);
+        assert!(matches!(
+            t[0].shape,
+            Shape::Invalid {
+                what: Invalid::HashMismatch,
+                got: Some(_)
+            }
+        ));
     }
 
     #[test]
