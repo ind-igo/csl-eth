@@ -162,6 +162,8 @@ fn walk_inner<S: NodeSource>(
         fetched,
         expected,
     };
+    // Trace-only data that costs an allocation is built only when tracing.
+    let tracing = trace.is_some();
     let mut note = |key: NodeKey, hash: Option<B256>, len: usize, shape: Shape| {
         if let Some(t) = trace.as_deref_mut() {
             t.push(Step {
@@ -321,16 +323,18 @@ fn walk_inner<S: NodeSource>(
             }
             TrieNode::Leaf(l) => {
                 let matches = path.slice(depth..) == l.key;
-                note(
-                    key,
-                    hash,
-                    len,
-                    Shape::Leaf {
-                        rest: l.key,
-                        matches,
-                        value: l.value.clone(),
-                    },
-                );
+                if tracing {
+                    note(
+                        key,
+                        hash,
+                        len,
+                        Shape::Leaf {
+                            rest: l.key,
+                            matches,
+                            value: l.value.clone(),
+                        },
+                    );
+                }
                 if !matches {
                     return done(
                         Outcome::Absent(AbsentBy::LeafMismatch),

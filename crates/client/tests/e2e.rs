@@ -694,17 +694,62 @@ fn baseline_by_hash_agrees_and_costs_a_round_per_node() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A directory host that records every want, so a test can check what a
-/// read put on the wire.
+/// A directory host that records every want, round by round, so a test
+/// can check what a read put on the wire and when.
 struct Recording {
     dir: DirDriver,
-    wants: std::sync::Mutex<Vec<Want>>,
+    wants: std::sync::Mutex<Vec<Vec<Want>>>,
+}
+
+impl Recording {
+    fn new(dir: &std::path::Path) -> Recording {
+        Recording {
+            dir: DirDriver::new(dir),
+            wants: Default::default(),
+        }
+    }
 }
 
 impl Driver for Recording {
     fn fetch(&self, wants: &[Want]) -> Vec<Got> {
-        self.wants.lock().unwrap().extend_from_slice(wants);
+        self.wants.lock().unwrap().push(wants.to_vec());
         self.dir.fetch(wants)
+    }
+}
+
+/// Check a traced node's shape against its own bytes, decoded here: a
+/// branch's occupied slots, an extension's nibbles, a leaf's rest and value.
+fn check_shape(bytes: &[u8], shape: &Shape) {
+    use alloy_rlp::Decodable;
+    use alloy_trie::nodes::TrieNode;
+    let mut b = bytes;
+    match (
+        TrieNode::decode(&mut b).expect("a verified node decodes"),
+        shape,
+    ) {
+        (
+            TrieNode::Branch(br),
+            Shape::Branch {
+                occupied,
+                next,
+                taken,
+            },
+        ) => {
+            assert_eq!(
+                *occupied,
+                br.state_mask.get(),
+                "the branch's occupied slots"
+            );
+            assert_eq!(*taken, br.state_mask.is_bit_set(*next));
+        }
+        (TrieNode::Extension(e), Shape::Extension { nibbles, .. }) => {
+            assert_eq!(*nibbles, e.key, "the extension's nibbles")
+        }
+        (TrieNode::Leaf(l), Shape::Leaf { rest, value, .. }) => {
+            assert_eq!(*rest, l.key, "the leaf's rest of key");
+            assert_eq!(*value, l.value);
+        }
+        (node, shape) => panic!("{node:?} traced as {shape:?}"),
     }
 }
 
@@ -730,7 +775,7 @@ fn committed_child(parent: &[u8], shape: &Shape) -> Option<alloy_trie::nodes::Rl
 fn check_walk(
     wt: &WalkTrace,
     reference: &HashMap<NodeKey, Vec<u8>>,
-    wants: &[Want],
+    wants: &[Vec<Want>],
     dir: &std::path::Path,
     snap: &Snapshot<Recording>,
     owner: &B256,
@@ -746,18 +791,19 @@ fn check_walk(
         Some(wt.root),
         "the root is what the walk trusted"
     );
+    assert_eq!(wants.len() as u32, rounds, "one fetch per round");
     let tables = snap.tables();
     let mut embedded_bytes: HashMap<NodeKey, Vec<u8>> = HashMap::new();
+    // The attempt that checked the node before this one: a walk checks
+    // its nodes in order, so no node is checked before its parent.
+    let mut parent_at = 0;
     for (i, n) in wt.nodes.iter().enumerate() {
         let s = &n.step;
         let failed = matches!(s.shape, Shape::Missing | Shape::Invalid { .. });
         assert_eq!(n.checked_at.is_none(), failed, "{s:?}");
-        if let Some(a) = n.checked_at {
-            assert!(
-                a <= rounds,
-                "checked at attempt {a} of a {rounds}-round read"
-            );
-        }
+        // The attempt at which this node's bytes were first in hand: 0 for
+        // the cache and embedded nodes, else the round that fetched its page.
+        let mut landed = parent_at;
         let bytes = match s.hash {
             Some(h) => {
                 let b = reference
@@ -783,17 +829,21 @@ fn check_walk(
                         assert_eq!(table, wt.table);
                         let info = &tables[table as usize];
                         let ro = 4096 + (page - 1) * info.record_bytes;
-                        let fetched = wants.iter().any(|w| match w {
-                            Want::Range { rel, off, len } => {
-                                *rel == info.path && *off <= ro && ro + 4096 <= off + *len as u64
-                            }
-                            _ => false,
+                        let round = wants.iter().position(|ws| {
+                            ws.iter().any(|w| match w {
+                                Want::Range { rel, off, len } => {
+                                    *rel == info.path
+                                        && *off <= ro
+                                        && ro + 4096 <= off + *len as u64
+                                }
+                                _ => false,
+                            })
                         });
-                        assert!(
-                            fetched,
-                            "page {page} of {} was fetched by this read",
-                            info.name
-                        );
+                        let round = round.unwrap_or_else(|| {
+                            panic!("page {page} of {} was fetched by this read", info.name)
+                        });
+                        // Fetched in round r (1-based): in hand from attempt r.
+                        landed = landed.max(round as u32 + 1);
                         let file = std::fs::read(dir.join(&info.path)).unwrap();
                         let pg = csl_run::Page::decode_with(
                             &file[ro as usize..ro as usize + 4096],
@@ -824,6 +874,22 @@ fn check_walk(
                     .expect("an embedded node follows its parent")
             }
         };
+        if let Some(a) = n.checked_at {
+            assert!(
+                a <= rounds,
+                "checked at attempt {a} of a {rounds}-round read"
+            );
+            // Never checked before its bytes landed, nor before its parent.
+            // (Later is allowed: the path walk waits for all of the round's
+            // depths, and a storage walk waits for its account's walk.)
+            assert!(
+                a >= landed,
+                "{:?} landed by attempt {landed}, checked at {a}",
+                s.key
+            );
+            parent_at = a;
+            check_shape(&bytes, &s.shape);
+        }
         // The next node is the child this one commits to.
         if let Some(c) = wt.nodes.get(i + 1) {
             let child =
@@ -872,11 +938,8 @@ fn traces_chain_name_fetched_pages_and_agree_across_modes() {
     let w = world(1500, 21);
     let dir = scratch("trace");
     produce(&dir, &w.head, "", w.accounts.iter().cloned(), &w.code).unwrap();
-    let host = Recording {
-        dir: DirDriver::new(&dir),
-        wants: Default::default(),
-    };
-    let mut snap = Snapshot::open(host, None, w.head.state_root).unwrap();
+    let mut snap = Snapshot::open(Recording::new(&dir), None, w.head.state_root).unwrap();
+    snap.tracing = true;
     let eps = snap
         .manifest()
         .table(TABLE_ACCOUNT_NODES)
@@ -1052,6 +1115,8 @@ fn traces_chain_name_fetched_pages_and_agree_across_modes() {
                     for (i, (w, g)) in wants.iter().zip(&got).enumerate() {
                         if let (Want::Range { rel, off, .. }, Ok(Some(body))) = (w, g) {
                             for e in snap.entries_in(rel, *off, body) {
+                                // A target is a non-empty interval inside the body.
+                                assert!(e.value_len > 0 && e.value_off + e.value_len <= body.len());
                                 if best.as_ref().is_none_or(|(_, b)| e.at.depth > b.at.depth) {
                                     best = Some((i, e));
                                 }
@@ -1086,5 +1151,61 @@ fn traces_chain_name_fetched_pages_and_agree_across_modes() {
         matches!(last.step.shape, Shape::Invalid { what: Invalid::HashMismatch, got: Some(g) } if Some(g) != last.step.hash)
     );
     assert_eq!(last.checked_at, None);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn tracing_changes_no_want_and_no_cost() {
+    // The trace is additive: a tracing snapshot puts the same wants on the
+    // wire, round by round, and reports the same cost as one that does not.
+    let w = world(800, 23);
+    let dir = scratch("trace-additive");
+    produce(&dir, &w.head, "", w.accounts.iter().cloned(), &w.code).unwrap();
+    let open = |tracing: bool| {
+        let mut s = Snapshot::open(Recording::new(&dir), None, w.head.state_root).unwrap();
+        let eps = s
+            .manifest()
+            .table(TABLE_ACCOUNT_NODES)
+            .unwrap()
+            .epsilon_pages as u64;
+        s.hint = csl_eth_client::Hint::symmetric(eps + 1);
+        s.top_levels = 2;
+        s.tracing = tracing;
+        s
+    };
+    let (mut plain, mut traced) = (open(false), open(true));
+    let take = |s: &Snapshot<Recording>| std::mem::take(&mut *s.driver().wants.lock().unwrap());
+    assert_eq!(take(&plain), take(&traced), "opening");
+
+    let present: BTreeMap<B256, ()> = w.accounts.iter().map(|a| (a.hashed, ())).collect();
+    let mut rng = ChaCha8Rng::seed_from_u64(8);
+    let absent: Vec<B256> = (0..10).map(|_| random_absent(&mut rng, &present)).collect();
+    let mut compare = |what: &str, f: &dyn Fn(&mut Snapshot<Recording>) -> Cost| {
+        let (pc, tc) = (f(&mut plain), f(&mut traced));
+        assert_eq!(pc, tc, "{what}: cost");
+        assert_eq!(take(&plain), take(&traced), "{what}: wants per round");
+        assert!(plain.trace().walks.is_empty() && plain.trace().code.is_none());
+        assert!(!traced.trace().walks.is_empty() || traced.trace().code.is_some());
+    };
+    for k in w
+        .accounts
+        .iter()
+        .step_by(41)
+        .map(|a| a.hashed)
+        .chain(absent)
+    {
+        compare("account", &|s| s.account(&k).1);
+        compare("account by hash", &|s| s.account_by_hash(&k).1);
+    }
+    for a in w.accounts.iter().filter(|a| !a.storage.is_empty()).take(6) {
+        let slot = a.storage[0].0;
+        compare("storage", &|s| s.storage(&a.hashed, &slot).1);
+        compare("storage by hash", &|s| {
+            s.storage_by_hash(&a.hashed, &slot).1
+        });
+    }
+    for h in w.code.keys().take(4) {
+        compare("code", &|s| s.code(h).1);
+    }
     std::fs::remove_dir_all(&dir).ok();
 }

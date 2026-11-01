@@ -480,6 +480,7 @@ impl Client {
                     Ok(Ok((mut snap, head))) => {
                         snap.hint = self.hint;
                         snap.top_levels = self.top_levels;
+                        snap.tracing = true;
                         let (requests, bytes, rounds) = snap.store().cost();
                         let mut v = head_json(&head, &snap);
                         v["open"] = serde_json::json!({ "requests": requests, "bytes": bytes, "rounds": rounds });

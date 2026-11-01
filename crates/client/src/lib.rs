@@ -35,7 +35,8 @@ use csl_eth_store::{
     LATEST_FILE, RUN_FORMAT, TABLE_COUNT,
 };
 use csl_eth_trie::{
-    decode_word, path_of, walk_traced, AbsentBy, Account, Invalid, NodeKey, Outcome, Shape, Step,
+    decode_word, path_of, walk, walk_traced, AbsentBy, Account, Invalid, NodeKey, Outcome, Shape,
+    Step,
 };
 use csl_run::{Reader, PAGE};
 use std::{collections::HashMap, fmt, sync::Arc};
@@ -479,6 +480,7 @@ impl<D: Driver> Opener<D> {
             attempts: 0,
             checked: HashMap::new(),
             round_keys: Vec::new(),
+            tracing: false,
         }))
     }
 }
@@ -510,6 +512,10 @@ pub struct Snapshot<D> {
     checked: HashMap<(Trie, bool, NodeKey), u32>,
     /// The table keys the current attempt asked for.
     round_keys: Vec<RoundKey>,
+    /// Keep a [`Trace`] of each read's final walk(s) and the attempt's
+    /// table keys (off by default). Tracing only records: what is fetched,
+    /// every answer and every [`Cost`] are the same either way.
+    pub tracing: bool,
 }
 
 /// Nodes fetched so far, by position.
@@ -598,7 +604,7 @@ impl<D: Driver> Snapshot<D> {
         let Some(info) = self.tables().into_iter().nth(t as usize) else {
             return out;
         };
-        if info.page_count == 0 || info.record_bytes != PAGE as u64 {
+        if info.error.is_some() || info.page_count == 0 || info.record_bytes != PAGE as u64 {
             return out;
         }
         let end = off + body.len() as u64;
@@ -633,11 +639,19 @@ impl<D: Driver> Snapshot<D> {
                 // decoder above has checked every offset).
                 let at_off = csl_run::PAGE_HEADER + 2 * j;
                 let o = u16::from_le_bytes([b[at_off], b[at_off + 1]]) as usize;
+                // Only a non-empty value lying wholly inside this page, and
+                // holding exactly the entry's bytes, is a target: a flip
+                // there changes that node's bytes and nothing else.
+                let start = o + 32 + 1 + 2;
+                let len = e.value.len();
+                if len == 0 || start + len > PAGE || b[start..start + len] != e.value[..] {
+                    continue;
+                }
                 out.push(EntryAt {
                     at: *at,
                     page: i,
-                    value_off: (ro - off) as usize + o + 32 + 1 + 2,
-                    value_len: e.value.len(),
+                    value_off: (ro - off) as usize + start,
+                    value_len: len,
                 });
             }
         }
@@ -663,9 +677,11 @@ impl<D: Driver> Snapshot<D> {
                 let (model_pages, model_record_bytes) = layout
                     .and_then(|l| model_pages_of(l.model_bytes))
                     .unwrap_or((0, 0));
-                let error = match &self.readers[t as usize] {
-                    Err(r) => Some(r.to_string()),
-                    Ok(_) => None,
+                let error = match (&self.readers[t as usize], tr, layout) {
+                    (Err(r), _, _) => Some(r.to_string()),
+                    (Ok(_), None, _) => Some("not in the manifest".into()),
+                    (Ok(_), Some(_), None) => Some("no valid run layout".into()),
+                    (Ok(_), Some(_), Some(_)) => None,
                 };
                 TableInfo {
                     table_id: t,
@@ -757,6 +773,9 @@ impl<D: Driver> Snapshot<D> {
 
     /// Note a key of this attempt (see [`RoundKey`]).
     fn note_key(&mut self, table: u16, trie: Trie, depth: usize, key: [u8; 32]) {
+        if !self.tracing {
+            return;
+        }
         self.round_keys.push(RoundKey {
             table,
             trie,
@@ -768,6 +787,9 @@ impl<D: Driver> Snapshot<D> {
     /// After a walk: every node it accepted is checked as of this attempt,
     /// unless an earlier attempt's walk already checked it.
     fn mark_checked(&mut self, trie: Trie, by_hash: bool, steps: &[Step]) {
+        if !self.tracing {
+            return;
+        }
         let at = self.attempts.saturating_sub(1);
         for s in steps {
             if !matches!(s.shape, Shape::Missing | Shape::Invalid { .. }) {
@@ -789,6 +811,9 @@ impl<D: Driver> Snapshot<D> {
         origin: &HashMap<NodeKey, Origin>,
         key_of: impl Fn(&Step) -> [u8; 32],
     ) {
+        if !self.tracing {
+            return;
+        }
         let nodes = steps
             .into_iter()
             .map(|s| {
@@ -957,7 +982,11 @@ impl<D: Driver> Snapshot<D> {
         let mut steps = Vec::new();
         let (outcome, walked) = loop {
             steps.clear();
-            let w = walk_traced(root, path, &nodes, &mut steps);
+            let w = if self.tracing {
+                walk_traced(root, path, &nodes, &mut steps)
+            } else {
+                walk(root, path, &nodes)
+            };
             self.mark_checked(trie, false, &steps);
             let walked = w.nodes;
             match w.outcome {
@@ -1090,7 +1119,11 @@ impl<D: Driver> Snapshot<D> {
         let mut steps = Vec::new();
         let (outcome, walked) = loop {
             steps.clear();
-            let w = walk_traced(root, path, &nodes, &mut steps);
+            let w = if self.tracing {
+                walk_traced(root, path, &nodes, &mut steps)
+            } else {
+                walk(root, path, &nodes)
+            };
             self.mark_checked(trie, true, &steps);
             let walked = w.nodes;
             match w.outcome {
@@ -1259,12 +1292,14 @@ impl<D: Driver> Snapshot<D> {
     }
 
     fn code_inner(&mut self, code_hash: &B256) -> Result<(Read<Vec<u8>>, Cost), Pending> {
-        self.trace.code = Some(CodeTrace {
-            code_hash: *code_hash,
-            page: None,
-            blob: None,
-            len: None,
-        });
+        if self.tracing {
+            self.trace.code = Some(CodeTrace {
+                code_hash: *code_hash,
+                page: None,
+                blob: None,
+                len: None,
+            });
+        }
         if *code_hash == KECCAK_EMPTY {
             return Ok((Read::Verified(Vec::new()), self.cost(0, 0)));
         }
