@@ -14,62 +14,60 @@
 //! manifest of a clean open, and rewrites the response as the fault says,
 //! deterministically from a seed.
 //!
+//! Most faults are *aimed*. A fault that damages every page a read touches
+//! mostly damages the account root (table key `0^32`, the first entry of
+//! the account table's first page), so every walk stops at the top and
+//! nothing below it is exercised. Instead, before the table runs, a clean
+//! walk of every read ([`routes`]) records the nodes it needs: their table,
+//! key, depth, the page that holds each and the page the model predicts
+//! for it, path-keyed (tables 0 and 1) and by hash (table 3, the
+//! baseline's). Each read then aims at one node, cycling over the depths
+//! across the plan (root, middle and deepest account node; every storage
+//! depth for slot reads), and the driver corrupts only the response that
+//! holds that node's page, leaving every other response clean. The row
+//! reports which (table, trie, depth) each read aimed at, and the reads
+//! whose aim the fault could not land ("untargeted"). Faults that are about
+//! a whole file or region (page 0, model pages, the manifest, `latest`,
+//! blobs) and `bit_flip` (random bits in every data response) are not
+//! aimed.
+//!
 //! The format carries no Bloom filter (pages route by chained fences and
 //! the learned model), so the spec's "zeroed Bloom" has nothing to zero;
 //! the table says so.
 //!
-//! Scoring: a read is correct when it returns the slice's value or the
-//! absence the slice implies; `Insufficient` is the acceptable failure;
-//! a wrong value, an absence for a present key or a value for an absent
-//! key fails the design. The `Reason` variants seen per fault say how the
-//! client caught it: at the page (`Run`), at the trie (`Invalid`,
-//! `Missing`) or at the hash of the bytes (`Code`, `Blob`).
+//! The reads are the workload's ([`workload::plan`] at small sizes: crafted
+//! leaf and extension mismatches, deep storage, extension-crossing paths,
+//! keys outside the prefix) and are scored by the workload's scorer, so a
+//! value or an absence for an outside key fails the table as it fails the
+//! workload. `Insufficient` is the acceptable failure; the `Reason`s seen
+//! per fault and mode say how the client caught it: at the page (`Run`),
+//! at the trie (`Invalid`, `Missing`) or at the hash of the bytes (`Code`,
+//! `Blob`), and in which table.
 
+use crate::workload::{self, Draw, Expect, Plan, Sizes, Target, Verdict};
 use crate::Slice;
-use alloy_primitives::{keccak256, B256, U256};
-use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
-use clap::{Args as ClapArgs, ValueEnum};
-use csl_eth_client::{DirDriver, Driver, Got, Hint, Read, Reason, Snapshot, Want};
-use csl_eth_store::{manifest_path, table_path, Manifest, LATEST_FILE, RUN_FORMAT, TABLE_COUNT};
-use csl_eth_trie::{path_of, Account, Nibbles, NodeKey};
-use csl_run::{EntryLayout, Layout, Page, KEY_MAX, KEY_MIN, PAGE};
-use rand::{Rng, RngCore, SeedableRng};
+use alloy_primitives::{keccak256, B256};
+use clap::Args as ClapArgs;
+use csl_eth_client::{DirDriver, Driver, Got, Hint, Reason, Snapshot, Want};
+use csl_eth_store::{
+    manifest_path, table_path, Manifest, LATEST_FILE, RUN_FORMAT, TABLE_ACCOUNT_NODES, TABLE_CODE,
+    TABLE_COUNT, TABLE_NODES_BY_HASH, TABLE_STORAGE_NODES,
+};
+use csl_eth_trie::{path_of, walk, Account, Nibbles, NodeKey, Outcome, EMPTY_ROOT_HASH};
+use csl_run::{EntryLayout, Layout, Page, Reader, KEY_MAX, KEY_MIN, PAGE};
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
+use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     fmt,
+    fs::File,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
-/// Which client reads the keys: the path-keyed read, the content-addressed
-/// baseline, or both.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Mode {
-    Path,
-    Baseline,
-    Both,
-}
-
-impl Mode {
-    /// The modes to run, as "is the baseline".
-    fn each(self) -> Vec<bool> {
-        match self {
-            Mode::Path => vec![false],
-            Mode::Baseline => vec![true],
-            Mode::Both => vec![false, true],
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Mode::Path => "path",
-            Mode::Baseline => "baseline",
-            Mode::Both => "both",
-        }
-    }
-}
+pub use crate::workload::Mode;
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
@@ -82,11 +80,13 @@ pub struct Args {
     /// Where to write the JSON table.
     #[arg(long)]
     pub out: PathBuf,
-    /// Keys per shape (present accounts, absent accounts, present slots,
-    /// absent slots, code).
+    /// Reads per kind in the plan (present and absent accounts, present and
+    /// absent slots; a quarter as many outside the prefix; code of every
+    /// contract drawn).
     #[arg(long, default_value_t = 200)]
     pub keys: usize,
-    /// Fraction of the qualifying responses each fault touches.
+    /// Fraction of reads an aimed fault fires on, or of the qualifying
+    /// responses an unaimed one touches.
     #[arg(long, default_value_t = 1.0)]
     pub rate: f64,
     #[arg(long, default_value_t = 1)]
@@ -97,7 +97,8 @@ pub struct Args {
     /// the faulty driver on every read).
     #[arg(long, default_value_t = 0)]
     pub top_levels: usize,
-    /// Run only these faults (repeatable); every fault when absent.
+    /// Run only these faults (repeatable); every fault when absent. The
+    /// control row always runs.
     #[arg(long = "fault")]
     pub faults: Vec<String>,
 }
@@ -112,13 +113,16 @@ pub enum Fault {
     FenceGap,
     FenceExcludes,
     TruncatedPage,
-    TruncatedFile,
+    TruncatedLatest,
+    TruncatedManifest,
     TruncatedBlob,
     WrongRunPage,
     WrongRange,
     BitFlip,
+    BitFlipPage,
     ModelPageTamper,
     Page0Tamper,
+    Page0Missing,
     ManifestStateRoot,
     ManifestModelRoot,
     ManifestTableRoot,
@@ -129,7 +133,7 @@ pub enum Fault {
 }
 
 impl Fault {
-    pub const ALL: [Fault; 21] = [
+    pub const ALL: [Fault; 24] = [
         Fault::None,
         Fault::NodeOmitted,
         Fault::PageMalformed,
@@ -137,13 +141,16 @@ impl Fault {
         Fault::FenceGap,
         Fault::FenceExcludes,
         Fault::TruncatedPage,
-        Fault::TruncatedFile,
+        Fault::TruncatedLatest,
+        Fault::TruncatedManifest,
         Fault::TruncatedBlob,
         Fault::WrongRunPage,
         Fault::WrongRange,
         Fault::BitFlip,
+        Fault::BitFlipPage,
         Fault::ModelPageTamper,
         Fault::Page0Tamper,
+        Fault::Page0Missing,
         Fault::ManifestStateRoot,
         Fault::ManifestModelRoot,
         Fault::ManifestTableRoot,
@@ -162,13 +169,16 @@ impl Fault {
             Fault::FenceGap => "fence_gap",
             Fault::FenceExcludes => "fence_excludes",
             Fault::TruncatedPage => "truncated_page",
-            Fault::TruncatedFile => "truncated_file",
+            Fault::TruncatedLatest => "truncated_latest",
+            Fault::TruncatedManifest => "truncated_manifest",
             Fault::TruncatedBlob => "truncated_blob",
             Fault::WrongRunPage => "wrong_run_page",
             Fault::WrongRange => "wrong_range",
             Fault::BitFlip => "bit_flip",
+            Fault::BitFlipPage => "bit_flip_page",
             Fault::ModelPageTamper => "model_page_tamper",
             Fault::Page0Tamper => "page0_tamper",
+            Fault::Page0Missing => "page0_missing",
             Fault::ManifestStateRoot => "manifest_state_root",
             Fault::ManifestModelRoot => "manifest_model_root",
             Fault::ManifestTableRoot => "manifest_table_root",
@@ -183,63 +193,86 @@ impl Fault {
         Fault::ALL.iter().copied().find(|f| f.name() == s)
     }
 
-    /// What the driver does to a qualifying response.
+    /// What the driver does to a qualifying response. "The aimed node" is
+    /// the one node of the read's path the fault is aimed at (module doc).
     pub fn describe(self) -> &'static str {
         match self {
             Fault::None => "control: responses pass through untouched",
-            Fault::NodeOmitted => "data page re-encoded with one entry removed (the deepest node on the read's path when the page holds one, else a random entry); fences and count stay consistent, so the node is silently missing",
-            Fault::PageMalformed => "data page re-encoded with one entry removed but the header's count left as it was: the offset table no longer matches",
-            Fault::ForgedFence => "data page fences widened to [0^32, FF^32]: the page claims to cover every key, so a key the model predicts onto it is found absent from the page instead of on its neighbour",
-            Fault::FenceGap => "data page fences narrowed to its first entry and the successor of its last: keys in the former gaps fall between pages, but every node a walk needs is an entry and stays covered, so this cannot misroute a read",
-            Fault::FenceExcludes => "data page upper fence lowered onto its last entry, so a key the page holds is outside its fences; the page's own validation rejects it",
-            Fault::TruncatedPage => "data range answered with half the bytes asked",
-            Fault::TruncatedFile => "every whole-file want (latest, manifest, blobs) answered with its first half",
+            Fault::NodeOmitted => "the page holding the aimed node re-encoded without it; fences and count stay consistent, so the node is silently missing",
+            Fault::PageMalformed => "the page holding the aimed node re-encoded without it but the header's count left as it was: the offset table no longer matches",
+            Fault::ForgedFence => "the page the model predicts for the aimed node, when that is not the page holding it, re-encoded with fences [0^32, FF^32]: it claims to cover the node, so the node is found absent from it instead of on its neighbour (a node the model predicts exactly cannot be misrouted this way, and is aimed past)",
+            Fault::FenceGap => "the page holding the aimed node re-encoded with fences narrowed to its first entry and the successor of its last: keys in the former gaps fall between pages, but every node a walk needs is an entry and stays covered, so this cannot misroute a read (a negative control)",
+            Fault::FenceExcludes => "the page holding the aimed node re-encoded with its upper fence lowered onto its last entry, so a key the page holds is outside its fences; the page's own validation rejects it (not aimable on the table's last page, whose upper fence must stay FF^32)",
+            Fault::TruncatedPage => "the range response holding the aimed node's page answered with half the bytes asked",
+            Fault::TruncatedLatest => "snapshots/latest answered with its first half",
+            Fault::TruncatedManifest => "the manifest answered with its first half (latest served whole)",
             Fault::TruncatedBlob => "blob files answered with their first half",
-            Fault::WrongRunPage => "data range of a table answered with the same range of another table (account_nodes from storage_nodes and back, code from nodes_by_hash and back)",
-            Fault::WrongRange => "data range answered from one page further into the same file",
-            Fault::BitFlip => "one random bit flipped in each data range response",
+            Fault::WrongRunPage => "the range response holding the aimed node's page answered with the same range of another table (account_nodes from storage_nodes and back, nodes_by_hash from code and back)",
+            Fault::WrongRange => "the range response holding the aimed node's page answered from one page further into the same file",
+            Fault::BitFlip => "unaimed: one random bit flipped in every data range response",
+            Fault::BitFlipPage => "one random bit flipped in the page holding the aimed node",
             Fault::ModelPageTamper => "one random bit flipped in each model page record",
-            Fault::Page0Tamper => "one random bit flipped in page 0 (header and top model)",
+            Fault::Page0Tamper => "one random bit flipped in page 0 (header and top model) of every table",
+            Fault::Page0Missing => "page 0 of every table answered Ok(None): no table can route",
             Fault::ManifestStateRoot => "manifest state_root altered",
             Fault::ManifestModelRoot => "every table's model_root in the manifest altered",
             Fault::ManifestTableRoot => "every table's root (blake3 of the run file) in the manifest altered; the client never checks it, the trie proves values",
-            Fault::MissingRange => "range wants answered Ok(None): the host says the file is not there",
-            Fault::HttpError => "range wants answered Err(500)",
-            Fault::StaleValue => "one entry's value bytes altered in place on each data page (the deepest node on the read's path when the page holds one, else a random entry)",
-            Fault::StalePage => "every entry's value bytes altered in place on each data page",
+            Fault::MissingRange => "the range response holding the aimed node's page answered Ok(None) (the host says the file is not there); page 0 and model pages are served, so the refusal lands mid-walk",
+            Fault::HttpError => "the range response holding the aimed node's page answered Err(500); page 0 and model pages are served, so the refusal lands mid-walk",
+            Fault::StaleValue => "the aimed node's value bytes altered in place (one byte), the page re-encoded",
+            Fault::StalePage => "every entry's value bytes altered in place on the page holding the aimed node",
         }
     }
 
-    fn qualifies(self, k: &Kind) -> bool {
-        match self {
-            Fault::None => false,
+    /// Aimed at one node per read (module doc).
+    pub fn aimed(self) -> bool {
+        matches!(
+            self,
             Fault::NodeOmitted
-            | Fault::PageMalformed
-            | Fault::ForgedFence
-            | Fault::FenceGap
-            | Fault::FenceExcludes
-            | Fault::TruncatedPage
-            | Fault::WrongRunPage
-            | Fault::WrongRange
-            | Fault::BitFlip
-            | Fault::StaleValue
-            | Fault::StalePage => matches!(k, Kind::Data(_)),
-            Fault::TruncatedFile => {
-                matches!(k, Kind::Latest | Kind::Manifest | Kind::Blob | Kind::File)
-            }
+                | Fault::PageMalformed
+                | Fault::ForgedFence
+                | Fault::FenceGap
+                | Fault::FenceExcludes
+                | Fault::TruncatedPage
+                | Fault::WrongRunPage
+                | Fault::WrongRange
+                | Fault::BitFlipPage
+                | Fault::MissingRange
+                | Fault::HttpError
+                | Fault::StaleValue
+                | Fault::StalePage
+        )
+    }
+
+    /// The fault should change some response; a row where it changed none
+    /// is flagged (its reads say nothing about the fault).
+    pub fn fires(self) -> bool {
+        self != Fault::None
+    }
+
+    fn qualifies(self, k: &Kind) -> bool {
+        if self.aimed() {
+            return matches!(k, Kind::Data(_));
+        }
+        match self {
+            Fault::BitFlip => matches!(k, Kind::Data(_)),
+            Fault::TruncatedLatest => matches!(k, Kind::Latest),
+            Fault::TruncatedManifest => matches!(k, Kind::Manifest),
             Fault::TruncatedBlob => matches!(k, Kind::Blob),
             Fault::ModelPageTamper => matches!(k, Kind::Model(_)),
-            Fault::Page0Tamper => matches!(k, Kind::Page0(_)),
+            Fault::Page0Tamper | Fault::Page0Missing => matches!(k, Kind::Page0(_)),
             Fault::ManifestStateRoot | Fault::ManifestModelRoot | Fault::ManifestTableRoot => {
                 matches!(k, Kind::Manifest)
             }
-            Fault::MissingRange | Fault::HttpError => {
-                matches!(
-                    k,
-                    Kind::Page0(_) | Kind::Data(_) | Kind::Model(_) | Kind::Range
-                )
-            }
+            _ => false,
         }
+    }
+
+    /// The row's seed: from the fault's name, the base seed and the mode,
+    /// so `--fault x` alone reproduces row x of a full table.
+    fn seed(self, base: u64, mode: &str) -> u64 {
+        let h = keccak256(format!("{}/{mode}/{base}", self.name()));
+        u64::from_le_bytes(h.0[..8].try_into().expect("8 bytes"))
     }
 }
 
@@ -331,14 +364,94 @@ impl Geometry {
     }
 }
 
+/// Which trie a node belongs to (the baseline's table 3 holds both).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Trie {
+    Account,
+    Storage,
+    Code,
+}
+
+impl Trie {
+    fn name(self) -> &'static str {
+        match self {
+            Trie::Account => "account",
+            Trie::Storage => "storage",
+            Trie::Code => "code",
+        }
+    }
+}
+
+/// One node a clean read needs, where it lives in its table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Aim {
+    pub table: u16,
+    pub trie: Trie,
+    /// Nibbles consumed to reach the node (0 for code).
+    pub depth: usize,
+    pub key: [u8; 32],
+    /// The data page that holds it.
+    pub page: u64,
+    /// The data page the model predicts for its key: the first the reader
+    /// visits.
+    pub predicted: u64,
+}
+
+impl Aim {
+    /// The coverage label: table, trie and depth.
+    pub fn label(&self) -> String {
+        format!(
+            "table {} {} depth {}",
+            self.table,
+            self.trie.name(),
+            self.depth
+        )
+    }
+}
+
+/// The nodes a clean read of one draw needs, in walk order, as the path
+/// mode and the baseline fetch them.
+#[derive(Clone, Debug, Default)]
+pub struct Route {
+    pub path: Vec<Aim>,
+    pub baseline: Vec<Aim>,
+}
+
+#[derive(Default)]
 struct State {
-    rng: ChaCha8Rng,
-    /// Table keys of the nodes the current read walks, deepest first:
-    /// rank 0 is the leaf's position. A page-level fault that must hit the
-    /// path picks the lowest-ranked entry it finds.
-    focus: HashMap<[u8; 32], usize>,
+    rng: Option<ChaCha8Rng>,
+    aim: Option<Aim>,
+    /// The aim landed: a response holding it was changed this read.
+    hit: bool,
     responses: u64,
+    /// Responses whose bytes or status the fault changed.
     faulted: u64,
+}
+
+/// A handle on a driver's counters that survives the driver being moved
+/// into a snapshot (or dropped by an open that refused).
+#[derive(Clone, Default)]
+pub struct Handle(Arc<Mutex<State>>);
+
+impl Handle {
+    /// The node the next read is aimed at (`None`: the read is spared).
+    pub fn set_aim(&self, aim: Option<Aim>) {
+        let mut st = self.0.lock().unwrap();
+        st.aim = aim;
+        st.hit = false;
+    }
+
+    /// Whether the aim of the read just made landed.
+    pub fn take_hit(&self) -> bool {
+        let mut st = self.0.lock().unwrap();
+        std::mem::take(&mut st.hit)
+    }
+
+    /// Responses seen and responses the fault changed.
+    pub fn stats(&self) -> (u64, u64) {
+        let st = self.0.lock().unwrap();
+        (st.responses, st.faulted)
+    }
 }
 
 /// A host that answers from a clean driver and lies as one [`Fault`] says.
@@ -347,10 +460,10 @@ pub struct FaultDriver<D> {
     fault: Fault,
     rate: f64,
     geometry: Geometry,
-    state: Mutex<State>,
+    state: Handle,
 }
 
-/// What `edit_pages` does with a decoded page after the closure ran.
+/// What a page edit does with a decoded page.
 enum Edit {
     Keep,
     Reencode,
@@ -361,74 +474,83 @@ enum Edit {
 
 impl<D: Driver> FaultDriver<D> {
     pub fn new(inner: D, fault: Fault, rate: f64, geometry: Geometry, seed: u64) -> FaultDriver<D> {
+        let state = Handle::default();
+        state.0.lock().unwrap().rng = Some(ChaCha8Rng::seed_from_u64(seed));
         FaultDriver {
             inner,
             fault,
             rate: rate.clamp(0.0, 1.0),
             geometry,
-            state: Mutex::new(State {
-                rng: ChaCha8Rng::seed_from_u64(seed),
-                focus: HashMap::new(),
-                responses: 0,
-                faulted: 0,
-            }),
+            state,
         }
     }
 
-    /// The nodes the next read walks, deepest first, so an omitted or
-    /// stale entry lands on the path rather than anywhere on the page.
-    pub fn set_focus(&self, keys: &[[u8; 32]]) {
-        let mut st = self.state.lock().unwrap();
-        st.focus = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
-    }
-
-    /// Responses seen and responses the fault changed.
-    pub fn stats(&self) -> (u64, u64) {
-        let st = self.state.lock().unwrap();
-        (st.responses, st.faulted)
+    pub fn handle(&self) -> Handle {
+        self.state.clone()
     }
 
     fn apply(&self, w: &Want, got: Got) -> Got {
         let kind = self.geometry.classify(w);
-        let mut st = self.state.lock().unwrap();
+        let mut guard = self.state.0.lock().unwrap();
+        let st = &mut *guard;
         st.responses += 1;
         if !self.fault.qualifies(&kind) {
             return got;
         }
-        if self.rate < 1.0 && !st.rng.random_bool(self.rate) {
+        let rng = st.rng.as_mut().expect("seeded");
+        // An aimed fault's rate is per read (see `run_table`).
+        if !self.fault.aimed() && self.rate < 1.0 && !rng.random_bool(self.rate) {
             return got;
         }
-        let st = &mut *st;
         let out = match (&kind, w) {
             (Kind::Data(i), Want::Range { rel, off, len }) => {
                 let g = &self.geometry.tables[*i];
-                self.data_fault(st, g, rel, *off, *len, got.clone())
+                if self.fault.aimed() {
+                    match &st.aim {
+                        Some(aim) if aim.table == g.table => {
+                            self.aimed(rng, aim, g, rel, *off, *len, &got)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    // `bit_flip`: anywhere in the response.
+                    got.clone().ok().flatten().map(|mut v| {
+                        flip_bit(rng, &mut v);
+                        Ok(Some(v))
+                    })
+                }
             }
-            (Kind::Model(_) | Kind::Page0(_), Want::Range { .. }) => match self.fault {
-                Fault::MissingRange | Fault::HttpError => Some(self.refusal()),
-                _ => got.clone().ok().flatten().map(|mut v| {
-                    flip_bit(&mut st.rng, &mut v);
+            (Kind::Page0(_), Want::Range { .. }) if self.fault == Fault::Page0Missing => {
+                Some(Ok(None))
+            }
+            (Kind::Model(_) | Kind::Page0(_), Want::Range { .. }) => {
+                got.clone().ok().flatten().map(|mut v| {
+                    flip_bit(rng, &mut v);
                     Ok(Some(v))
-                }),
-            },
-            (Kind::Range, Want::Range { .. }) => Some(self.refusal()),
+                })
+            }
             (Kind::Manifest, Want::File { .. }) => match self.fault {
-                Fault::TruncatedFile => truncate(got.clone()),
+                Fault::TruncatedManifest => truncate(&got),
                 _ => got
                     .clone()
                     .ok()
                     .flatten()
                     .and_then(|v| self.manifest_fault(v)),
             },
-            (Kind::Latest | Kind::Blob | Kind::File, Want::File { .. }) => truncate(got.clone()),
+            (Kind::Latest | Kind::Blob, Want::File { .. }) => truncate(&got),
             _ => None,
         };
         match out {
-            Some(g) => {
+            // A re-encode can reproduce the bytes it was given; only a
+            // response that actually changed counts as faulted.
+            Some(g) if g != got => {
                 st.faulted += 1;
+                if self.fault.aimed() {
+                    st.hit = true;
+                }
                 g
             }
-            None => got,
+            _ => got,
         }
     }
 
@@ -440,18 +562,39 @@ impl<D: Driver> FaultDriver<D> {
         }
     }
 
-    fn data_fault(
+    /// An aimed fault on one data range response of the aim's table: only
+    /// a response holding the aimed page is touched, and within it only
+    /// that page (or the whole response, for the faults that are about the
+    /// response: refused, cut short, served from elsewhere).
+    #[allow(clippy::too_many_arguments)]
+    fn aimed(
         &self,
-        st: &mut State,
+        rng: &mut ChaCha8Rng,
+        aim: &Aim,
         g: &TableGeom,
         rel: &str,
         off: u64,
         len: usize,
-        got: Got,
+        got: &Got,
     ) -> Option<Got> {
+        let l = &g.layout;
+        // Byte offset of record `q` in this response, when it holds all of it.
+        let at = |q: u64| -> Option<usize> {
+            let start = l.checked_record_off(q)?;
+            let end = start + l.record_bytes;
+            (start >= off && end <= off + len as u64).then(|| (start - off) as usize)
+        };
         match self.fault {
-            Fault::MissingRange | Fault::HttpError => return Some(self.refusal()),
+            Fault::MissingRange | Fault::HttpError => {
+                at(aim.page)?;
+                return Some(self.refusal());
+            }
+            Fault::TruncatedPage => {
+                at(aim.page)?;
+                return truncate(got);
+            }
             Fault::WrongRunPage => {
+                at(aim.page)?;
                 let partner = self.geometry.by_table(g.table ^ 1)?;
                 let span = partner.layout.page_count * PAGE as u64;
                 let off2 = PAGE as u64 + (off - PAGE as u64) % span;
@@ -463,6 +606,7 @@ impl<D: Driver> FaultDriver<D> {
                 return Some(self.inner.fetch(&[w]).remove(0));
             }
             Fault::WrongRange => {
+                at(aim.page)?;
                 let w = Want::Range {
                     rel: rel.to_string(),
                     off: off + PAGE as u64,
@@ -470,30 +614,45 @@ impl<D: Driver> FaultDriver<D> {
                 };
                 return Some(self.inner.fetch(&[w]).remove(0));
             }
-            Fault::TruncatedPage => return truncate(got),
             _ => {}
         }
-        let mut bytes = got.ok().flatten()?;
-        if self.fault == Fault::BitFlip {
-            flip_bit(&mut st.rng, &mut bytes);
+        let q = if self.fault == Fault::ForgedFence {
+            aim.predicted
+        } else {
+            aim.page
+        };
+        let b = at(q)?;
+        let mut bytes = got.clone().ok().flatten()?;
+        let slot = &mut bytes[b..b + PAGE];
+        if self.fault == Fault::BitFlipPage {
+            flip_bit(rng, slot);
             return Some(Ok(Some(bytes)));
         }
-        let fault = self.fault;
-        let edited = edit_pages(&mut bytes, off, &g.layout, &mut |page| match fault {
-            Fault::NodeOmitted => match pick(page, &st.focus, &mut st.rng, |_| true) {
+        let mut page = Page::decode_with(slot, EntryLayout::Variable, q == l.page_count, q).ok()?;
+        let find = |page: &Page| page.entries.iter().position(|e| e.key == aim.key);
+        let edit = match self.fault {
+            Fault::NodeOmitted => match find(&page) {
                 Some(i) => {
                     page.entries.remove(i);
                     Edit::Reencode
                 }
                 None => Edit::Keep,
             },
-            Fault::PageMalformed => match pick(page, &st.focus, &mut st.rng, |_| true) {
+            Fault::PageMalformed => match find(&page) {
                 Some(i) => {
                     let n = page.entries.len() as u16;
                     page.entries.remove(i);
                     Edit::ReencodeWithCount(n)
                 }
                 None => Edit::Keep,
+            },
+            Fault::StaleValue => match find(&page) {
+                // A value, or a blob's reference; a tombstone has no bytes.
+                Some(i) if !page.entries[i].value.is_empty() => {
+                    stale(&mut page.entries[i].value);
+                    Edit::Reencode
+                }
+                _ => Edit::Keep,
             },
             Fault::ForgedFence => {
                 page.lo = KEY_MIN;
@@ -502,20 +661,14 @@ impl<D: Driver> FaultDriver<D> {
             }
             Fault::FenceGap => {
                 let (Some(first), Some(last)) = (page.entries.first(), page.entries.last()) else {
-                    return Edit::Keep;
+                    return None;
                 };
                 let lo = first.key;
                 let hi = if page.hi == KEY_MAX {
                     KEY_MAX
                 } else {
-                    match succ(last.key) {
-                        Some(h) => h,
-                        None => return Edit::Keep,
-                    }
+                    succ(last.key)?
                 };
-                if lo == page.lo && hi == page.hi {
-                    return Edit::Keep;
-                }
                 page.lo = lo;
                 page.hi = hi;
                 Edit::Reencode
@@ -529,24 +682,9 @@ impl<D: Driver> FaultDriver<D> {
                 }
                 _ => Edit::Keep,
             },
-            Fault::StaleValue => {
-                match pick(page, &st.focus, &mut st.rng, |e| {
-                    e.tag == 0 && !e.value.is_empty()
-                }) {
-                    Some(i) => {
-                        stale(&mut page.entries[i].value);
-                        Edit::Reencode
-                    }
-                    None => Edit::Keep,
-                }
-            }
             Fault::StalePage => {
                 let mut any = false;
-                for e in page
-                    .entries
-                    .iter_mut()
-                    .filter(|e| e.tag == 0 && !e.value.is_empty())
-                {
+                for e in page.entries.iter_mut().filter(|e| !e.value.is_empty()) {
                     stale(&mut e.value);
                     any = true;
                 }
@@ -557,15 +695,24 @@ impl<D: Driver> FaultDriver<D> {
                 }
             }
             _ => Edit::Keep,
-        });
-        (edited > 0).then_some(Ok(Some(bytes)))
+        };
+        let count = match edit {
+            Edit::Keep => return None,
+            Edit::Reencode => None,
+            Edit::ReencodeWithCount(n) => Some(n),
+        };
+        slot.copy_from_slice(&page.encode_with(EntryLayout::Variable));
+        if let Some(n) = count {
+            slot[0..2].copy_from_slice(&n.to_le_bytes());
+        }
+        Some(Ok(Some(bytes)))
     }
 
     /// The manifest with one field forged. `state_root` is what the client
     /// compares to the root it verified; `model_root` is what page 0 must
     /// hash to; `root` is the run file's identity, which nothing checks.
     fn manifest_fault(&self, bytes: Vec<u8>) -> Option<Got> {
-        let mut m: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let mut m: Value = serde_json::from_slice(&bytes).ok()?;
         match self.fault {
             Fault::ManifestStateRoot => forge_hex(m.get_mut("state_root")?),
             Fault::ManifestModelRoot | Fault::ManifestTableRoot => {
@@ -595,72 +742,6 @@ impl<D: Driver> Driver for FaultDriver<D> {
     }
 }
 
-/// Decode every whole data page in a range response, let `f` edit it, and
-/// write the canonical re-encoding back. Pages that do not decode (the
-/// range ran into the model section, or an earlier fault) are left alone.
-/// Returns how many pages changed.
-fn edit_pages(
-    bytes: &mut [u8],
-    off: u64,
-    l: &Layout,
-    f: &mut dyn FnMut(&mut Page) -> Edit,
-) -> usize {
-    if !off.is_multiple_of(PAGE as u64) {
-        return 0;
-    }
-    let mut edited = 0;
-    for i in 0..bytes.len() / PAGE {
-        let page_off = off + (i * PAGE) as u64;
-        if page_off < PAGE as u64 || page_off >= l.model_off {
-            continue;
-        }
-        let page_no = page_off / PAGE as u64;
-        let last = page_no == l.page_count;
-        let slot = &mut bytes[i * PAGE..(i + 1) * PAGE];
-        let Ok(mut page) = Page::decode_with(slot, EntryLayout::Variable, last, page_no) else {
-            continue;
-        };
-        let count = match f(&mut page) {
-            Edit::Keep => continue,
-            Edit::Reencode => None,
-            Edit::ReencodeWithCount(n) => Some(n),
-        };
-        slot.copy_from_slice(&page.encode_with(EntryLayout::Variable));
-        if let Some(n) = count {
-            slot[0..2].copy_from_slice(&n.to_le_bytes());
-        }
-        edited += 1;
-    }
-    edited
-}
-
-/// The entry a page-level fault aims at: the one on the read's path
-/// nearest the leaf when the page holds any, else a random one.
-fn pick(
-    page: &Page,
-    focus: &HashMap<[u8; 32], usize>,
-    rng: &mut ChaCha8Rng,
-    ok: impl Fn(&csl_run::Entry) -> bool,
-) -> Option<usize> {
-    let candidates: Vec<usize> = page
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| ok(e))
-        .map(|(i, _)| i)
-        .collect();
-    if candidates.is_empty() {
-        return None;
-    }
-    candidates
-        .iter()
-        .copied()
-        .filter_map(|i| focus.get(&page.entries[i].key).map(|rank| (*rank, i)))
-        .min()
-        .map(|(_, i)| i)
-        .or_else(|| Some(candidates[rng.random_range(0..candidates.len())]))
-}
-
 /// A value altered in place: same length, one byte in the middle changed.
 fn stale(v: &mut [u8]) {
     let i = v.len() / 2;
@@ -675,8 +756,8 @@ fn flip_bit(rng: &mut ChaCha8Rng, v: &mut [u8]) {
     v[i] ^= 1 << rng.random_range(0..8);
 }
 
-fn truncate(got: Got) -> Option<Got> {
-    let mut v = got.ok().flatten()?;
+fn truncate(got: &Got) -> Option<Got> {
+    let mut v = got.clone().ok().flatten()?;
     v.truncate(v.len() / 2);
     Some(Ok(Some(v)))
 }
@@ -695,360 +776,228 @@ fn succ(mut k: [u8; 32]) -> Option<[u8; 32]> {
 }
 
 /// Change the last hex digit of a JSON hex string in place.
-fn forge_hex(v: &mut serde_json::Value) {
+fn forge_hex(v: &mut Value) {
     if let Some(s) = v.as_str() {
         let mut s = s.to_string();
         let last = s.pop().unwrap_or('0');
         s.push(if last == 'a' { 'b' } else { 'a' });
-        *v = serde_json::Value::String(s);
+        *v = Value::String(s);
     }
 }
 
-/// The reads of one fault row: every shape, drawn once from the slice and
-/// read under every fault.
-enum Probe {
-    /// `Some`: a present account; `None`: absent inside the prefix.
-    Account {
-        hashed: B256,
-        expect: Option<Account>,
-    },
-    /// Outside the covered prefix: `Insufficient` is the only right answer.
-    Outside {
-        hashed: B256,
-    },
-    /// `Some`: a present slot; `None`: absent (the account may have no
-    /// storage at all, see `shape`).
-    Slot {
-        owner: B256,
-        slot: B256,
-        expect: Option<U256>,
-        empty_storage: bool,
-    },
-    Code {
-        hash: B256,
-        bytes: Vec<u8>,
-    },
+// ----------------------------------------------------------------------
+// Routes: what a clean read needs.
+
+/// The bucket's tables read directly from disk, for the clean walks.
+struct Clean {
+    readers: Vec<Option<Reader<File>>>,
+    state_root: B256,
 }
 
-impl Probe {
-    fn shape(&self) -> &'static str {
-        match self {
-            Probe::Account {
-                expect: Some(_), ..
-            } => "account_present",
-            Probe::Account { expect: None, .. } => "account_absent",
-            Probe::Outside { .. } => "account_outside",
-            Probe::Slot {
-                expect: Some(_), ..
-            } => "slot_present",
-            Probe::Slot {
-                empty_storage: true,
-                ..
-            } => "slot_empty_storage",
-            Probe::Slot { .. } => "slot_absent",
-            Probe::Code { .. } => "code",
+impl Clean {
+    fn open(bucket: &Path, m: &Manifest) -> Result<Clean, String> {
+        let mut readers = Vec::new();
+        for t in 0..TABLE_COUNT as u16 {
+            let Some(tr) = m.table(t) else {
+                readers.push(None);
+                continue;
+            };
+            let p = bucket.join(table_path(&m.block_hash, t));
+            let f = File::open(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+            let mut r = Reader::try_with_format(f, tr.run_ref(m.block_number), RUN_FORMAT)
+                .map_err(|e| format!("table {t}: {e}"))?;
+            r.prepare().map_err(|e| format!("table {t}: {e}"))?;
+            readers.push(Some(r));
         }
-    }
-
-    /// Table keys of the nodes this read walks, deepest first.
-    fn focus(&self) -> Vec<[u8; 32]> {
-        fn account_keys(h: &B256) -> Vec<[u8; 32]> {
-            let p = path_of(h);
-            (0..=csl_eth_trie::MAX_DEPTH)
-                .rev()
-                .map(|d| NodeKey::prefix(&p, d).table_key().expect("depth ≤ 62"))
-                .collect()
-        }
-        match self {
-            Probe::Account { hashed, .. } | Probe::Outside { hashed } => account_keys(hashed),
-            Probe::Slot { owner, slot, .. } => {
-                let p = path_of(slot);
-                let mut keys: Vec<[u8; 32]> = (0..=csl_eth_trie::MAX_DEPTH)
-                    .rev()
-                    .map(|d| {
-                        NodeKey::prefix(&p, d)
-                            .storage_table_key(owner)
-                            .expect("depth ≤ 62")
-                    })
-                    .collect();
-                keys.extend(account_keys(owner));
-                keys
-            }
-            Probe::Code { hash, .. } => vec![hash.0],
-        }
-    }
-
-    fn key(&self) -> B256 {
-        match self {
-            Probe::Account { hashed, .. } | Probe::Outside { hashed } => *hashed,
-            Probe::Slot { owner, .. } => *owner,
-            Probe::Code { hash, .. } => *hash,
-        }
-    }
-
-    fn slot(&self) -> Option<B256> {
-        match self {
-            Probe::Slot { slot, .. } => Some(*slot),
-            _ => None,
-        }
-    }
-
-    fn expected(&self) -> String {
-        match self {
-            Probe::Account {
-                expect: Some(a), ..
-            } => format!("{a:?}"),
-            Probe::Account { expect: None, .. } | Probe::Slot { expect: None, .. } => {
-                "absent".into()
-            }
-            Probe::Outside { .. } => "insufficient".into(),
-            Probe::Slot {
-                expect: Some(v), ..
-            } => format!("{v}"),
-            Probe::Code { hash, .. } => format!("code {hash}"),
-        }
-    }
-}
-
-fn prefix_nibbles(s: &str) -> Nibbles {
-    let n: Vec<u8> = s
-        .trim_start_matches("0x")
-        .chars()
-        .map(|c| c.to_digit(16).expect("slice prefix is hex") as u8)
-        .collect();
-    Nibbles::from_nibbles(n)
-}
-
-/// A random key under the slice's prefix.
-fn random_in_prefix(rng: &mut ChaCha8Rng, prefix: &Nibbles) -> B256 {
-    let mut k = [0u8; 32];
-    rng.fill_bytes(&mut k);
-    for (i, n) in prefix.iter().enumerate() {
-        let b = i / 2;
-        k[b] = if i % 2 == 0 {
-            (k[b] & 0x0f) | (n << 4)
-        } else {
-            (k[b] & 0xf0) | n
-        };
-    }
-    B256::from(k)
-}
-
-/// Draw the probes: `n` per shape, strided over the slice so the same
-/// seed and slice give the same table.
-fn probes(s: &Slice, n: usize, seed: u64) -> Vec<Probe> {
-    let n = n.max(1);
-    let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0x9e37_79b9_7f4a_7c15);
-    let prefix = prefix_nibbles(&s.head.prefix);
-    let present = |k: &B256| s.accounts.binary_search_by(|(x, _)| x.cmp(k)).is_ok();
-    let mut out = Vec::new();
-    if s.accounts.is_empty() {
-        return out;
-    }
-    let stride = (s.accounts.len() / n).max(1);
-
-    // Present accounts, then absent keys under the prefix.
-    for (h, a) in s.accounts.iter().step_by(stride).take(n) {
-        out.push(Probe::Account {
-            hashed: *h,
-            expect: Some(*a),
-        });
-    }
-    let mut absent = 0;
-    while absent < n {
-        let k = random_in_prefix(&mut rng, &prefix);
-        if !present(&k) {
-            out.push(Probe::Account {
-                hashed: k,
-                expect: None,
-            });
-            absent += 1;
-        }
-    }
-    // Outside the prefix: the first nibble flipped. None when the slice is
-    // the whole trie.
-    if !prefix.is_empty() {
-        for (h, _) in s.accounts.iter().step_by(stride).take(8) {
-            let mut k = *h;
-            k.0[0] ^= 0x10;
-            if !path_of(&k).starts_with(&prefix) {
-                out.push(Probe::Outside { hashed: k });
-            }
-        }
-    }
-
-    // Storage: the largest tries first (deep walks), then strided owners.
-    let with_storage: Vec<(B256, &Vec<(B256, U256)>)> = s
-        .accounts
-        .iter()
-        .filter_map(|(h, a)| {
-            s.storage
-                .get(&a.storage_root)
-                .filter(|v| !v.is_empty())
-                .map(|v| (*h, v))
+        Ok(Clean {
+            readers,
+            state_root: m.state_root,
         })
-        .collect();
-    if !with_storage.is_empty() {
-        let mut by_size: Vec<usize> = (0..with_storage.len()).collect();
-        by_size.sort_by_key(|&i| {
-            (
-                std::cmp::Reverse(with_storage[i].1.len()),
-                with_storage[i].0,
-            )
-        });
-        let mut slots = Vec::new();
-        let big = (n / 8).max(1);
-        for &i in by_size.iter().take(4) {
-            let (owner, v) = &with_storage[i];
-            for (k, val) in v.iter().step_by((v.len() / big).max(1)).take(big) {
-                slots.push((*owner, *k, *val));
-            }
-        }
-        let sstride = (with_storage.len() / n).max(1);
-        let mut i = 0usize;
-        while slots.len() < n && i <= 4 * n {
-            let (owner, v) = &with_storage[(i * sstride) % with_storage.len()];
-            let (k, val) = v[(i * 7) % v.len()];
-            slots.push((*owner, k, val));
-            i += 1;
-        }
-        for (owner, slot, val) in slots {
-            out.push(Probe::Slot {
-                owner,
-                slot,
-                expect: Some(val),
-                empty_storage: false,
-            });
-        }
-        for (owner, v) in with_storage.iter().step_by(sstride).take(n) {
-            let slot = loop {
-                let mut k = [0u8; 32];
-                rng.fill_bytes(&mut k);
-                let k = B256::from(k);
-                if v.binary_search_by(|(x, _)| x.cmp(&k)).is_err() {
-                    break k;
-                }
-            };
-            out.push(Probe::Slot {
-                owner: *owner,
-                slot,
-                expect: None,
-                empty_storage: false,
-            });
-        }
-    }
-    let empties: Vec<B256> = s
-        .accounts
-        .iter()
-        .filter(|(_, a)| a.storage_root == EMPTY_ROOT_HASH)
-        .map(|(h, _)| *h)
-        .collect();
-    if !empties.is_empty() {
-        let m = (n / 10).max(1);
-        for owner in empties.iter().step_by((empties.len() / m).max(1)).take(m) {
-            let mut k = [0u8; 32];
-            rng.fill_bytes(&mut k);
-            out.push(Probe::Slot {
-                owner: *owner,
-                slot: B256::from(k),
-                expect: None,
-                empty_storage: true,
-            });
-        }
     }
 
-    // Code of the slice's contracts across the size range: inline entries
-    // and blobs both.
-    let mut seen = HashSet::new();
-    let mut codes: Vec<(usize, B256)> = s
-        .accounts
-        .iter()
-        .filter(|(_, a)| a.code_hash != KECCAK_EMPTY && seen.insert(a.code_hash))
-        .filter_map(|(_, a)| s.code.get(&a.code_hash).map(|c| (c.len(), a.code_hash)))
-        .collect();
-    codes.sort();
-    for (_, h) in codes.iter().step_by((codes.len() / n).max(1)).take(n) {
-        out.push(Probe::Code {
-            hash: *h,
-            bytes: s.code[h].clone(),
-        });
+    fn reader(&mut self, t: u16) -> Result<&mut Reader<File>, String> {
+        self.readers[t as usize]
+            .as_mut()
+            .ok_or_else(|| format!("the bucket has no table {t}"))
     }
-    out
-}
 
-/// How one read scored.
-enum Verdict {
-    Correct,
-    Insufficient(Reason),
-    WrongValue(String),
-    FalseAbsent(String),
-    FalsePresent(String),
-    /// An outside-prefix key answered with a value or an absence: the
-    /// trie proved it, so it is not a failure, but the slice cannot score
-    /// it and the control row would not produce it.
-    Unexpected(String),
-}
-
-fn judge<T: PartialEq + fmt::Debug>(r: Read<T>, expect: Option<&T>) -> Verdict {
-    match (r, expect) {
-        (Read::Insufficient(why), _) => Verdict::Insufficient(why),
-        (Read::Verified(v), Some(e)) if v == *e => Verdict::Correct,
-        (Read::Verified(v), Some(_)) => Verdict::WrongValue(format!("{v:?}")),
-        (Read::Verified(v), None) => Verdict::FalsePresent(format!("{v:?}")),
-        (Read::VerifiedAbsent(by), Some(_)) => Verdict::FalseAbsent(format!("{by:?}")),
-        (Read::VerifiedAbsent(_), None) => Verdict::Correct,
+    fn aim(&mut self, table: u16, trie: Trie, depth: usize, key: [u8; 32]) -> Result<Aim, String> {
+        let r = self.reader(table)?;
+        let (page, _, _) = r.locate(&key).map_err(|e| format!("table {table}: {e}"))?;
+        let predicted = r
+            .predict_page(csl_run::k64(&key))
+            .map_err(|e| format!("table {table}: {e}"))?;
+        Ok(Aim {
+            table,
+            trie,
+            depth,
+            key,
+            page,
+            predicted,
+        })
     }
-}
 
-fn read_probe<D: Driver>(snap: &mut Snapshot<D>, baseline: bool, p: &Probe) -> Verdict {
-    match p {
-        Probe::Account { hashed, expect } => {
-            let (r, _) = if baseline {
-                snap.account_by_hash(hashed)
-            } else {
-                snap.account(hashed)
-            };
-            judge(r, expect.as_ref())
-        }
-        Probe::Outside { hashed } => {
-            let (r, _) = if baseline {
-                snap.account_by_hash(hashed)
-            } else {
-                snap.account(hashed)
-            };
-            match r {
-                Read::Insufficient(_) => Verdict::Correct,
-                Read::Verified(a) => Verdict::Unexpected(format!("verified {a:?}")),
-                Read::VerifiedAbsent(by) => Verdict::Unexpected(format!("absent {by:?}")),
-            }
-        }
-        Probe::Slot {
-            owner,
-            slot,
-            expect,
-            ..
-        } => {
-            let (r, _) = if baseline {
-                snap.storage_by_hash(owner, slot)
-            } else {
-                snap.storage(owner, slot)
-            };
-            judge(r, expect.as_ref())
-        }
-        Probe::Code { hash, bytes } => {
-            let (r, _) = snap.code(hash);
-            if let Read::Verified(b) = &r {
-                if keccak256(b) != *hash {
-                    return Verdict::WrongValue(format!(
-                        "{} bytes not hashing to codeHash",
-                        b.len()
-                    ));
+    /// Walk `path` from `root` over `table`, fetching each node by its
+    /// path key until the trie answers or the table lacks one (outside the
+    /// slice). The nodes the walk took, in order, with their bytes, and
+    /// the walk's outcome.
+    #[allow(clippy::type_complexity)]
+    fn walk(
+        &mut self,
+        table: u16,
+        root: B256,
+        path: &Nibbles,
+        key_of: impl Fn(&NodeKey) -> [u8; 32],
+    ) -> Result<(Vec<(NodeKey, Vec<u8>)>, Outcome), String> {
+        let mut nodes: HashMap<NodeKey, Vec<u8>> = HashMap::new();
+        loop {
+            let w = walk(root, path, &nodes);
+            if let Outcome::Missing(nk) = &w.outcome {
+                let r = self.reader(table)?;
+                let (e, _) = r
+                    .get_entry(&key_of(nk))
+                    .map_err(|e| format!("table {table}: {e}"))?;
+                if let Some(e) = e.filter(|e| e.tag == 0) {
+                    nodes.insert(*nk, e.value);
+                    continue;
                 }
             }
-            judge(r, Some(bytes))
+            let held = w
+                .fetched
+                .iter()
+                .filter_map(|nk| nodes.get(nk).map(|v| (*nk, v.clone())))
+                .collect();
+            return Ok((held, w.outcome));
         }
     }
+
+    /// One trie's part of a route: path-keyed in `table`, by hash in 3.
+    fn trie_route(
+        &mut self,
+        route: &mut Route,
+        table: u16,
+        trie: Trie,
+        held: &[(NodeKey, Vec<u8>)],
+        key_of: impl Fn(&NodeKey) -> [u8; 32],
+    ) -> Result<(), String> {
+        for (nk, bytes) in held {
+            route
+                .path
+                .push(self.aim(table, trie, nk.depth(), key_of(nk))?);
+            route.baseline.push(self.aim(
+                TABLE_NODES_BY_HASH,
+                trie,
+                nk.depth(),
+                keccak256(bytes).0,
+            )?);
+        }
+        Ok(())
+    }
+
+    fn route(&mut self, draw: &Draw) -> Result<Route, String> {
+        let mut route = Route::default();
+        let account_key = |nk: &NodeKey| nk.table_key().expect("walk depth ≤ 62");
+        match &draw.target {
+            Target::Code(h) => {
+                let a = self.aim(TABLE_CODE, Trie::Code, 0, h.0)?;
+                route.path.push(a);
+                route.baseline.push(a);
+            }
+            Target::Account(h) | Target::Slot(h, _) => {
+                let root = self.state_root;
+                let (held, outcome) =
+                    self.walk(TABLE_ACCOUNT_NODES, root, &path_of(h), account_key)?;
+                self.trie_route(
+                    &mut route,
+                    TABLE_ACCOUNT_NODES,
+                    Trie::Account,
+                    &held,
+                    account_key,
+                )?;
+                let (Target::Slot(owner, slot), Outcome::Present(v)) = (&draw.target, outcome)
+                else {
+                    return Ok(route);
+                };
+                let account = Account::decode(&v).map_err(|e| format!("account {owner}: {e}"))?;
+                if account.storage_root == EMPTY_ROOT_HASH {
+                    return Ok(route);
+                }
+                let owner = *owner;
+                let storage_key =
+                    move |nk: &NodeKey| nk.storage_table_key(&owner).expect("walk depth ≤ 62");
+                let (held, _) = self.walk(
+                    TABLE_STORAGE_NODES,
+                    account.storage_root,
+                    &path_of(slot),
+                    storage_key,
+                )?;
+                self.trie_route(
+                    &mut route,
+                    TABLE_STORAGE_NODES,
+                    Trie::Storage,
+                    &held,
+                    storage_key,
+                )?;
+            }
+        }
+        Ok(route)
+    }
 }
+
+/// The clean route of every draw, read from the bucket's own files.
+pub fn routes(bucket: &Path, m: &Manifest, plan: &Plan) -> Result<Vec<Route>, String> {
+    let mut clean = Clean::open(bucket, m)?;
+    plan.draws.iter().map(|d| clean.route(d)).collect()
+}
+
+/// Cycles the aim over depths across the plan, per mode.
+#[derive(Default)]
+struct Aimer {
+    account: usize,
+    storage: usize,
+}
+
+impl Aimer {
+    /// The node this read aims at: a slot read with a storage walk aims at
+    /// the storage trie, each depth in turn; any other read at the root,
+    /// the middle or the deepest node of its account walk (or its code
+    /// entry). `forged_fence` needs a node the model does not predict
+    /// exactly, and takes the nearest one on the same walk when the chosen
+    /// depth has none.
+    fn choose(&mut self, nodes: &[Aim], fault: Fault) -> Option<Aim> {
+        let storage: Vec<&Aim> = nodes.iter().filter(|a| a.trie == Trie::Storage).collect();
+        let (pool, i) = if !storage.is_empty() {
+            let c = self.storage;
+            self.storage += 1;
+            let n = storage.len();
+            (storage, c % n)
+        } else {
+            let pool: Vec<&Aim> = nodes.iter().collect();
+            if pool.is_empty() {
+                return None;
+            }
+            let c = self.account;
+            self.account += 1;
+            let n = pool.len();
+            let i = match c % 3 {
+                0 => 0,
+                1 => n / 2,
+                _ => n - 1,
+            };
+            (pool, i)
+        };
+        if fault != Fault::ForgedFence {
+            return Some(*pool[i]);
+        }
+        (0..pool.len())
+            .filter(|j| pool[*j].predicted != pool[*j].page)
+            .min_by_key(|j| j.abs_diff(i))
+            .map(|j| *pool[j])
+    }
+}
+
+// ----------------------------------------------------------------------
+// The table.
 
 /// `Reason` as a short class, page numbers and offsets stripped, so a
 /// fault's row says how it was caught rather than where.
@@ -1115,25 +1064,42 @@ pub struct Counts {
     pub wrong_value: u64,
     pub false_absent: u64,
     pub false_present: u64,
-    pub unexpected: u64,
+    /// A key outside the prefix answered with a value or an absence.
+    pub outside_answered: u64,
+    /// A right answer whose walk the shape model did not predict.
+    pub shape_mismatch: u64,
 }
 
 impl Counts {
-    fn add(&mut self, v: &Verdict) {
+    fn add(&mut self, v: &Verdict, outside: bool, mismatches: u64) {
         self.reads += 1;
+        self.shape_mismatch += mismatches;
         match v {
             Verdict::Correct => self.correct += 1,
+            // Outside the prefix, a missing node is the right answer.
+            Verdict::Insufficient(Reason::Missing { .. }) if outside => self.correct += 1,
             Verdict::Insufficient(_) => self.insufficient += 1,
-            Verdict::WrongValue(_) => self.wrong_value += 1,
+            Verdict::WrongValue(_) | Verdict::Kind => self.wrong_value += 1,
             Verdict::FalseAbsent(_) => self.false_absent += 1,
             Verdict::FalsePresent(_) => self.false_present += 1,
-            Verdict::Unexpected(_) => self.unexpected += 1,
+            Verdict::OutsideAnswered(_) => self.outside_answered += 1,
         }
+    }
+
+    fn merge(&mut self, o: &Counts) {
+        self.reads += o.reads;
+        self.correct += o.correct;
+        self.insufficient += o.insufficient;
+        self.wrong_value += o.wrong_value;
+        self.false_absent += o.false_absent;
+        self.false_present += o.false_present;
+        self.outside_answered += o.outside_answered;
+        self.shape_mismatch += o.shape_mismatch;
     }
 
     /// Reads that fail the design.
     pub fn failures(&self) -> u64 {
-        self.wrong_value + self.false_absent + self.false_present
+        self.wrong_value + self.false_absent + self.false_present + self.outside_answered
     }
 }
 
@@ -1141,11 +1107,38 @@ impl Counts {
 pub struct Failure {
     pub fault: String,
     pub mode: &'static str,
-    pub shape: &'static str,
-    pub key: B256,
-    pub slot: Option<B256>,
+    pub shape: String,
+    pub target: Value,
+    /// The node the read was aimed at, when it was.
+    pub aim: Option<String>,
     pub got: String,
     pub expected: String,
+}
+
+/// One fault under one mode.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ModeRow {
+    /// The open refused: no reads were made.
+    pub open_error: Option<String>,
+    /// Responses the driver saw and responses the fault changed.
+    pub responses: u64,
+    pub faulted: u64,
+    pub total: Counts,
+    /// `Reason` classes seen, with counts: how the fault was caught.
+    pub reasons: BTreeMap<String, u64>,
+    /// Aimed faults: the (table, trie, depth) of each read whose aim
+    /// landed.
+    pub coverage: BTreeMap<String, u64>,
+    /// Aimed faults: reads with no node to aim at, or whose aimed node the
+    /// fault could not reach (see each fault's description).
+    pub untargeted: u64,
+    /// Reads the rate spared.
+    pub spared: u64,
+    /// Insufficient reads by the trie nodes their last walk decoded before
+    /// it stopped: a refusal mid-walk stops below the root.
+    pub caught_after_nodes: BTreeMap<usize, u64>,
+    /// shape → counts.
+    pub shapes: BTreeMap<String, Counts>,
 }
 
 /// One fault's row.
@@ -1153,26 +1146,32 @@ pub struct Failure {
 pub struct Row {
     pub name: String,
     pub description: &'static str,
-    /// The open refused (a manifest fault): no reads were made.
+    pub aimed: bool,
+    /// The first mode's refusal, when the open refused.
     pub open_error: Option<String>,
-    /// Responses the driver saw and responses the fault changed, summed
-    /// over the modes run.
+    /// Summed over the modes run.
     pub responses: u64,
     pub faulted: u64,
+    /// Expected to fire but changed no response: its reads say nothing
+    /// about the fault.
+    pub flagged: bool,
     pub total: Counts,
-    /// `Reason` classes seen, with counts: how the fault was caught.
+    /// Summed over the modes; per mode in `modes`.
     pub reasons: BTreeMap<String, u64>,
-    /// mode → shape → counts.
-    pub modes: BTreeMap<&'static str, BTreeMap<&'static str, Counts>>,
+    pub modes: BTreeMap<&'static str, ModeRow>,
 }
 
 impl Row {
     pub fn pass(&self) -> bool {
-        self.total.failures() == 0
+        self.total.failures() == 0 && self.total.shape_mismatch == 0
+    }
+
+    pub fn mode(&self, mode: &str) -> Option<&ModeRow> {
+        self.modes.get(mode)
     }
 
     pub fn counts(&self, mode: &str, shape: &str) -> Option<&Counts> {
-        self.modes.get(mode)?.get(shape)
+        self.modes.get(mode)?.shapes.get(shape)
     }
 }
 
@@ -1187,13 +1186,18 @@ pub struct Table {
     pub mode: &'static str,
     pub top_levels: usize,
     pub bloom: &'static str,
-    /// Probes per shape.
-    pub shapes: BTreeMap<&'static str, usize>,
-    /// No wrong value, no false absence, no false presence in any row.
+    pub plan: Value,
+    /// Reads per shape.
+    pub shapes: BTreeMap<String, usize>,
+    /// The control row read every key right, and no row has a wrong value,
+    /// a false absence or presence, an answered outside key, or a walk the
+    /// shape model did not predict.
     pub pass: bool,
+    pub control_correct: bool,
+    /// Rows expected to fire that changed no response.
+    pub flagged: Vec<String>,
     pub faults: Vec<Row>,
-    /// Every failing or unexpected read, in full (empty when `pass` and
-    /// nothing was unexpected).
+    /// Every failing read, in full (empty when `pass`).
     pub failures: Vec<Failure>,
 }
 
@@ -1226,35 +1230,66 @@ impl Default for Options {
     }
 }
 
+/// The plan the table reads: the workload's, at `keys` per kind.
+pub fn plan_for(slice: &Slice, keys: usize, seed: u64) -> Result<Plan, String> {
+    let keys = keys.max(1);
+    let sizes = Sizes {
+        accounts: keys,
+        absent: keys,
+        slots: keys,
+        absent_slots: keys,
+        outside: (keys / 4).max(1),
+        d_account: csl_eth_store::D_ACCOUNT,
+        d_storage: csl_eth_store::D_STORAGE,
+    };
+    workload::plan(slice, &sizes, seed)
+}
+
 /// The table: every fault in `o.faults` applied to `bucket`'s responses,
-/// the probes drawn from `slice` read under each, scored. Each fault and
-/// mode gets its own snapshot over its own driver, so nothing one fault
-/// verified (a kept model page, a cached top level) serves the next.
+/// the workload's plan drawn from `slice` read under each, scored.
 pub fn run_table(slice: &Slice, bucket: &Path, o: &Options) -> Result<Table, String> {
+    let plan = plan_for(slice, o.keys, o.seed)?;
+    run_table_plan(slice, bucket, &plan, o)
+}
+
+/// As [`run_table`], over a given plan. Each fault and mode gets its own
+/// snapshot over its own driver, so nothing one fault verified (a kept
+/// model page, a cached top level) serves the next.
+pub fn run_table_plan(
+    slice: &Slice,
+    bucket: &Path,
+    plan: &Plan,
+    o: &Options,
+) -> Result<Table, String> {
     let clean = Snapshot::open(DirDriver::new(bucket), None, slice.head.state_root)?;
     let geometry = Geometry::of(clean.manifest())?;
+    let routes = routes(bucket, clean.manifest(), plan)?;
     drop(clean);
-    let probes = probes(slice, o.keys, o.seed);
-    let mut shapes: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for p in &probes {
-        *shapes.entry(p.shape()).or_default() += 1;
+    let mut shapes: BTreeMap<String, usize> = BTreeMap::new();
+    for d in &plan.draws {
+        *shapes.entry(shape(d).to_string()).or_default() += 1;
     }
+    // The control row always runs, first.
+    let mut faults = vec![Fault::None];
+    faults.extend(o.faults.iter().copied().filter(|f| *f != Fault::None));
     let mut rows = Vec::new();
     let mut failures = Vec::new();
-    for (fi, fault) in o.faults.iter().copied().enumerate() {
+    for fault in faults {
         let mut row = Row {
             name: fault.name().to_string(),
             description: fault.describe(),
+            aimed: fault.aimed(),
             open_error: None,
             responses: 0,
             faulted: 0,
+            flagged: false,
             total: Counts::default(),
             reasons: BTreeMap::new(),
             modes: BTreeMap::new(),
         };
-        for (mi, baseline) in o.mode.each().into_iter().enumerate() {
-            let mode = if baseline { "baseline" } else { "path" };
-            let seed = o.seed ^ ((fi as u64 + 1) << 32) ^ ((mi as u64 + 1) << 48);
+        for baseline in o.mode.each() {
+            let mode = workload::mode_label(baseline);
+            let seed = fault.seed(o.seed, mode);
             let driver = FaultDriver::new(
                 DirDriver::new(bucket),
                 fault,
@@ -1262,52 +1297,51 @@ pub fn run_table(slice: &Slice, bucket: &Path, o: &Options) -> Result<Table, Str
                 geometry.clone(),
                 seed,
             );
-            let mut snap = match Snapshot::open(driver, None, slice.head.state_root) {
-                Ok(s) => s,
+            let handle = driver.handle();
+            let mut mr = ModeRow::default();
+            match Snapshot::open(driver, None, slice.head.state_root) {
+                Ok(mut snap) => {
+                    snap.hint = Hint::symmetric(1);
+                    snap.top_levels = o.top_levels;
+                    read_all(
+                        &mut snap,
+                        &handle,
+                        fault,
+                        o,
+                        plan,
+                        &routes,
+                        slice,
+                        baseline,
+                        &mut mr,
+                        &mut failures,
+                    );
+                }
                 Err(e) => {
-                    row.open_error = Some(e);
-                    continue;
-                }
-            };
-            snap.hint = Hint::symmetric(1);
-            snap.top_levels = o.top_levels;
-            let per_shape = row.modes.entry(mode).or_default();
-            for p in &probes {
-                if baseline && matches!(p, Probe::Code { .. }) {
-                    continue;
-                }
-                snap.driver().set_focus(&p.focus());
-                let v = read_probe(&mut snap, baseline, p);
-                per_shape.entry(p.shape()).or_default().add(&v);
-                row.total.add(&v);
-                match &v {
-                    Verdict::Insufficient(r) if !matches!(p, Probe::Outside { .. }) => {
-                        *row.reasons.entry(reason_key(r)).or_default() += 1;
-                    }
-                    Verdict::WrongValue(g)
-                    | Verdict::FalseAbsent(g)
-                    | Verdict::FalsePresent(g)
-                    | Verdict::Unexpected(g) => {
-                        failures.push(Failure {
-                            fault: fault.name().to_string(),
-                            mode,
-                            shape: p.shape(),
-                            key: p.key(),
-                            slot: p.slot(),
-                            got: g.clone(),
-                            expected: p.expected(),
-                        });
-                    }
-                    _ => {}
+                    row.open_error.get_or_insert(e.clone());
+                    mr.open_error = Some(e);
                 }
             }
-            let (responses, faulted) = snap.driver().stats();
-            row.responses += responses;
-            row.faulted += faulted;
+            (mr.responses, mr.faulted) = handle.stats();
+            row.responses += mr.responses;
+            row.faulted += mr.faulted;
+            row.total.merge(&mr.total);
+            for (k, n) in &mr.reasons {
+                *row.reasons.entry(k.clone()).or_default() += n;
+            }
+            row.modes.insert(mode, mr);
         }
+        row.flagged = fault.fires() && row.faulted == 0;
         rows.push(row);
     }
-    let pass = rows.iter().all(Row::pass);
+    let control_correct = rows.first().is_some_and(|r| {
+        r.open_error.is_none() && r.total.reads > 0 && r.total.correct == r.total.reads
+    });
+    let pass = control_correct && rows.iter().all(Row::pass);
+    let flagged = rows
+        .iter()
+        .filter(|r| r.flagged)
+        .map(|r| r.name.clone())
+        .collect();
     Ok(Table {
         block_number: slice.head.block_number,
         state_root: slice.head.state_root,
@@ -1318,14 +1352,103 @@ pub fn run_table(slice: &Slice, bucket: &Path, o: &Options) -> Result<Table, Str
         mode: o.mode.name(),
         top_levels: o.top_levels,
         bloom: "this format has no Bloom filter (pages route by chained fences and the learned model); nothing to zero",
+        plan: plan.meta.clone(),
         shapes,
         pass,
+        control_correct,
+        flagged,
         faults: rows,
         failures,
     })
 }
 
-pub fn run(args: Args) -> Result<serde_json::Value, String> {
+/// A draw's shape for the table: its first series (the read's kind).
+fn shape(d: &Draw) -> &str {
+    d.series.first().map_or("unknown", String::as_str)
+}
+
+/// Every draw of the plan through one faulted snapshot, aimed and scored.
+#[allow(clippy::too_many_arguments)]
+fn read_all<D: Driver>(
+    snap: &mut Snapshot<D>,
+    handle: &Handle,
+    fault: Fault,
+    o: &Options,
+    plan: &Plan,
+    routes: &[Route],
+    slice: &Slice,
+    baseline: bool,
+    mr: &mut ModeRow,
+    failures: &mut Vec<Failure>,
+) {
+    let mode = workload::mode_label(baseline);
+    let mut aimer = Aimer::default();
+    let mut rng = ChaCha8Rng::seed_from_u64(fault.seed(o.seed, mode) ^ 0x5eed);
+    for (draw, route) in plan.draws.iter().zip(routes) {
+        // The baseline changes only the trie walks; code is the same read.
+        if baseline && matches!(draw.target, Target::Code(_)) {
+            continue;
+        }
+        let mut aim = None;
+        if fault.aimed() {
+            let nodes = if baseline {
+                &route.baseline
+            } else {
+                &route.path
+            };
+            aim = aimer.choose(nodes, fault);
+            if o.rate < 1.0 && !rng.random_bool(o.rate) {
+                aim = None;
+                mr.spared += 1;
+            } else if aim.is_none() {
+                mr.untargeted += 1;
+            }
+        }
+        handle.set_aim(aim);
+        let (answer, cost) = workload::read_draw(snap, baseline, draw);
+        if let Some(a) = &aim {
+            if handle.take_hit() {
+                *mr.coverage.entry(a.label()).or_default() += 1;
+            } else {
+                mr.untargeted += 1;
+            }
+        }
+        let v = workload::score(draw, slice, &answer);
+        let outside = matches!(draw.expect, Expect::Insufficient);
+        let mismatches = if v == Verdict::Correct {
+            workload::shape_mismatches(draw, &answer, &cost).len() as u64
+        } else {
+            0
+        };
+        mr.total.add(&v, outside, mismatches);
+        mr.shapes
+            .entry(shape(draw).to_string())
+            .or_default()
+            .add(&v, outside, mismatches);
+        match &v {
+            Verdict::Insufficient(r) if !(outside && matches!(r, Reason::Missing { .. })) => {
+                *mr.reasons.entry(reason_key(r)).or_default() += 1;
+                *mr.caught_after_nodes.entry(cost.nodes).or_default() += 1;
+            }
+            Verdict::Correct | Verdict::Insufficient(_) if mismatches == 0 => {}
+            _ => failures.push(Failure {
+                fault: fault.name().to_string(),
+                mode,
+                shape: shape(draw).to_string(),
+                target: workload::target_json(&draw.target),
+                aim: aim.map(|a| a.label()),
+                got: if v == Verdict::Correct {
+                    "right answer, walk not as the shape model predicts".into()
+                } else {
+                    format!("{v:?}")
+                },
+                expected: format!("{:?}", draw.expect),
+            }),
+        }
+    }
+}
+
+pub fn run(args: Args) -> Result<Value, String> {
     let slice = Slice::read(&args.slice).map_err(|e| format!("slice: {e}"))?;
     let faults = if args.faults.is_empty() {
         Fault::ALL.to_vec()
@@ -1350,31 +1473,52 @@ pub fn run(args: Args) -> Result<serde_json::Value, String> {
     };
     let t = std::time::Instant::now();
     let table = run_table(&slice, &args.bucket, &o)?;
-    let json = serde_json::to_string_pretty(&table).map_err(|e| e.to_string())?;
-    std::fs::write(&args.out, json).map_err(|e| format!("{}: {e}", args.out.display()))?;
-    let summary: Vec<serde_json::Value> = table
+    let text = serde_json::to_string_pretty(&table).map_err(|e| e.to_string())?;
+    std::fs::write(&args.out, text).map_err(|e| format!("{}: {e}", args.out.display()))?;
+    let summary: Vec<Value> = table
         .faults
         .iter()
         .map(|r| {
-            serde_json::json!({
-                "fault": r.name,
-                "open_error": r.open_error,
-                "faulted": r.faulted,
-                "reads": r.total.reads,
-                "correct": r.total.correct,
-                "insufficient": r.total.insufficient,
-                "failures": r.total.failures(),
-                "unexpected": r.total.unexpected,
-                "reasons": r.reasons,
-            })
+            let modes: BTreeMap<&str, Value> = r
+                .modes
+                .iter()
+                .map(|(m, mr)| {
+                    (
+                        *m,
+                        json!({
+                            "open_error": mr.open_error,
+                            "faulted": mr.faulted,
+                            "reads": mr.total.reads,
+                            "correct": mr.total.correct,
+                            "insufficient": mr.total.insufficient,
+                            "failures": mr.total.failures(),
+                            "untargeted": mr.untargeted,
+                            "coverage": mr.coverage,
+                            "reasons": mr.reasons,
+                        }),
+                    )
+                })
+                .collect();
+            json!({"fault": r.name, "flagged": r.flagged, "modes": modes})
         })
         .collect();
-    Ok(serde_json::json!({
+    let out = json!({
         "out": args.out,
         "pass": table.pass,
+        "control_correct": table.control_correct,
+        "flagged": table.flagged,
         "shapes": table.shapes,
         "wall_ms": t.elapsed().as_millis() as u64,
         "faults": summary,
         "failures": table.failures.len(),
-    }))
+    });
+    if !table.pass {
+        return Err(format!(
+            "fault table failed (control row all correct: {}, {} failing reads); report at {}",
+            table.control_correct,
+            table.failures.len(),
+            args.out.display()
+        ));
+    }
+    Ok(out)
 }

@@ -14,13 +14,19 @@
 //! mismatch rather than an empty slot, a path through an extension, a slot
 //! of an account with no storage) and lets the run check the client's
 //! answer against an independent model: the `AbsentBy` it reports and the
-//! `nodes` it decoded must be the predicted ones. A disagreement is
-//! reported (`shape_mismatch`); it is not a failure of the design, but it
-//! would mean one of the two is wrong about the trie.
+//! `nodes` it decoded must be the predicted ones. A disagreement
+//! (`shape_mismatch`) fails the run: the answer may still be right, but one
+//! of the two is wrong about the trie, and an account wrongly proven absent
+//! during an absent-slot read would show only here (both say "absent").
 //!
 //! Pass or fail follows the spec's rows: a false absence or a wrong value
-//! fails outright; on a remote host, the warmed account read must stay
-//! within 50 KB and two dependent rounds at the 95th percentile.
+//! fails outright; on a remote host, the warmed account read (present and
+//! absent) must stay within 50 KB and two dependent rounds at the 95th
+//! percentile.
+//!
+//! The scorer ([`score`]) and the read itself ([`read_draw`]) are shared
+//! with the fault table, which reads a small plan of the same shapes
+//! through a lying host.
 
 use crate::Slice;
 use alloy_primitives::{keccak256, B256, U256};
@@ -48,6 +54,34 @@ pub enum Mode {
     /// The content-addressed baseline (profile §9).
     Baseline,
     Both,
+}
+
+impl Mode {
+    /// The modes to run, as "is the baseline".
+    pub(crate) fn each(self) -> Vec<bool> {
+        match self {
+            Mode::Path => vec![false],
+            Mode::Baseline => vec![true],
+            Mode::Both => vec![false, true],
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Mode::Path => "path",
+            Mode::Baseline => "baseline",
+            Mode::Both => "both",
+        }
+    }
+}
+
+/// A mode's label in reports.
+pub(crate) fn mode_label(baseline: bool) -> &'static str {
+    if baseline {
+        "baseline"
+    } else {
+        "path"
+    }
 }
 
 #[derive(ClapArgs, Debug)]
@@ -496,7 +530,7 @@ pub struct Plan {
     pub meta: Value,
 }
 
-fn parse_prefix(s: &str) -> Result<Nibbles, String> {
+pub(crate) fn parse_prefix(s: &str) -> Result<Nibbles, String> {
     let s = s.trim_start_matches("0x");
     if s.len() > 62 {
         return Err("prefix must be at most 62 hex nibbles".into());
@@ -1029,8 +1063,15 @@ pub struct Scored {
 }
 
 impl Scored {
+    /// A wrong answer, an unexpected outcome, or a walk the shape model
+    /// did not predict.
     pub fn failed(&self) -> bool {
-        self.wrong_values + self.false_absent + self.false_present + self.unexpected > 0
+        self.wrong_values
+            + self.false_absent
+            + self.false_present
+            + self.unexpected
+            + self.shape_mismatch
+            > 0
     }
 
     /// The p95 of a series' column, for the budget rule.
@@ -1070,7 +1111,7 @@ impl Scored {
 }
 
 /// What a read answered, with the type erased for scoring.
-enum Answer {
+pub(crate) enum Answer {
     Account(Account),
     Slot(U256),
     Code(Vec<u8>),
@@ -1078,12 +1119,143 @@ enum Answer {
     Insufficient(Reason),
 }
 
-fn target_json(t: &Target) -> Value {
+pub(crate) fn target_json(t: &Target) -> Value {
     match t {
         Target::Account(h) => json!({"account": h}),
         Target::Slot(h, k) => json!({"account": h, "slot": k}),
         Target::Code(h) => json!({"code": h}),
     }
+}
+
+fn erase<T>(r: Read<T>, f: impl FnOnce(T) -> Answer) -> Answer {
+    match r {
+        Read::Verified(v) => f(v),
+        Read::VerifiedAbsent(b) => Answer::Absent(b),
+        Read::Insufficient(r) => Answer::Insufficient(r),
+    }
+}
+
+/// One draw through `snap`: the baseline's methods when `baseline` (code
+/// has one method; the baseline changes only the trie walks).
+pub(crate) fn read_draw<D: Driver>(
+    snap: &mut Snapshot<D>,
+    baseline: bool,
+    draw: &Draw,
+) -> (Answer, Cost) {
+    match &draw.target {
+        Target::Account(h) => {
+            let (r, c) = if baseline {
+                snap.account_by_hash(h)
+            } else {
+                snap.account(h)
+            };
+            (erase(r, Answer::Account), c)
+        }
+        Target::Slot(h, k) => {
+            let (r, c) = if baseline {
+                snap.storage_by_hash(h, k)
+            } else {
+                snap.storage(h, k)
+            };
+            (erase(r, Answer::Slot), c)
+        }
+        Target::Code(h) => {
+            let (r, c) = snap.code(h);
+            (erase(r, Answer::Code), c)
+        }
+    }
+}
+
+/// How one answer scores against the slice. `Insufficient` is returned
+/// as is: the workload accepts it only for an outside key with a missing
+/// node, the fault table for any key (it is how a fault is caught).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    Correct,
+    Insufficient(Reason),
+    WrongValue(String),
+    /// A present key proven absent.
+    FalseAbsent(String),
+    /// An absent key answered with a value.
+    FalsePresent(String),
+    /// A key outside the prefix answered with a value or an absence: the
+    /// slice cannot prove either, and on mainnet every slot of the root is
+    /// full, so only a bug produces one.
+    OutsideAnswered(String),
+    /// A value of another kind than the target's (the client's methods
+    /// cannot do this).
+    Kind,
+}
+
+pub(crate) fn score(draw: &Draw, s: &Slice, answer: &Answer) -> Verdict {
+    match (&draw.expect, answer) {
+        (_, Answer::Insufficient(r)) => Verdict::Insufficient(r.clone()),
+        (Expect::Account(want), Answer::Account(got)) => {
+            if got == want {
+                Verdict::Correct
+            } else {
+                Verdict::WrongValue(format!("{got:?}"))
+            }
+        }
+        (Expect::Slot(want), Answer::Slot(got)) => {
+            if got == want {
+                Verdict::Correct
+            } else {
+                Verdict::WrongValue(format!("{got}"))
+            }
+        }
+        (Expect::Code(len), Answer::Code(got)) => {
+            let Target::Code(h) = &draw.target else {
+                return Verdict::Kind;
+            };
+            if got.len() == *len && keccak256(got) == *h && s.code.get(h) == Some(got) {
+                Verdict::Correct
+            } else {
+                Verdict::WrongValue(format!("{} bytes", got.len()))
+            }
+        }
+        (Expect::Account(_) | Expect::Slot(_) | Expect::Code(_), Answer::Absent(by)) => {
+            Verdict::FalseAbsent(format!("{by:?}"))
+        }
+        // The kind of absence is the shape model's business (see
+        // `shape_mismatches`); the answer is right.
+        (Expect::Absent(_), Answer::Absent(_)) => Verdict::Correct,
+        (Expect::Absent(_), Answer::Account(_) | Answer::Slot(_) | Answer::Code(_)) => {
+            Verdict::FalsePresent("a value".into())
+        }
+        (Expect::Insufficient, Answer::Absent(by)) => {
+            Verdict::OutsideAnswered(format!("absent {by:?}"))
+        }
+        (Expect::Insufficient, _) => Verdict::OutsideAnswered("a value".into()),
+        _ => Verdict::Kind,
+    }
+}
+
+/// Where a right answer's walk disagrees with the shape model: the kind of
+/// absence, or the nodes decoded. Code reads walk nothing; outside keys
+/// stop at the first missing node, which the model does not predict.
+pub(crate) fn shape_mismatches(draw: &Draw, answer: &Answer, cost: &Cost) -> Vec<Value> {
+    let mut out = Vec::new();
+    if let (Expect::Absent(want), Answer::Absent(got)) = (&draw.expect, answer) {
+        if got != want {
+            out.push(json!({
+                "what": "absent_by",
+                "target": target_json(&draw.target),
+                "predicted": format!("{want:?}"),
+                "got": format!("{got:?}"),
+            }));
+        }
+    }
+    let predicted = !matches!(draw.expect, Expect::Code(_) | Expect::Insufficient);
+    if predicted && cost.nodes != draw.nodes {
+        out.push(json!({
+            "what": "nodes",
+            "target": target_json(&draw.target),
+            "predicted": draw.nodes,
+            "got": cost.nodes,
+        }));
+    }
+    out
 }
 
 /// Run every draw through `snap` (the baseline's methods when `baseline`)
@@ -1095,49 +1267,13 @@ pub fn run_mode<D: Driver>(
     baseline: bool,
 ) -> Scored {
     let mut out = Scored {
-        mode: if baseline { "baseline" } else { "path" },
+        mode: mode_label(baseline),
         ..Scored::default()
     };
     let t_all = Instant::now();
     for draw in &plan.draws {
         let t = Instant::now();
-        let (answer, cost) = match &draw.target {
-            Target::Account(h) => {
-                let (r, c) = if baseline {
-                    snap.account_by_hash(h)
-                } else {
-                    snap.account(h)
-                };
-                let a = match r {
-                    Read::Verified(a) => Answer::Account(a),
-                    Read::VerifiedAbsent(b) => Answer::Absent(b),
-                    Read::Insufficient(r) => Answer::Insufficient(r),
-                };
-                (a, c)
-            }
-            Target::Slot(h, k) => {
-                let (r, c) = if baseline {
-                    snap.storage_by_hash(h, k)
-                } else {
-                    snap.storage(h, k)
-                };
-                let a = match r {
-                    Read::Verified(v) => Answer::Slot(v),
-                    Read::VerifiedAbsent(b) => Answer::Absent(b),
-                    Read::Insufficient(r) => Answer::Insufficient(r),
-                };
-                (a, c)
-            }
-            Target::Code(h) => {
-                let (r, c) = snap.code(h);
-                let a = match r {
-                    Read::Verified(v) => Answer::Code(v),
-                    Read::VerifiedAbsent(b) => Answer::Absent(b),
-                    Read::Insufficient(r) => Answer::Insufficient(r),
-                };
-                (a, c)
-            }
-        };
+        let (answer, cost) = read_draw(snap, baseline, draw);
         let wall = t.elapsed();
         out.reads += 1;
         let fail = |out: &mut Scored, what: &str, got: String| {
@@ -1150,75 +1286,39 @@ pub fn run_mode<D: Driver>(
                 }));
             }
         };
-        let ok = match (&draw.expect, &answer) {
-            (Expect::Account(want), Answer::Account(got)) => {
-                if got == want {
-                    true
-                } else {
-                    out.wrong_values += 1;
-                    fail(&mut out, "wrong_value", format!("{got:?}"));
-                    false
-                }
-            }
-            (Expect::Slot(want), Answer::Slot(got)) => {
-                if got == want {
-                    true
-                } else {
-                    out.wrong_values += 1;
-                    fail(&mut out, "wrong_value", format!("{got}"));
-                    false
-                }
-            }
-            (Expect::Code(len), Answer::Code(got)) => {
-                let Target::Code(h) = &draw.target else {
-                    unreachable!()
-                };
-                if got.len() == *len && keccak256(got) == *h && s.code.get(h) == Some(got) {
-                    true
-                } else {
-                    out.wrong_values += 1;
-                    fail(&mut out, "wrong_value", format!("{} bytes", got.len()));
-                    false
-                }
-            }
-            (Expect::Account(_) | Expect::Slot(_) | Expect::Code(_), Answer::Absent(by)) => {
-                out.false_absent += 1;
-                fail(&mut out, "false_absent", format!("{by:?}"));
-                false
-            }
-            (Expect::Absent(want), Answer::Absent(got)) => {
-                if got != want {
-                    out.shape_mismatch += 1;
-                    if out.mismatches.len() < 20 {
-                        out.mismatches.push(json!({
-                            "what": "absent_by",
-                            "target": target_json(&draw.target),
-                            "predicted": format!("{want:?}"),
-                            "got": format!("{got:?}"),
-                        }));
-                    }
-                }
+        let ok = match score(draw, s, &answer) {
+            Verdict::Correct => true,
+            Verdict::Insufficient(Reason::Missing { .. })
+                if matches!(draw.expect, Expect::Insufficient) =>
+            {
                 true
             }
-            (Expect::Absent(_), Answer::Account(_) | Answer::Slot(_) | Answer::Code(_)) => {
-                out.false_present += 1;
-                fail(&mut out, "false_present", "a value".into());
-                false
-            }
-            (Expect::Insufficient, Answer::Insufficient(Reason::Missing { .. })) => true,
-            (_, Answer::Insufficient(r)) => {
+            Verdict::Insufficient(r) => {
                 out.unexpected += 1;
                 fail(&mut out, "insufficient", r.to_string());
                 false
             }
-            (Expect::Insufficient, _) => {
-                out.unexpected += 1;
-                fail(&mut out, "outside_answered", "a value or an absence".into());
+            Verdict::WrongValue(g) => {
+                out.wrong_values += 1;
+                fail(&mut out, "wrong_value", g);
                 false
             }
-            // A value of another kind than the target's: the client's
-            // methods cannot do this.
-            _ => {
+            Verdict::FalseAbsent(g) => {
+                out.false_absent += 1;
+                fail(&mut out, "false_absent", g);
+                false
+            }
+            Verdict::FalsePresent(g) => {
+                out.false_present += 1;
+                fail(&mut out, "false_present", g);
+                false
+            }
+            Verdict::OutsideAnswered(g) => {
+                out.unexpected += 1;
+                fail(&mut out, "outside_answered", g);
+                false
+            }
+            Verdict::Kind => {
                 out.unexpected += 1;
                 fail(&mut out, "kind", "a value of another kind".into());
                 false
@@ -1228,18 +1328,10 @@ pub fn run_mode<D: Driver>(
             continue;
         }
         out.ok += 1;
-        // Code reads walk nothing; outside keys stop at the first missing
-        // node, which the model does not predict.
-        let predicted = !matches!(draw.expect, Expect::Code(_) | Expect::Insufficient);
-        if predicted && cost.nodes != draw.nodes {
+        for m in shape_mismatches(draw, &answer, &cost) {
             out.shape_mismatch += 1;
             if out.mismatches.len() < 20 {
-                out.mismatches.push(json!({
-                    "what": "nodes",
-                    "target": target_json(&draw.target),
-                    "predicted": draw.nodes,
-                    "got": cost.nodes,
-                }));
+                out.mismatches.push(m);
             }
         }
         for name in &draw.series {
@@ -1483,6 +1575,54 @@ fn tune<D: Driver>(snap: &mut Snapshot<D>, t: &Tuning) {
 pub const BUDGET_BYTES: u64 = 50 * 1024;
 pub const BUDGET_ROUNDS: u64 = 2;
 
+/// The budget row over the path-keyed read's account series, present and
+/// absent (a wallet asks for both, and an absence walks the same pages).
+/// Judged only on a remote host, where it pushes onto `failed`; a run of
+/// the baseline alone says so instead of reporting nothing.
+fn budget(scored: &[Scored], remote: bool, failed: &mut Vec<String>) -> Value {
+    let rule = format!(
+        "path-keyed {ACCOUNT_PRESENT} and {ACCOUNT_ABSENT} p95: bytes <= {BUDGET_BYTES}, rounds <= {BUDGET_ROUNDS}"
+    );
+    let Some(sc) = scored.iter().find(|sc| sc.mode == "path") else {
+        return json!({
+            "rule": rule,
+            "applies": remote,
+            "judged": false,
+            "note": "not judged: the budget applies to the path-keyed read, and only the baseline was run",
+        });
+    };
+    let mut series = serde_json::Map::new();
+    let mut within = true;
+    for name in [ACCOUNT_PRESENT, ACCOUNT_ABSENT] {
+        let bytes = sc.p95(name, "bytes");
+        let rounds = sc.p95(name, "rounds");
+        let ok =
+            bytes.is_some_and(|b| b <= BUDGET_BYTES) && rounds.is_some_and(|r| r <= BUDGET_ROUNDS);
+        if remote && !ok {
+            failed.push(format!(
+                "warmed {name} read on the remote host: p95 {} bytes, {} rounds (budget {BUDGET_BYTES} bytes, {BUDGET_ROUNDS} rounds)",
+                bytes.map_or("-".into(), |b| b.to_string()),
+                rounds.map_or("-".into(), |r| r.to_string())
+            ));
+        }
+        within &= ok;
+        series.insert(
+            name.into(),
+            json!({"n": sc.count(name), "bytes_p95": bytes, "rounds_p95": rounds, "within": ok}),
+        );
+    }
+    json!({
+        "rule": rule,
+        "applies": remote,
+        "judged": remote,
+        // The present series at the top level, as earlier reports had it.
+        "bytes_p95": sc.p95(ACCOUNT_PRESENT, "bytes"),
+        "rounds_p95": sc.p95(ACCOUNT_PRESENT, "rounds"),
+        "within": within,
+        "series": series,
+    })
+}
+
 pub fn run(args: Args) -> Result<Value, String> {
     let s = Slice::read(&args.slice).map_err(|e| e.to_string())?;
     let prefix = parse_prefix(&s.head.prefix)?;
@@ -1510,18 +1650,14 @@ pub fn run(args: Args) -> Result<Value, String> {
         plan.meta["drawn"]
     );
 
-    let modes: Vec<bool> = match args.mode {
-        Mode::Path => vec![false],
-        Mode::Baseline => vec![true],
-        Mode::Both => vec![false, true],
-    };
+    let modes = args.mode.each();
     let remote = args.url.is_some();
     let mut scored: Vec<Scored> = Vec::new();
     let mut http: Vec<Value> = Vec::new();
     let mut head: Option<Value> = None;
     let mut oracle_out = Value::Null;
     for baseline in modes {
-        let label = if baseline { "baseline" } else { "path" };
+        let label = mode_label(baseline);
         eprintln!("workload: {label} mode");
         let (sc, h, http_totals, o) = match (&args.bucket, &args.url) {
             (Some(dir), None) => {
@@ -1577,30 +1713,12 @@ pub fn run(args: Args) -> Result<Value, String> {
     for sc in &scored {
         if sc.failed() {
             failed.push(format!(
-                "{}: wrong_values {} false_absent {} false_present {} unexpected {}",
-                sc.mode, sc.wrong_values, sc.false_absent, sc.false_present, sc.unexpected
+                "{}: wrong_values {} false_absent {} false_present {} unexpected {} shape_mismatch {}",
+                sc.mode, sc.wrong_values, sc.false_absent, sc.false_present, sc.unexpected, sc.shape_mismatch
             ));
         }
     }
-    let budget = scored.iter().find(|sc| sc.mode == "path").map(|sc| {
-        let bytes = sc.p95(ACCOUNT_PRESENT, "bytes");
-        let rounds = sc.p95(ACCOUNT_PRESENT, "rounds");
-        let ok = bytes.is_some_and(|b| b <= BUDGET_BYTES) && rounds.is_some_and(|r| r <= BUDGET_ROUNDS);
-        if remote && !ok {
-            failed.push(format!(
-                "warmed account read on the remote host: p95 {} bytes, {} rounds (budget {BUDGET_BYTES} bytes, {BUDGET_ROUNDS} rounds)",
-                bytes.map_or("-".into(), |b| b.to_string()),
-                rounds.map_or("-".into(), |r| r.to_string())
-            ));
-        }
-        json!({
-            "rule": format!("path-keyed account_present p95: bytes <= {BUDGET_BYTES}, rounds <= {BUDGET_ROUNDS}"),
-            "applies": remote,
-            "bytes_p95": bytes,
-            "rounds_p95": rounds,
-            "within": ok,
-        })
-    });
+    let budget = budget(&scored, remote, &mut failed);
     let pass = failed.is_empty();
 
     let report = json!({

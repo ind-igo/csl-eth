@@ -1,157 +1,65 @@
-//! The fault table over a synthetic bucket: every named fault applied to
-//! the responses, every shape read under it through both clients, and the
-//! table passes (no wrong value, no false absence) with each fault caught
-//! the way its row says.
+//! The fault table over synthetic buckets: every named fault applied to
+//! the responses, the workload's shapes read under it through both
+//! clients, and the table passes (no wrong value, no false absence) with
+//! each aimed fault caught in the table and trie it was aimed at.
 
-use alloy_primitives::{keccak256, B256, U256};
-use alloy_trie::{HashBuilder, KECCAK_EMPTY};
-use csl_eth_snap::faults::{run_table, Fault, Mode, Options};
-use csl_eth_snap::{Slice, SliceHead};
-use csl_eth_store::{produce, AccountLeaf, Head};
-use csl_eth_trie::{encode_word, path_of, Account};
-use rand::{Rng, RngCore, SeedableRng};
-use rand_chacha::ChaCha8Rng;
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::PathBuf,
-};
+mod common;
 
-fn storage_root(slots: &[(B256, U256)]) -> B256 {
-    let mut hb = HashBuilder::default();
-    for (k, v) in slots {
-        hb.add_leaf(path_of(k), &encode_word(v));
-    }
-    hb.root()
-}
+use csl_eth_snap::faults::{run_table, Fault, Mode, Options, Row, Table};
 
-fn state_root(accounts: &[AccountLeaf]) -> B256 {
-    let mut hb = HashBuilder::default();
-    for a in accounts {
-        hb.add_leaf(path_of(&a.hashed), &a.account.encode());
-    }
-    hb.root()
-}
-
-/// The e2e world, as a slice: `n` accounts, a third with storage (two of
-/// them deep), a quarter with code (some above the blob threshold), and a
-/// pair under a long extension.
-fn world(n: usize, seed: u64) -> (Slice, Vec<AccountLeaf>, Head) {
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let mut by_key: BTreeMap<B256, AccountLeaf> = BTreeMap::new();
-    let mut code = HashMap::new();
-    let mut i = 0usize;
-    while by_key.len() < n {
-        let mut h = [0u8; 32];
-        rng.fill_bytes(&mut h);
-        if i == 0 || i == 1 {
-            h = [0x33; 32];
-            h[30] = if i == 0 { 0x10 } else { 0x70 };
-        }
-        let hashed = B256::from(h);
-        let mut storage: Vec<(B256, U256)> = Vec::new();
-        if i.is_multiple_of(3) {
-            let slots = if i == 3 || i == 6 {
-                2000
-            } else {
-                rng.random_range(1..=40)
-            };
-            let mut m = BTreeMap::new();
-            while m.len() < slots {
-                let mut s = [0u8; 32];
-                rng.fill_bytes(&mut s);
-                let w = U256::from(rng.random::<u64>() | 1);
-                m.insert(B256::from(s), w);
-            }
-            storage = m.into_iter().collect();
-        }
-        let code_hash = if i % 4 == 1 {
-            let len = if i % 8 == 1 {
-                rng.random_range(1..=3000)
-            } else {
-                rng.random_range(3969..=24576)
-            };
-            let mut c = vec![0u8; len];
-            rng.fill_bytes(&mut c);
-            let h = keccak256(&c);
-            code.insert(h, c);
-            h
-        } else {
-            KECCAK_EMPTY
-        };
-        let account = Account {
-            nonce: rng.random_range(0..1000),
-            balance: U256::from(rng.random::<u128>()),
-            storage_root: storage_root(&storage),
-            code_hash,
-        };
-        by_key.insert(
-            hashed,
-            AccountLeaf {
-                hashed,
-                account,
-                storage,
-            },
-        );
-        i += 1;
-    }
-    let leaves: Vec<AccountLeaf> = by_key.into_values().collect();
-    let head = Head {
-        block_hash: B256::repeat_byte(0xAB),
-        block_number: 24_400_000,
-        timestamp: 1_761_800_000,
-        state_root: state_root(&leaves),
-    };
-    let mut storage: HashMap<B256, Vec<(B256, U256)>> = HashMap::new();
-    for a in &leaves {
-        if !a.storage.is_empty() {
-            storage.insert(a.account.storage_root, a.storage.clone());
+fn print(t: &Table) {
+    for r in &t.faults {
+        for (m, mr) in &r.modes {
+            eprintln!(
+                "{:<20} {m:<8} open_error={:?} faulted={} reads={} correct={} insufficient={} failures={} untargeted={} coverage={:?} reasons={:?}",
+                r.name,
+                mr.open_error,
+                mr.faulted,
+                mr.total.reads,
+                mr.total.correct,
+                mr.total.insufficient,
+                mr.total.failures(),
+                mr.untargeted,
+                mr.coverage,
+                mr.reasons
+            );
         }
     }
-    let slice = Slice {
-        head: SliceHead {
-            block_hash: head.block_hash,
-            block_number: head.block_number,
-            timestamp: head.timestamp,
-            state_root: head.state_root,
-            prefix: String::new(),
-            fetched_at: 0,
-            accounts: leaves.len() as u64,
-            storage_tries: storage.len() as u64,
-            storage_slots: leaves.iter().map(|a| a.storage.len() as u64).sum(),
-            codes: code.len() as u64,
-            peers_used: 0,
-            bytes_in: 0,
-            requests: 0,
-            wall_ms: 0,
-            repivots: 0,
-        },
-        accounts: leaves.iter().map(|a| (a.hashed, a.account)).collect(),
-        storage,
-        code,
-        boundary: Vec::new(),
-    };
-    (slice, leaves, head)
+    for f in &t.failures {
+        eprintln!("failure: {f:?}");
+    }
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "csl-eth-faults-{}-{}-{name}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&p).unwrap();
-    p
+/// A reason containing `needle` was seen under `mode`.
+fn caught(r: &Row, mode: &str, needle: &str) {
+    let mr = r.mode(mode).unwrap();
+    assert!(
+        mr.total.insufficient > 0,
+        "{} {mode}: nothing insufficient",
+        r.name
+    );
+    assert!(
+        mr.reasons.keys().any(|k| k.contains(needle)),
+        "{} {mode}: expected a {needle} reason, saw {:?}",
+        r.name,
+        mr.reasons
+    );
+}
+
+/// The aimed node's (table, trie, depth) labels seen under `mode`.
+fn covered(r: &Row, mode: &str, prefix: &str) -> usize {
+    r.mode(mode)
+        .unwrap()
+        .coverage
+        .keys()
+        .filter(|k| k.starts_with(prefix))
+        .count()
 }
 
 #[test]
-fn every_fault_is_caught_and_none_becomes_a_false_answer() {
-    let (slice, leaves, head) = world(900, 2);
-    let dir = scratch("table");
-    produce(&dir, &head, "", leaves.iter().cloned(), &slice.code).unwrap();
-
+fn every_fault_is_caught_where_it_was_aimed_and_none_becomes_a_false_answer() {
+    let w = common::whole(900, 2);
+    let dir = w.produce("table");
     let o = Options {
         keys: 40,
         rate: 1.0,
@@ -160,30 +68,33 @@ fn every_fault_is_caught_and_none_becomes_a_false_answer() {
         top_levels: 0,
         faults: Fault::ALL.to_vec(),
     };
-    let t = run_table(&slice, &dir, &o).unwrap();
-    for r in &t.faults {
-        eprintln!(
-            "{:<22} open_error={:?} faulted={} reads={} correct={} insufficient={} failures={} reasons={:?}",
-            r.name,
-            r.open_error,
-            r.faulted,
-            r.total.reads,
-            r.total.correct,
-            r.total.insufficient,
-            r.total.failures(),
-            r.reasons
+    let t = run_table(&w.slice, &dir, &o).unwrap();
+    print(&t);
+    assert!(t.pass, "a fault produced a wrong value or a false absence");
+    assert!(t.control_correct);
+    assert!(t.failures.is_empty(), "{:?}", t.failures);
+    assert!(t.flagged.is_empty(), "never fired: {:?}", t.flagged);
+    assert_eq!(t.faults.len(), Fault::ALL.len());
+    // The plan's strided picks can repeat a largest or extension account,
+    // so a kind may come in a draw or two under its size.
+    for s in ["account_present", "storage_present"] {
+        assert!((37..=40).contains(&t.shapes[s]), "{s}: {:?}", t.shapes);
+    }
+    for s in [
+        "account_absent",
+        "storage_absent",
+        "storage_empty_trie",
+        "storage_absent_account",
+        "code",
+    ] {
+        assert!(
+            t.shapes.get(s).is_some_and(|n| *n > 0),
+            "no {s} reads: {:?}",
+            t.shapes
         );
     }
-    for f in &t.failures {
-        eprintln!("failure: {f:?}");
-    }
-    assert!(t.pass, "a fault produced a wrong value or a false absence");
-    assert!(t.failures.is_empty(), "{:?}", t.failures);
-    assert_eq!(t.faults.len(), Fault::ALL.len());
-    assert!(t.shapes["account_present"] == 40 && t.shapes["slot_present"] == 40);
-    assert!(t.shapes["code"] > 0 && t.shapes["slot_empty_storage"] > 0);
     assert!(
-        !t.shapes.contains_key("account_outside"),
+        !t.shapes.contains_key("outside"),
         "a whole-trie slice has no outside"
     );
 
@@ -192,48 +103,135 @@ fn every_fault_is_caught_and_none_becomes_a_false_answer() {
     assert_eq!(none.total.insufficient, 0);
     assert_eq!(none.total.correct, none.total.reads);
     assert_eq!(none.faulted, 0);
-    assert!(none.counts("baseline", "account_present").unwrap().correct == 40);
+    assert_eq!(
+        none.counts("baseline", "account_present").unwrap().correct as usize,
+        t.shapes["account_present"]
+    );
 
-    // Every row that opened made the same reads, and every fault fired.
+    // Every row that opened made the same reads.
     for r in &t.faults {
-        if r.open_error.is_none() {
-            assert_eq!(r.total.reads, none.total.reads, "{}", r.name);
-            if r.name != "none" {
-                assert!(r.faulted > 0, "{} never fired", r.name);
+        for (m, mr) in &r.modes {
+            if mr.open_error.is_none() {
+                assert_eq!(
+                    mr.total.reads,
+                    none.mode(m).unwrap().total.reads,
+                    "{} {m}",
+                    r.name
+                );
             }
         }
     }
 
-    // How each was caught.
-    let caught = |name: &str, needle: &str| {
-        let r = t.row(name).unwrap();
-        assert!(r.total.insufficient > 0, "{name}: nothing insufficient");
+    // Aimed faults: the aim lands on almost every read (`forged_fence`
+    // needs a node the model mispredicts and `fence_gap` a page whose
+    // fences are not already tight), reaches every storage depth in the
+    // path mode and the hash-keyed table in the baseline, and the catch is
+    // in that table.
+    for f in Fault::ALL.iter().filter(|f| f.aimed()) {
+        let r = t.row(f.name()).unwrap();
+        for m in ["path", "baseline"] {
+            let mr = r.mode(m).unwrap();
+            let landed: u64 = mr.coverage.values().sum();
+            assert_eq!(landed + mr.untargeted, mr.total.reads, "{} {m}", r.name);
+            if !matches!(f, Fault::ForgedFence | Fault::FenceGap) {
+                assert!(
+                    mr.untargeted * 50 <= mr.total.reads,
+                    "{} {m}: {} of {} reads untargeted",
+                    r.name,
+                    mr.untargeted,
+                    mr.total.reads
+                );
+            }
+        }
         assert!(
-            r.reasons.keys().any(|k| k.contains(needle)),
-            "{name}: expected a {needle} reason, saw {:?}",
-            r.reasons
+            covered(r, "path", "table 1 storage depth ") >= 3,
+            "{}: {:?}",
+            r.name,
+            r.mode("path").unwrap().coverage
         );
-    };
-    caught("node_omitted", "Missing");
-    caught("page_malformed", "malformed: offsets");
-    caught("forged_fence", "Missing");
-    caught("fence_excludes", "malformed: key outside fences");
+        assert!(
+            covered(r, "path", "table 0 account depth ") >= 3,
+            "{}",
+            r.name
+        );
+        assert!(
+            covered(r, "baseline", "table 3 storage depth ") >= 3,
+            "{}",
+            r.name
+        );
+        assert!(
+            covered(r, "baseline", "table 3 account depth ") >= 3,
+            "{}",
+            r.name
+        );
+        assert_eq!(covered(r, "baseline", "table 0"), 0, "{}", r.name);
+        assert_eq!(covered(r, "baseline", "table 1"), 0, "{}", r.name);
+    }
+    // Every fault aimed at an entry or its page is caught in the storage
+    // table in the path mode and in the hash-keyed table in the baseline.
+    for (name, needle) in [
+        ("node_omitted", "Missing"),
+        ("page_malformed", "malformed: offsets"),
+        ("forged_fence", "Missing"),
+        ("fence_excludes", "malformed: key outside fences"),
+        ("truncated_page", "short range"),
+        ("wrong_run_page", "Run("),
+        ("bit_flip_page", ""),
+        ("missing_range", "io: not found"),
+        ("http_error", "500"),
+        ("stale_value", "HashMismatch"),
+        ("stale_page", "HashMismatch"),
+    ] {
+        let r = t.row(name).unwrap();
+        caught(r, "path", needle);
+        let path = &r.mode("path").unwrap().reasons;
+        let base = &r.mode("baseline").unwrap().reasons;
+        assert!(
+            path.keys()
+                .any(|k| k.contains(needle) && k.contains("table 1")),
+            "{name}: no storage-table catch in the path mode: {path:?}"
+        );
+        assert!(
+            path.keys()
+                .any(|k| k.contains(needle) && k.contains("table 0")),
+            "{name}: no account-table catch in the path mode: {path:?}"
+        );
+        assert!(
+            base.keys()
+                .any(|k| k.contains(needle) && k.contains("table 3")),
+            "{name}: no hash-table catch in the baseline: {base:?}"
+        );
+    }
+    caught(
+        t.row("stale_value").unwrap(),
+        "path",
+        "Code(bytecode does not hash",
+    );
+    // A refusal aimed below the root lands mid-walk: most insufficient
+    // reads decoded nodes before it.
+    for name in ["missing_range", "http_error"] {
+        for m in ["path", "baseline"] {
+            let after = &t.row(name).unwrap().mode(m).unwrap().caught_after_nodes;
+            let mid: u64 = after.iter().filter(|(n, _)| **n > 0).map(|(_, c)| c).sum();
+            let all: u64 = after.values().sum();
+            assert!(mid * 2 > all, "{name} {m}: {after:?}");
+        }
+    }
     // Narrowed fences still cover every entry, and every node a walk
     // needs is an entry: the row is all correct and that is the point.
     let gap = t.row("fence_gap").unwrap();
     assert_eq!(gap.total.correct, gap.total.reads);
-    caught("truncated_page", "short range");
-    caught("wrong_run_page", "Run(");
-    caught("wrong_range", "Run(");
-    caught("bit_flip", "Run(");
-    caught("model_page_tamper", "ModelMismatch");
-    caught("page0_tamper", "ModelMismatch");
-    caught("stale_value", "HashMismatch");
-    caught("stale_value", "Code(bytecode does not hash");
-    caught("stale_page", "HashMismatch");
-    caught("missing_range", "io: not found");
-    caught("http_error", "500");
-    caught("truncated_blob", "Blob(does not hash to its name");
+    caught(t.row("wrong_range").unwrap(), "path", "Run(");
+    caught(t.row("bit_flip").unwrap(), "path", "Run(");
+    caught(t.row("bit_flip").unwrap(), "baseline", "table 3");
+    caught(t.row("model_page_tamper").unwrap(), "path", "ModelMismatch");
+    caught(t.row("page0_tamper").unwrap(), "path", "ModelMismatch");
+    caught(t.row("page0_missing").unwrap(), "path", "io: not found");
+    caught(
+        t.row("truncated_blob").unwrap(),
+        "path",
+        "Blob(does not hash to its name",
+    );
 
     // The manifest: a forged state_root refuses the open; forged model
     // roots open but every read is Insufficient; a forged file root is
@@ -248,6 +246,10 @@ fn every_fault_is_caught_and_none_becomes_a_false_answer() {
         sr.open_error
     );
     assert_eq!(sr.total.reads, 0);
+    assert!(
+        sr.faulted > 0,
+        "a refused open still counts what it changed"
+    );
     let mr = t.row("manifest_model_root").unwrap();
     assert!(mr.open_error.is_none());
     assert_eq!(mr.total.insufficient, mr.total.reads);
@@ -258,12 +260,50 @@ fn every_fault_is_caught_and_none_becomes_a_false_answer() {
     );
     let tr = t.row("manifest_table_root").unwrap();
     assert_eq!(tr.total.correct, tr.total.reads);
-    // Whole files cut in half: `latest` is no longer a block hash.
-    assert!(t.row("truncated_file").unwrap().open_error.is_some());
-    // Page 0 tampered on every table: nothing can route.
-    let p0 = t.row("page0_tamper").unwrap();
-    assert_eq!(p0.total.insufficient, p0.total.reads);
+    // Whole files cut in half: `latest` is no longer a block hash, the
+    // manifest no longer JSON.
+    for name in ["truncated_latest", "truncated_manifest"] {
+        let r = t.row(name).unwrap();
+        assert!(r.open_error.is_some(), "{name}");
+        assert!(r.faulted > 0, "{name}");
+    }
+    assert!(t
+        .row("truncated_manifest")
+        .unwrap()
+        .modes
+        .values()
+        .all(|m| m.faulted == 1));
+    // Page 0 tampered or refused on every table: nothing can route.
+    for name in ["page0_tamper", "page0_missing"] {
+        let p0 = t.row(name).unwrap();
+        assert_eq!(p0.total.insufficient, p0.total.reads, "{name}");
+    }
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// One fault alone reproduces its row of the full table: seeds come from
+/// the fault's name, not its place in the list.
+#[test]
+fn a_fault_alone_reproduces_its_row() {
+    let w = common::whole(300, 3);
+    let dir = w.produce("alone");
+    let mut o = Options {
+        keys: 20,
+        mode: Mode::Path,
+        faults: vec![Fault::NodeOmitted, Fault::BitFlip, Fault::BitFlipPage],
+        ..Options::default()
+    };
+    let all = run_table(&w.slice, &dir, &o).unwrap();
+    o.faults = vec![Fault::BitFlipPage];
+    let one = run_table(&w.slice, &dir, &o).unwrap();
+    assert_eq!(one.faults.len(), 2, "the control row always runs");
+    let (a, b) = (
+        all.row("bit_flip_page").unwrap(),
+        one.row("bit_flip_page").unwrap(),
+    );
+    assert_eq!(a.total, b.total);
+    assert_eq!(a.reasons, b.reasons);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -271,9 +311,8 @@ fn every_fault_is_caught_and_none_becomes_a_false_answer() {
 /// between right and Insufficient, still never wrong.
 #[test]
 fn a_flaky_host_splits_reads_between_right_and_insufficient() {
-    let (slice, leaves, head) = world(300, 5);
-    let dir = scratch("flaky");
-    produce(&dir, &head, "", leaves.iter().cloned(), &slice.code).unwrap();
+    let w = common::whole(300, 5);
+    let dir = w.produce("flaky");
     let o = Options {
         keys: 30,
         rate: 0.3,
@@ -287,9 +326,9 @@ fn a_flaky_host_splits_reads_between_right_and_insufficient() {
             Fault::StalePage,
         ],
     };
-    let t = run_table(&slice, &dir, &o).unwrap();
+    let t = run_table(&w.slice, &dir, &o).unwrap();
     assert!(t.pass, "{:?}", t.failures);
-    for r in &t.faults {
+    for r in t.faults.iter().filter(|r| r.name != "none") {
         eprintln!("{} at 0.3: {:?} {:?}", r.name, r.total, r.reasons);
         assert!(
             r.total.correct > 0 && r.total.insufficient > 0,
@@ -297,6 +336,9 @@ fn a_flaky_host_splits_reads_between_right_and_insufficient() {
             r.name,
             r.total
         );
+        if r.aimed {
+            assert!(r.mode("path").unwrap().spared > 0);
+        }
     }
     std::fs::remove_dir_all(&dir).ok();
 }
