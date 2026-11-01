@@ -120,6 +120,6 @@ path-keyed; the baseline uses fewer bytes only on storage (76 against 130 KB).
 
 Milestone 1 is closed: `csl-eth workload` and `csl-eth faults` are its exit tests, and `results/m1.md` walks the PoC spec's exit table row by row (zero false answers in 86,368 workload reads and 23 aimed faults; path-keyed account reads 40 KB and one round at p95 on R2).
 
-Not yet built, in order: a visualizer of the rounds (the `need`
-lists are its event stream), the head's period updates batched into one
-round, a producer loop that follows finality.
+The visualizer is at https://csl-eth.indigo-db8.workers.dev/viz.html (`browser/viz.html`, `browser/src/viz/`): the chain of trust lighting as the head verifies, the trie path node by node from the state root, every page of every table with each request's pages lit in its round's colour, and a waterfall of the rounds on the real clock. It can race the path-keyed read against the by-hash baseline on two cold clients, flip a byte of a fetched page to show the client refuse, and replay a read in slow motion. Everything drawn comes from the tab's own client: the requests from the driver's log, the nodes from the trace each read now returns (`done.trace`: per node its depth, kind, hash, the slot taken and the run-file page it was read from).
+
+Not yet built, in order: a producer loop that follows finality (a frozen snapshot stops opening once the sync-committee period after its finality update begins), the head's period updates batched into one round.
