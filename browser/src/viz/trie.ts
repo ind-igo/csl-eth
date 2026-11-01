@@ -1,5 +1,7 @@
-// The trie path: the client's final walk from the state root down, node by
-// node, as its trace reports it. A branch is its 16 slots (occupied dim,
+// The trie path: the client's final verified walk from the state root
+// down, node by node, as its trace reports it once the read has answered.
+// It is not drawn live: after the read, each node check is replayed at the
+// end of the client step that made it. A branch is its 16 slots (occupied dim,
 // empty hollow, the one the key takes lit); an extension shows the nibbles
 // it skips; a leaf shows the account or the slot. A node lights green when
 // the client's check of it is reached on the timeline, and the link from
@@ -119,10 +121,18 @@ function originText(n: TraceNode, narrow: boolean): string {
 export function renderTrie(scene: Scene | null, checks: Check[], cur: Cursor, focus: Focus, width: number, opts: { stateRoot?: string; tampered: boolean }): { svg: string; height: number; latest: string | null } {
   const W = Math.max(280, width);
   if (!scene || scene.kind === "open") {
-    const msg = scene?.kind === "open" ? (scene.lanes.every((l) => l.done) ? "The head is proven. Pick a key above and read it: its path from the state root down appears here." : "The head is being proven…") : "Open the bucket to begin.";
+    // The head is proven only when the open returned one, and (replaying)
+    // only once the cursor reaches that answer.
+    const l = scene?.lanes[0];
+    const answered = !!l && l.done && cur.t >= l.offset + l.ms - 1e-6;
+    const msg = !scene || !l ? "Open the bucket to begin." : !answered ? "The head is being proven…" : l.head ? "The head is proven. Pick a key above and read it: its path from the state root down appears here." : `The head was not proven: ${l.error ?? "no head"}. Nothing can be read.`;
     return { svg: `<svg width="${W}" height="120" viewBox="0 0 ${W} 120"><text x="${W / 2}" y="60" text-anchor="middle" class="t-muted" font-size="13">${esc(msg)}</text></svg>`, height: 120, latest: null };
   }
   const cols = columns(scene);
+  if (!cols.length) {
+    const msg = scene.kind === "race" ? "No race was run: see the status line." : "Nothing read.";
+    return { svg: `<svg width="${W}" height="120" viewBox="0 0 ${W} 120"><text x="${W / 2}" y="60" text-anchor="middle" class="t-muted" font-size="13">${esc(msg)}</text></svg>`, height: 120, latest: null };
+  }
   const pad = 12;
   const cw = (W - pad * (cols.length + 1)) / cols.length;
   const parts: string[] = [];
@@ -142,7 +152,7 @@ export function renderTrie(scene: Scene | null, checks: Check[], cur: Cursor, fo
     if (!tr) {
       const root = opts.stateRoot;
       parts.push(rootBox(x0, y, cw, "state root", root ?? "", "signed into the finalized header", "pending"));
-      const msg = lane.error ? `error: ${lane.error}` : lane.done ? `done in ${ms(lane.ms)}; its walk is drawn when both have finished` : "fetching the path's pages…";
+      const msg = lane.error ? `error: ${lane.error}` : lane.done ? `done in ${ms(lane.ms)}; its walk is drawn when both have finished` : "reading: the verified walk is drawn from the client's trace once it answers";
       parts.push(`<text x="${x0 + 10}" y="${y + ROOT_H + 24}" class="t-muted" font-size="12">${esc(msg)}</text>`);
       maxH = Math.max(maxH, y + ROOT_H + 40);
       parts.push(`</g>`);
@@ -334,7 +344,7 @@ function drawNode(n: TraceNode, w: WalkTrace, x: number, y: number, cw: number, 
     if (cw < 440) p.push(`<text x="${x + 10}" y="${bodyY + 41}" class="mono t-muted" font-size="10">${esc(hashLine)}</text>`);
     else p.push(`<text x="${x + cw - 10}" y="${bodyY + 27}" text-anchor="end" class="mono t-muted" font-size="10">${esc(hashLine)}</text>`);
   } else if (n.kind === "missing") {
-    p.push(`<text x="${x + 10}" y="${bodyY + 13}" class="t-warn" font-size="12">expected ${esc(short(n.hash, 6))}; the bucket has no such node</text>`);
+    p.push(`<text x="${x + 10}" y="${bodyY + 13}" class="t-warn" font-size="12">expected ${esc(short(n.hash, 6))}; ${n.from.kind === "not_served" && n.from.page ? "its page does not hold it" : "its bytes never reached the client"}</text>`);
   } else {
     p.push(`<text x="${x + 10}" y="${bodyY + 13}" class="t-bad" font-size="12">expected ${esc(short(n.hash, 5))}</text>`);
     p.push(`<text x="${x + 10}" y="${bodyY + 28}" class="t-bad" font-size="12">served bytes hash to ${esc(short(n.got, 5))}</text>`);

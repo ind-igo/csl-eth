@@ -28,6 +28,8 @@ export interface RequestLog {
   /// began (the visualizer's time axis).
   start?: number;
   end?: number;
+  /// Why no response came back (network error, timeout), when none did.
+  error?: string;
 }
 
 /// One computation of the client: `round` 0 is the call that began the

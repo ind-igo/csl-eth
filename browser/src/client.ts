@@ -126,6 +126,7 @@ export async function drive<T>(
           index: i,
           start: sent,
           end: performance.now() - t0,
+          ...(r.error ? { error: r.error } : {}),
         };
         log.push(entry);
         hooks.onResponse?.(entry);

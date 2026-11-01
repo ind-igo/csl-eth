@@ -26,6 +26,7 @@ export const C = {
   model: "#7c8aa5",
   cell: "#1f2633",
   heat: "#35577f",
+  slate: "#8a94a8",
 };
 
 const ROUNDS = ["#3987e5", "#d55181", "#9085e9", "#1fa3b3"];

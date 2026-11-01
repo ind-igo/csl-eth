@@ -1,9 +1,10 @@
-// The visualizer: the same wasm client and driver as the main page, with
-// every request, every client computation and the client's own trace of
-// its final walk recorded as they happen, then drawn. Nothing is
-// simulated: what moves is what this tab fetched and what its client
-// checked, in the order and at the times they happened (replays may slow
-// the clock down, and say so).
+// The visualizer: the same wasm client and driver as the main page. Live,
+// on the real clock: every request this tab makes and every step its
+// client computes. After a read answers: the client's trace of its final
+// verified walk, each node check attributed to the client step that made
+// it, replayed. Nothing is simulated: what moves is what this tab fetched
+// and what its client reported, in the order and at the times they
+// happened (replays may slow the clock down, and say so).
 
 import { drive, loadWasm, type ClientLike, type DriveHooks, type WasmModule } from "./client.ts";
 import type { Head, Need, ReadResult, TableInfo, TamperTarget } from "./protocol.ts";
@@ -11,6 +12,7 @@ import { BucketView, checkedPages, type Focus } from "./viz/bucket.ts";
 import { renderChain } from "./viz/chain.ts";
 import {
   type Check,
+  type Config,
   type Cursor,
   type Lane,
   type PageRef,
@@ -21,12 +23,14 @@ import {
   checksOf,
   esc,
   kb,
+  landedPages,
   ms,
   newLane,
   pageKey,
   pageOfNode,
   pagesOf,
   plural,
+  reqFailed,
   short,
 } from "./viz/model.ts";
 import { C, LANE, roundColor } from "./viz/palette.ts";
@@ -78,7 +82,9 @@ el.checkpoint.value = params.get("checkpoint") ?? DEFAULT_CHECKPOINT;
 let wasm: WasmModule | null = null;
 let client: ClientLike | null = null;
 let raceClients: ClientLike[] = [];
-let bucketUrl = "";
+/// What the open client was opened with; races open theirs the same way,
+/// whatever the settings panel says now.
+let opened: Config | null = null;
 let head: Head | null = null;
 let tables: TableInfo[] = [];
 let topLevels = 4;
@@ -108,14 +114,29 @@ const bucket = new BucketView(el.bucket, (p, ev) => hoverPage(p, ev));
 
 // --- recording a drive ------------------------------------------------------------
 
-function newScene(kind: Scene["kind"], what: What, key: string, slot?: string): Scene {
-  return { id: ++sceneId, kind, what, key, slot, lanes: [], t0: performance.now(), tables };
+function newScene(kind: Scene["kind"], what: What, key: string, config: Config, slot?: string): Scene {
+  return { id: ++sceneId, kind, what, key, slot, lanes: [], setup: [], t0: performance.now(), tables, config, head: head ?? undefined };
 }
 
-/// Drive `start` on `c`, recording into a new lane of `s`.
-async function record<T>(s: Scene, lane: Lane, c: ClientLike, start: () => string, tamper: boolean): Promise<T> {
+function readConfig(): Config {
+  return {
+    bucket: el.base.value.trim().replace(/\/+$/, ""),
+    checkpoint: el.checkpoint.value.trim(),
+    prefetch: Number(el.prefetch.value),
+    topLevels: Number(el.toplevels.value),
+  };
+}
+
+/// The pages a response asked for and delivered, from the scene's layout.
+function placeReq(s: Scene, e: Parameters<NonNullable<DriveHooks["onResponse"]>>[0]) {
+  return { pages: landedPages(s.tables, e), asked: pagesOf(s.tables, e.file, e.offset, e.length), failed: reqFailed(e) };
+}
+
+/// Drive `start` on `c`, recording into a new lane of `s` (of its setup
+/// when `setup`).
+async function record<T>(s: Scene, lane: Lane, c: ClientLike, start: () => string, tamper: boolean, setup = false): Promise<T> {
   lane.offset = performance.now() - s.t0;
-  s.lanes.push(lane);
+  (setup ? s.setup : s.lanes).push(lane);
   const hooks: DriveHooks = {
     onRound(round: number, need: Need[], at: number) {
       lane.rounds = round;
@@ -123,7 +144,7 @@ async function record<T>(s: Scene, lane: Lane, c: ClientLike, start: () => strin
     },
     onResponse(e) {
       lane.sent = lane.sent.filter((q) => !(q.round === e.round && q.index === e.index));
-      lane.reqs.push({ ...e, start: e.start ?? 0, end: e.end ?? 0, pages: pagesOf(s.tables, e.file, e.offset, e.length) });
+      lane.reqs.push({ ...e, start: e.start ?? 0, end: e.end ?? 0, ...placeReq(s, e) });
     },
     onStep(st) {
       lane.steps.push(st);
@@ -133,7 +154,7 @@ async function record<T>(s: Scene, lane: Lane, c: ClientLike, start: () => strin
     lane.tamper = null;
     hooks.alter = (round, need, bodies) => {
       if (lane.tamper) return;
-      const note = chooseTamper(c, round, need, bodies);
+      const note = chooseTamper(c, round, need, bodies, performance.now() - s.t0);
       if (!note) return;
       lane.tamper = note;
       const r = lane.reqs.find((x) => x.round === round && x.index === note.index);
@@ -141,7 +162,7 @@ async function record<T>(s: Scene, lane: Lane, c: ClientLike, start: () => strin
     };
   }
   try {
-    const { result, trip } = await drive<T>(c, bucketUrl, start, hooks);
+    const { result, trip } = await drive<T>(c, s.config.bucket, start, hooks);
     lane.ms = trip.ms;
     lane.rounds = trip.rounds;
     return result;
@@ -159,26 +180,30 @@ async function record<T>(s: Scene, lane: Lane, c: ClientLike, start: () => strin
 /// responses, the entries the client asked for that sit on fetched data
 /// pages; the deepest node (the storage trie before the account trie on a
 /// tie, then the first response) has the middle byte of its encoding
-/// inverted. Deterministic for a given round's responses.
-function chooseTamper(c: ClientLike, round: number, need: Need[], bodies: (Uint8Array | undefined)[]): TamperNote | null {
+/// inverted. Deterministic for a given round's responses. `t` is when, on
+/// the scene's clock: after the whole round landed, before the client's
+/// step.
+function chooseTamper(c: ClientLike, round: number, need: Need[], bodies: (Uint8Array | undefined)[], t: number): TamperNote | null {
   let best: { t: TamperTarget; i: number } | null = null;
   need.forEach((n, i) => {
     const b = bodies[i];
     if (!b || n.offset === undefined) return;
     const out = JSON.parse(c.tamper_targets(n.file, n.offset, b)) as { targets?: TamperTarget[] };
-    for (const t of out.targets ?? []) {
+    // Only a non-empty value wholly inside this body is a target.
+    const inside = (x: TamperTarget) => Number.isInteger(x.value_off) && Number.isInteger(x.value_len) && x.value_len > 0 && x.value_off >= 0 && x.value_off + x.value_len <= b.length;
+    for (const t of (out.targets ?? []).filter(inside)) {
       const rank = (x: TamperTarget) => x.depth * 2 + (x.trie === "storage" ? 1 : 0);
       if (!best || rank(t) > rank(best.t)) best = { t, i };
     }
   });
   if (!best) return null;
-  const { t, i } = best as { t: TamperTarget; i: number };
+  const { t: tg, i } = best as { t: TamperTarget; i: number };
   const body = bodies[i]!;
-  const at = t.value_off + Math.floor(t.value_len / 2);
+  const at = tg.value_off + Math.floor(tg.value_len / 2);
   const before = body[at]!;
   body[at] = before ^ 0xff;
   const n = need[i]!;
-  return { round, index: i, file: n.file, table: t.table, page: t.page, trie: t.trie, depth: t.depth, byte: (n.offset ?? 0) + at, before, after: body[at]! };
+  return { round, index: i, file: n.file, table: tg.table, page: tg.page, trie: tg.trie, depth: tg.depth, byte: (n.offset ?? 0) + at, before, after: body[at]!, t };
 }
 
 // --- actions ---------------------------------------------------------------------
@@ -190,8 +215,18 @@ function setBusy(b: boolean) {
   updateReplayButtons();
 }
 
-function newClient(): ClientLike {
-  return new wasm!.Client(el.checkpoint.value.trim(), Date.now(), Number(el.prefetch.value), Number(el.toplevels.value));
+/// A fresh client opened the way `cfg` says. Throws on a malformed
+/// checkpoint.
+function newClient(cfg: Config): ClientLike {
+  return new wasm!.Client(cfg.checkpoint, Date.now(), cfg.prefetch, cfg.topLevels);
+}
+
+/// The client's layout, with each recorded request placed in it.
+function adoptTables(s: Scene, c: ClientLike): TableInfo[] {
+  const t = JSON.parse(c.tables()) as { tables: TableInfo[]; top_levels: number };
+  s.tables = t.tables;
+  for (const l of [...s.setup, ...s.lanes]) for (const r of l.reqs) Object.assign(r, placeReq(s, r));
+  return t.tables;
 }
 
 async function open() {
@@ -202,33 +237,46 @@ async function open() {
   freeRace();
   head = null;
   tables = [];
-  bucketUrl = el.base.value.trim().replace(/\/+$/, "");
-  topLevels = Number(el.toplevels.value);
-  const s = newScene("open", "open", "");
+  bucket.setTables([]);
+  bucket.resize();
+  const cfg = readConfig();
+  topLevels = cfg.topLevels;
+  const s = newScene("open", "open", "", cfg);
   openScene = s;
   scene = s;
   mode = { kind: "live" };
   status("proving the head from the checkpoint…");
-  const c = newClient();
   const lane = newLane("open", 0);
+  let c: ClientLike | null = null;
   try {
-    const h = await record<Head>(s, lane, c, () => c.open(), false);
+    try {
+      c = newClient(cfg);
+    } catch (e) {
+      // Refused before any request: the checkpoint itself.
+      lane.offset = 0;
+      lane.done = true;
+      lane.error = e instanceof Error ? e.message : String(e);
+      s.lanes.push(lane);
+      throw e;
+    }
+    const cc = c;
+    const h = await record<Head>(s, lane, cc, () => cc.open(), false);
     lane.head = h;
     head = h;
-    client = c;
-    const t = JSON.parse(c.tables()) as { tables: TableInfo[]; top_levels: number };
-    tables = t.tables;
-    topLevels = t.top_levels;
-    s.tables = tables;
-    for (const r of lane.reqs) r.pages = pagesOf(tables, r.file, r.offset, r.length);
+    s.head = h;
+    client = cc;
+    opened = cfg;
+    tables = adoptTables(s, cc);
+    topLevels = (JSON.parse(cc.tables()) as { top_levels: number }).top_levels;
     bucket.setTables(tables);
     bucket.resize();
     bucket.addHeat(s);
     const lag = h.finality_lag_secs;
     const ago = lag < 7200 ? `${Math.round(lag / 60)} min` : `${(lag / 3600).toFixed(1)} h`;
-    status(`head verified: block ${h.block_number.toLocaleString()}, finalized ${ago} ago, signed by ${h.participants} of 512. Pick a key.`);
+    const bad = tables.filter((t) => t.error).map((t) => `${t.name} (${t.error})`);
+    status(`head verified: block ${h.block_number.toLocaleString()}, finalized ${ago} ago, signed by ${h.participants} of 512. ${bad.length ? `Unusable: ${bad.join(", ")}.` : "Pick a key."}`, bad.length > 0);
   } catch (e) {
-    c.free();
+    if (c && client !== c) c.free();
     status(`not verified: ${e instanceof Error ? e.message : e}`, true);
   } finally {
     mode = { kind: "idle" };
@@ -249,7 +297,7 @@ async function read() {
   if (!key) return;
   setBusy(true);
   const tamper = el.tamper.checked;
-  const s = newScene("read", what, key, what === "storage" ? slot || "0" : undefined);
+  const s = newScene("read", what, key, opened!, what === "storage" ? slot || "0" : undefined);
   scene = s;
   mode = { kind: "live" };
   clearFocus();
@@ -270,10 +318,13 @@ async function read() {
 }
 
 /// The same key, path-keyed and by hash, on two fresh clients opened on
-/// the same checkpoint (each with its own store: equally cold), started at
-/// the same moment.
+/// the same checkpoint the way the shown client was (each with its own
+/// store: equally cold), started at the same moment. Their opening drives
+/// are recorded as the scene's setup. The race is refused if either client
+/// proves a different head or snapshot from the one shown, or from each
+/// other.
 async function race() {
-  if (busy || !client || !wasm) return;
+  if (busy || !client || !wasm || !opened || !head) return;
   const what = el.kind.value as What;
   if (what === "code") {
     status("a race compares trie walks: pick an account or a storage slot", true);
@@ -285,14 +336,28 @@ async function race() {
   setBusy(true);
   clearFocus();
   freeRace();
+  const shown = head;
+  const s = newScene("race", what, key, opened, what === "storage" ? slot || "0" : undefined);
+  scene = s;
+  mode = { kind: "live" };
   status("opening two fresh clients on the same checkpoint (neither has read anything yet)…");
   try {
-    const pair = [newClient(), newClient()];
+    const pair = [newClient(s.config), newClient(s.config)];
     raceClients = pair;
-    await Promise.all(pair.map((c) => drive<Head>(c, bucketUrl, () => c.open())));
-    const s = newScene("race", what, key, what === "storage" ? slot || "0" : undefined);
-    scene = s;
-    mode = { kind: "live" };
+    const setup = [newLane("path", 0), newLane("baseline", 0)];
+    const heads = await Promise.all(pair.map((c, i) => record<Head>(s, setup[i]!, c, () => c.open(), false, true)));
+    heads.forEach((h, i) => (setup[i]!.head = h));
+    // Both must stand where the shown snapshot stands.
+    const at = (h: Head) => `${h.block_hash}|${h.state_root}|${h.snapshot.block_hash}|${h.snapshot.state_root}`;
+    const differ = heads.find((h) => at(h) !== at(shown));
+    if (differ) {
+      const blk = (h: Head) => `block ${h.block_number.toLocaleString()} (${short(h.block_hash, 4)}, state root ${short(h.state_root, 4)})`;
+      throw new Error(`refused: the race clients proved ${heads.map(blk).join(" and ")}, the page shows ${blk(shown)}. Reopen, then race.`);
+    }
+    const ts = pair.map((c) => JSON.stringify((JSON.parse(c.tables()) as { tables: TableInfo[] }).tables.map((t) => [t.file, t.page_count, t.model_off, t.error])));
+    if (ts[0] !== ts[1]) throw new Error("refused: the two race clients report different table layouts");
+    s.head = heads[0];
+    adoptTables(s, pair[0]!);
     status("racing: path-keyed and by hash, started together…");
     const lanes = [newLane("path", 0), newLane("baseline", 0)];
     const out = await Promise.allSettled(pair.map((c, i) => record<ReadResult>(s, lanes[i]!, c, readStart(c, what, key, slot, i === 1), false)));
@@ -301,7 +366,8 @@ async function race() {
     });
     afterRead(s);
   } catch (e) {
-    status(`error: ${e instanceof Error ? e.message : e}`, true);
+    status(`race: ${e instanceof Error ? e.message : e}`, true);
+    bucket.addHeat(s);
     mode = { kind: "idle" };
   } finally {
     setBusy(false);
@@ -369,7 +435,7 @@ function cursorNow(now: number): { cur: Cursor; checks: Check[]; fixedEnd: numbe
       const tl = mode.tl;
       const n = Math.min(tl.checks.length, Math.floor((now - mode.since) / CHECK_MS) + 1);
       if (n >= tl.checks.length && now - mode.since > tl.checks.length * CHECK_MS + 400) mode = { kind: "idle" };
-      return { cur: { t: tl.end().t, checks: n }, checks: tl.checks, fixedEnd: null, caption: checkCaption(s, tl.checks, n, "The client made these checks during its computations (the grey ticks on the rounds axis); shown one by one.") };
+      return { cur: { t: tl.end().t, checks: n }, checks: tl.checks, fixedEnd: null, caption: checkCaption(s, tl.checks, n, "The final verified walk, from the client's trace: each check happened in the client step marked on the rounds axis (grey ticks); replayed one by one.") };
     }
     case "replay": {
       const tl = mode.tl;
@@ -414,7 +480,7 @@ function nodeWords(s: Scene, c: Check): string {
   const who = s.kind === "race" ? `${l.name === "baseline" ? "by hash" : "path-keyed"}: ` : "";
   const trie = w.trie === "account" ? "account trie" : "storage trie";
   if (n.kind === "invalid") return `${who}${trie} depth ${n.depth}: the bytes hash to ${short(n.got, 4)}, not ${short(n.hash, 4)}. Rejected.`;
-  if (n.kind === "missing") return `${who}${trie} depth ${n.depth}: the node is not in the bucket. Nothing to check, so no answer.`;
+  if (n.kind === "missing") return `${who}${trie} depth ${n.depth}: ${n.from.kind === "not_served" && n.from.page ? "the page that would hold the node does not" : "the node's bytes never reached the client"}. Nothing to check, so no answer.`;
   const what = n.kind === "branch" ? `branch, taking slot ${n.next?.toString(16)}` : n.kind === "extension" ? `extension over ${n.nibbles?.length} nibbles` : "leaf";
   const how = n.hash ? `hashes to ${short(n.hash, 4)}, the hash its ${n.depth === 0 ? (w.trie === "account" ? "state root" : "storage root") : "parent"} committed to` : "is inside its parent's bytes, already covered by its hash";
   return `${who}${trie} depth ${n.depth}: ${what}. Its ${n.len} bytes ${how}.`;
@@ -447,8 +513,12 @@ function stepCaption(s: Scene, tl: Timeline, i: number): string {
     case "land": {
       const l = s.lanes[e.lane]!;
       const q = l.reqs[e.req]!;
-      const tam = q.tampered ? ` · this page tampered: byte ${q.tampered.byte.toLocaleString()} flipped` : "";
-      return `${pre}${lane(e.lane)}${esc(reqLabel(s, q.file, q.offset, q.length))} landed: ${kb(q.bytes)} after ${ms(q.end - q.start)}${tam}`;
+      const how = q.failed ? `failed (${q.status ? `HTTP ${q.status}` : q.error ?? "no response"}), ${kb(q.bytes)}` : `${kb(q.bytes)}`;
+      return `${pre}${lane(e.lane)}${esc(reqLabel(s, q.file, q.offset, q.length))} landed: ${esc(how)} after ${ms(q.end - q.start)}`;
+    }
+    case "tamper": {
+      const tm = s.lanes[e.lane]!.tamper!;
+      return `${pre}${lane(e.lane)}<span class="t-bad">the whole round has landed: the page flips byte ${tm.byte.toLocaleString()} of ${esc(pageName({ table: tm.table, kind: "data", index: tm.page }))} (0x${tm.before.toString(16).padStart(2, "0")} → 0x${tm.after.toString(16).padStart(2, "0")}) before the client's step reads it</span>`;
     }
     case "check":
       return `${pre}<span class="cap-ev">${checkIcon(s, tl.checks[e.check]!)} ${esc(nodeWords(s, tl.checks[e.check]!))}</span>`;
@@ -500,10 +570,12 @@ function showTip(html: string, ev: MouseEvent) {
   el.tip.style.top = `${Math.max(8, y)}px`;
 }
 
-function pageName(p: PageRef): string {
-  const t = tables.find((x) => x.id === p.table);
+function pageName(p: PageRef, cell = false): string {
+  const t = (scene?.tables ?? tables).find((x) => x.id === p.table);
   const name = t?.name ?? `table ${p.table}`;
-  return p.kind === "page0" ? `${name}, page 0 (header and top model)` : p.kind === "model" ? `${name}, model page ${p.index.toLocaleString()}` : `${name}, page ${p.index.toLocaleString()}`;
+  // A bucket cell may stand for a run of pages (a layout too large to draw).
+  const run = cell && bucket.per > 1 && p.kind !== "page0" ? `s ${p.index.toLocaleString()}–${(p.index + bucket.per - 1).toLocaleString()} (one cell)` : ` ${p.index.toLocaleString()}`;
+  return p.kind === "page0" ? `${name}, page 0 (header and top model)` : p.kind === "model" ? `${name}, model page${run}` : `${name}, page${run}`;
 }
 
 function hoverPage(p: PageRef | null, ev: MouseEvent) {
@@ -512,11 +584,11 @@ function hoverPage(p: PageRef | null, ev: MouseEvent) {
     focus.pages.add(pageKey(p));
     for (const r of reqsWithPage(scene, p)) focus.reqs.add(r);
     for (const n of nodesOnPage(scene, p)) focus.nodes.add(n);
-    const heat = bucket.heat.get(pageKey(p)) ?? 0;
-    const lines = [`<b>${esc(pageName(p))}</b>`];
-    if (focus.reqs.size) lines.push(`fetched by this ${scene.kind === "open" ? "opening" : "read"} (${[...focus.reqs].map((r) => `round ${r.split(":")[1]}`).join(", ")})`);
+    const heat = bucket.per === 1 ? bucket.heat(p) : 0;
+    const lines = [`<b>${esc(pageName(p, true))}</b>`];
+    if (focus.reqs.size) lines.push(`delivered to this ${scene.kind === "open" ? "opening" : "read"} (${[...focus.reqs].map((r) => `round ${r.split(":")[1]}`).join(", ")})`);
     if (focus.nodes.size) lines.push(`holds ${plural(focus.nodes.size, "node")} of the path: ${[...focus.nodes].map((id) => `depth ${depthOf(id)}`).join(", ")}`);
-    lines.push(heat ? `fetched ${plural(heat, "time")} this session` : "not fetched this session");
+    if (bucket.per === 1) lines.push(heat ? `delivered ${plural(heat, "time")} this session` : "not delivered this session");
     showTip(lines.join("<br>"), ev);
   }
   dirtyAll();
@@ -553,19 +625,22 @@ function hoverNode(id: string | null, ev: MouseEvent) {
 function hoverReq(id: string | null, ev: MouseEvent) {
   clearFocus();
   if (id && scene) {
-    const [li, round, idx] = id.split(":").map(Number);
-    const l = scene.lanes[li!]!;
+    const setup = id.startsWith("s");
+    const [li, round, idx] = id.replace(/^s/, "").split(":").map(Number);
+    const l = (setup ? scene.setup : scene.lanes)[li!]!;
     const r = l.reqs.find((x) => x.round === round && (x.index ?? 0) === idx);
     if (r) {
       focus.reqs.add(id);
       for (const p of r.pages) {
         focus.pages.add(pageKey(p));
-        for (const n of nodesOnPage(scene, p)) if (Number(n.split(":")[0]) === li) focus.nodes.add(n);
+        if (!setup) for (const n of nodesOnPage(scene, p)) if (Number(n.split(":")[0]) === li) focus.nodes.add(n);
       }
       const range = r.offset === null ? "whole file" : `bytes ${r.offset.toLocaleString()}–${(r.offset + (r.length ?? 0) - 1).toLocaleString()}`;
-      const lines = [`<b>${esc(reqLabel(scene, r.file, r.offset, r.length))}</b>`, `round ${r.round} · ${range}`, `HTTP ${r.status} · ${kb(r.bytes)} · ${ms(r.end - r.start)}`];
+      const who = setup ? `setup: opening the ${l.name === "baseline" ? "by-hash" : "path-keyed"} client · ` : "";
+      const lines = [`<b>${esc(reqLabel(scene, r.file, r.offset, r.length))}</b>`, `${who}round ${r.round} · ${range}`, `${r.status ? `HTTP ${r.status}` : `failed${r.error ? `: ${esc(r.error)}` : ""}`} · ${kb(r.bytes)} · ${ms(r.end - r.start)}`];
+      if (r.failed) lines.push(`<span class="t-bad">no usable body: ${r.asked.length ? `${plural(r.asked.length, "page")} asked for, none delivered` : "nothing delivered"}</span>`);
       if (focus.nodes.size) lines.push(`held ${plural(focus.nodes.size, "node")} of the final path`);
-      if (r.tampered) lines.push(`<span class="t-bad">byte ${r.tampered.byte.toLocaleString()} flipped (0x${r.tampered.before.toString(16).padStart(2, "0")} → 0x${r.tampered.after.toString(16).padStart(2, "0")}) before the client saw it</span>`);
+      if (r.tampered) lines.push(`<span class="t-bad">byte ${r.tampered.byte.toLocaleString()} flipped (0x${r.tampered.before.toString(16).padStart(2, "0")} → 0x${r.tampered.after.toString(16).padStart(2, "0")}) at ${ms(r.tampered.t - l.offset)}, after the whole round landed and before the client's step read it</span>`);
       showTip(lines.join("<br>"), ev);
     }
   }
@@ -639,10 +714,13 @@ function draw(now: number) {
     const s = scene;
     // The trie path.
     const landed = s ? s.lanes.reduce((n, l) => n + l.reqs.filter((r) => l.offset + r.end <= cur.t).length, 0) : 0;
-    const tSig = `${s?.id}|${cur.checks}|${s?.lanes.map((l) => `${l.done}${l.reqs.length}`).join()}|${fSig}|${el.trie.clientWidth}`;
+    // What the trie view shows changes with the checks shown, the open's
+    // answer and the tamper flip being reached.
+    const reached = s ? s.lanes.map((l) => `${l.done && cur.t >= l.offset + l.ms - 1e-6 ? 1 : 0}${l.tamper && cur.t >= l.tamper.t ? "t" : ""}`).join() : "";
+    const tSig = `${s?.id}|${cur.checks}|${s?.lanes.map((l) => `${l.done}${l.reqs.length}`).join()}|${reached}|${fSig}|${el.trie.clientWidth}`;
     if (tSig !== lastTrieSig) {
       lastTrieSig = tSig;
-      const out = renderTrie(s, checks, cur, focus, el.trie.clientWidth - 2, { stateRoot: head?.state_root, tampered: true });
+      const out = renderTrie(s, checks, cur, focus, el.trie.clientWidth - 2, { stateRoot: s?.head?.state_root, tampered: true });
       el.trie.innerHTML = out.svg;
       if (animating && checks.length && cur.checks >= checks.length) {
         // Every check shown: bring the end of the walk(s) into view.
@@ -657,7 +735,7 @@ function draw(now: number) {
           if (box.bottom > wrap.bottom - 20 || box.top < wrap.top) el.trie.scrollTop += box.bottom - wrap.bottom + 90;
         }
       }
-      el.trieHead.innerHTML = trieHead(s);
+      el.trieHead.innerHTML = trieHead(s, cur);
     }
     // The chain of trust: the opening drive, at its own cursor.
     const os = openScene;
@@ -665,7 +743,7 @@ function draw(now: number) {
     const cSig = `${os?.id}|${os === s ? landed : "end"}|${os?.lanes[0]?.sent.length}|${os?.lanes[0]?.steps.length}|${os === s ? Math.floor(cur.t) : 0}|${fSig}`;
     if (cSig !== lastChainSig) {
       lastChainSig = cSig;
-      el.chain.innerHTML = renderChain(os, oc, el.checkpoint.value.trim(), s === os ? focus.reqs : new Set());
+      el.chain.innerHTML = renderChain(os, oc, s === os ? focus.reqs : new Set());
     }
     // The rounds.
     const wSig = `${s?.id}|${cur.t.toFixed(1)}|${fSig}|${el.falls.clientWidth}|${fixedEnd}`;
@@ -686,17 +764,18 @@ function draw(now: number) {
 }
 
 function idleCaption(): string {
-  if (!client) return busy ? "" : "Open the bucket to begin.";
+  if (!client) return busy ? "" : openScene?.lanes[0]?.error ? "Not opened: change the settings and reopen." : "Open the bucket to begin.";
   if (!scene || scene.kind === "open") return "Pick a key and read it, or race the two ways of reading it. Hover anything: a node, a page or a request lights the others.";
   return "Done. Replay it slowed down, or step through it event by event.";
 }
 
-function trieHead(s: Scene | null): string {
+function trieHead(s: Scene | null, cur: Cursor): string {
   if (!s || s.kind === "open") return `<b>the path</b><span>from the state root down to the key</span>`;
   const l = s.lanes[0];
   const hashed = l?.result?.hashed ?? "";
   const what = s.what === "storage" ? `slot ${esc(s.slot)} of ${esc(short(s.key, 6))}` : s.what === "code" ? `code ${esc(short(s.key, 6))}` : esc(short(s.key, 8));
-  const tam = l?.tamper ? `<span class="pill bad">✗ tampered: byte ${l.tamper.byte.toLocaleString()} of ${esc(pageName({ table: l.tamper.table, kind: "data", index: l.tamper.page }))} (${l.tamper.trie === "account" ? "an account" : "a storage"} node at depth ${l.tamper.depth}) flipped before the client saw it</span>` : l?.tamper === null ? `<span class="pill">tamper asked: no node in this read's responses to flip</span>` : "";
+  // The flip is shown from when it happened.
+  const tam = l?.tamper && cur.t >= l.tamper.t ? `<span class="pill bad">✗ tampered: byte ${l.tamper.byte.toLocaleString()} of ${esc(pageName({ table: l.tamper.table, kind: "data", index: l.tamper.page }))} (${l.tamper.trie === "account" ? "an account" : "a storage"} node at depth ${l.tamper.depth}) flipped before the client saw it</span>` : l?.tamper ? "" : l?.tamper === null && l.done ? `<span class="pill">tamper asked: no node in this read's responses to flip</span>` : "";
   const hs = l?.result?.hashed_slot;
   const paths = hashed ? ` · account path ${l?.result?.address ? "keccak(address)" : "(a hashed key, given)"} = <span class="mono">${esc(short(hashed, 5))}</span>${hs ? ` · slot path keccak(slot) = <span class="mono">${esc(short(hs, 5))}</span>` : ""}` : "";
   return `<b>${s.kind === "race" ? "race" : s.what}</b><span>${what}${paths}</span>${tam}`;
@@ -825,7 +904,7 @@ window.addEventListener("resize", dirtyAll);
   busy: () => busy,
 };
 
-el.bucketNote.innerHTML = `<span><i style="background:${C.page0}"></i>page 0</span><span><i style="background:${C.model}"></i>model pages</span><span><i style="background:${C.heat}"></i>fetched earlier</span><span><i class="ring" style="border-color:${C.ok}"></i>holds a checked node</span>`;
+el.bucketNote.innerHTML = `<span><i style="background:${C.page0}"></i>page 0</span><span><i style="background:${C.model}"></i>model pages</span><span><i style="background:${C.heat}"></i>delivered earlier</span><span><i class="ring" style="border-color:${C.ok}"></i>holds a checked node</span><span><i class="ring" style="border-color:${C.bad}"></i>asked for, not delivered</span>`;
 
 syncKind();
 renderChips();

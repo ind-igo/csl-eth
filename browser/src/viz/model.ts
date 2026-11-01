@@ -6,6 +6,15 @@
 
 import type { Head, ReadResult, RequestLog, StepLog, TableInfo, TraceNode } from "../protocol.ts";
 
+/// What a scene's client was opened with: fixed when it was opened, so a
+/// scene never mixes in settings edited since.
+export interface Config {
+  bucket: string;
+  checkpoint: string;
+  prefetch: number;
+  topLevels: number;
+}
+
 /// A page of a run file: page 0 (the header and top model), a data page
 /// (1-based, as `csl-run` numbers records), or a model page (1-based).
 export interface PageRef {
@@ -19,9 +28,12 @@ export const pageKey = (p: PageRef) => `${p.table}:${p.kind}:${p.index}`;
 /// The pages of `file` that the byte range `[offset, offset + length)`
 /// covers, from the layout the client reported (`Client.tables`). A whole
 /// file (head, manifest, blob) is no table's page.
+/// A table whose reader or layout the client rejected has no pages to draw.
+/// At most `MAX_PAGES` pages are listed for one range: the layout is the
+/// bucket's claim, and a hostile one must not stall the tab.
 export function pagesOf(tables: TableInfo[], file: string, offset: number | null, length: number | null): PageRef[] {
   const t = tables.find((x) => x.file === file);
-  if (!t || offset === null || length === null || length <= 0) return [];
+  if (!t || t.error || offset === null || length === null || length <= 0) return [];
   const out: PageRef[] = [];
   const end = offset + length;
   if (offset < t.data_off) out.push({ table: t.id, kind: "page0", index: 0 });
@@ -31,7 +43,7 @@ export function pagesOf(tables: TableInfo[], file: string, offset: number | null
     const b = Math.min(end, dataEnd);
     const first = Math.floor((a - t.data_off) / t.record_bytes) + 1;
     const last = Math.floor((b - 1 - t.data_off) / t.record_bytes) + 1;
-    for (let i = first; i <= last; i++) out.push({ table: t.id, kind: "data", index: i });
+    for (let i = first; i <= Math.min(last, first + MAX_PAGES - 1); i++) out.push({ table: t.id, kind: "data", index: i });
   }
   if (t.model_pages > 0 && t.model_record_bytes > 0 && end > t.model_off) {
     const a = Math.max(offset, t.model_off);
@@ -39,10 +51,41 @@ export function pagesOf(tables: TableInfo[], file: string, offset: number | null
     if (b > a) {
       const first = Math.floor((a - t.model_off) / t.model_record_bytes) + 1;
       const last = Math.floor((b - 1 - t.model_off) / t.model_record_bytes) + 1;
-      for (let m = first; m <= last; m++) out.push({ table: t.id, kind: "model", index: m });
+      for (let m = first; m <= Math.min(last, first + MAX_PAGES - 1); m++) out.push({ table: t.id, kind: "model", index: m });
     }
   }
   return out;
+}
+
+const MAX_PAGES = 4096;
+
+/// The bytes `[a, b)` a page occupies in its run file.
+function pageSpan(t: TableInfo, p: PageRef): [number, number] {
+  if (p.kind === "page0") return [0, t.data_off];
+  if (p.kind === "data") return [t.data_off + (p.index - 1) * t.record_bytes, t.data_off + p.index * t.record_bytes];
+  return [t.model_off + (p.index - 1) * t.model_record_bytes, t.model_off + p.index * t.model_record_bytes];
+}
+
+/// The pages a response actually delivered: a range answered 206 whose body
+/// holds the whole page. A failed or short response delivered none (the
+/// client rejects a range that is not a 206; it never sees a page it was
+/// not given).
+export function landedPages(tables: TableInfo[], r: RequestLog): PageRef[] {
+  if (r.offset === null || r.length === null || r.status !== 206) return [];
+  const t = tables.find((x) => x.file === r.file);
+  if (!t) return [];
+  const end = r.offset + Math.min(r.length, r.bytes);
+  return pagesOf(tables, r.file, r.offset, r.length).filter((p) => {
+    const [a, b] = pageSpan(t, p);
+    return a >= r.offset! && b <= end;
+  });
+}
+
+/// A request failed: no usable body (network error, a status the client
+/// rejects, or a range answered short).
+export function reqFailed(r: RequestLog): boolean {
+  if (r.offset === null) return r.status !== 200 && r.status !== 404;
+  return r.status !== 206 || r.bytes < (r.length ?? 0);
 }
 
 /// The byte the page flipped for the tamper demonstration, and where.
@@ -59,12 +102,20 @@ export interface TamperNote {
   byte: number;
   before: number;
   after: number;
+  /// When the byte was flipped, on the scene's clock: after the whole
+  /// round had landed, before the client's step read any of it.
+  t: number;
 }
 
 export interface Req extends RequestLog {
   start: number;
   end: number;
+  /// The pages its body delivered (none for a failed or short response).
   pages: PageRef[];
+  /// The pages it asked for.
+  asked: PageRef[];
+  /// No usable body (see `reqFailed`).
+  failed: boolean;
   tampered?: TamperNote;
 }
 
@@ -100,9 +151,16 @@ export interface Scene {
   key: string;
   slot?: string;
   lanes: Lane[];
+  /// A race's two opening drives (fresh clients), before the race itself:
+  /// real requests, drawn collapsed.
+  setup: Lane[];
   /// `performance.now()` when the scene began.
   t0: number;
+  /// The layout the scene's client(s) reported.
   tables: TableInfo[];
+  config: Config;
+  /// The head the scene's client(s) proved.
+  head?: Head;
 }
 
 export function newLane(name: LaneName, offset: number): Lane {
@@ -162,6 +220,7 @@ export interface Cursor {
 export type Ev =
   | { kind: "send"; t: number; lane: number; round: number; reqs: number[] }
   | { kind: "land"; t: number; lane: number; req: number }
+  | { kind: "tamper"; t: number; lane: number }
   | { kind: "check"; t: number; check: number }
   | { kind: "done"; t: number; lane: number };
 
@@ -194,10 +253,11 @@ export class Timeline {
         evs.push({ kind: "send", t, lane: li, round, reqs });
       }
       lane.reqs.forEach((r, ri) => evs.push({ kind: "land", t: lane.offset + r.end, lane: li, req: ri }));
+      if (lane.tamper) evs.push({ kind: "tamper", t: lane.tamper.t, lane: li });
       evs.push({ kind: "done", t: lane.offset + lane.ms, lane: li });
     });
     this.checks.forEach((c, i) => evs.push({ kind: "check", t: c.t, check: i }));
-    const rank = { send: 0, land: 1, check: 2, done: 3 } as const;
+    const rank = { send: 0, land: 1, tamper: 2, check: 3, done: 4 } as const;
     evs.sort((a, b) => a.t - b.t || rank[a.kind] - rank[b.kind] || (a.kind === "check" && b.kind === "check" ? a.check - b.check : 0));
     this.evs = evs;
     let d = 0;

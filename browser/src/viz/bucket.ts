@@ -3,7 +3,10 @@
 // lands and stay tinted for the scene; the pages that held the walk's
 // nodes get a ring once the client has checked the node; pages fetched
 // earlier in the session keep a faint heat. Cells are mapped from the
-// layout the client reports (`Client.tables`), never guessed.
+// layout the client reports (`Client.tables`), never guessed; a table the
+// client rejected is not drawn. The layout is the bucket's claim, so the
+// drawing is bounded by the canvas, not by it: when the pages outnumber
+// the cells that fit, one cell stands for a run of consecutive pages.
 
 import type { TableInfo } from "../protocol.ts";
 import { type Cursor, type Lane, type PageRef, type Scene, pageKey, pageOfNode, pagesOf } from "./model.ts";
@@ -21,6 +24,9 @@ interface Grid {
   labelY: number;
   cols: number;
   rows: number;
+  /// Data cells and model cells (each `per` pages).
+  data: number;
+  model: number;
 }
 
 const LABEL = 18;
@@ -37,8 +43,11 @@ export class BucketView {
   private h = 0;
   private dpr = 1;
   private dirty = true;
-  /// Times each page was fetched this session, from finished scenes.
-  heat = new Map<string, number>();
+  /// Pages per cell: 1 unless the layout claims more pages than fit.
+  per = 1;
+  /// Times each page was delivered this session, from finished scenes,
+  /// keyed by run file and page (a reopened snapshot is other files).
+  private heatMap = new Map<string, number>();
 
   constructor(
     private canvas: HTMLCanvasElement,
@@ -50,8 +59,19 @@ export class BucketView {
   }
 
   setTables(t: TableInfo[]) {
-    this.tables = t.filter((x) => x.page_count > 0);
+    this.tables = t.filter((x) => !x.error && x.page_count > 0);
     this.dirty = true;
+  }
+
+  private heatKey(p: PageRef): string | null {
+    const t = this.tables.find((x) => x.id === p.table);
+    return t ? `${t.file}|${pageKey(p)}` : null;
+  }
+
+  /// Times this page (of the file now drawn) was delivered this session.
+  heat(p: PageRef): number {
+    const k = this.heatKey(p);
+    return k ? (this.heatMap.get(k) ?? 0) : 0;
   }
 
   /// Fit the grids to the canvas's box: the largest cell pitch that shows
@@ -65,22 +85,32 @@ export class BucketView {
     this.canvas.height = this.h * this.dpr;
     this.base.width = this.canvas.width;
     this.base.height = this.canvas.height;
-    let pitch = 2;
-    for (let p = 9; p >= 2; p--) {
+    const fits = (p: number, per: number) => {
       const cols = Math.floor((this.w - 2) / p);
-      const need = this.tables.reduce((s, t) => s + LABEL + Math.ceil(this.cells(t) / cols) * p + GAP, 0);
-      if (need <= this.h) {
-        pitch = p;
-        break;
-      }
+      return this.tables.reduce((s, t) => s + LABEL + Math.ceil(this.cellsOf(t, per) / cols) * p + GAP, 0) <= this.h;
+    };
+    let pitch = 2;
+    let per = 1;
+    const p9 = [9, 8, 7, 6, 5, 4, 3, 2].find((p) => fits(p, 1));
+    if (p9 !== undefined) pitch = p9;
+    else {
+      // More pages than cells: the smallest power-of-two run per cell that
+      // fits at the smallest pitch.
+      per = 2;
+      while (!fits(2, per) && per < 1e300) per *= 2;
     }
     this.pitch = pitch;
+    this.per = per;
     this.cell = pitch >= 3 ? pitch - 1 : pitch;
     const cols = Math.floor((this.w - 2) / pitch);
+    // Never more cells than the canvas holds, whatever the layout claims.
+    const cap = cols * Math.ceil(this.h / pitch);
     let y = 0;
     this.grids = this.tables.map((t) => {
-      const rows = Math.ceil(this.cells(t) / cols);
-      const g = { table: t, labelY: y + 12, y: y + LABEL, cols, rows };
+      const data = Math.min(cap, Math.ceil(t.page_count / per));
+      const model = Math.min(cap, Math.ceil(t.model_pages / per));
+      const rows = Math.ceil((1 + data + model) / cols);
+      const g = { table: t, labelY: y + 12, y: y + LABEL, cols, rows, data, model };
       y += LABEL + rows * pitch + GAP;
       return g;
     });
@@ -88,12 +118,21 @@ export class BucketView {
   }
 
   /// Cells of a table: page 0, the data pages, then the model pages.
-  private cells(t: TableInfo) {
-    return 1 + t.page_count + t.model_pages;
+  private cellsOf(t: TableInfo, per: number) {
+    return 1 + Math.ceil(t.page_count / per) + Math.ceil(t.model_pages / per);
   }
 
-  private cellIndex(t: TableInfo, p: PageRef) {
-    return p.kind === "page0" ? 0 : p.kind === "data" ? p.index : t.page_count + p.index;
+  private cellIndex(g: Grid, p: PageRef) {
+    const i = Math.floor((p.index - 1) / this.per);
+    return p.kind === "page0" ? 0 : p.kind === "data" ? 1 + i : 1 + g.data + i;
+  }
+
+  /// The first page a cell stands for.
+  private pageOfCell(g: Grid, c: number): PageRef {
+    const t = g.table;
+    if (c === 0) return { table: t.id, kind: "page0", index: 0 };
+    if (c <= g.data) return { table: t.id, kind: "data", index: (c - 1) * this.per + 1 };
+    return { table: t.id, kind: "model", index: (c - 1 - g.data) * this.per + 1 };
   }
 
   private xy(g: Grid, c: number): [number, number] {
@@ -107,11 +146,8 @@ export class BucketView {
     for (const g of this.grids) {
       if (y < g.y || y >= g.y + g.rows * this.pitch) continue;
       const c = Math.floor((y - g.y) / this.pitch) * g.cols + Math.floor((x - 1) / this.pitch);
-      const t = g.table;
-      if (x < 1 || c < 0 || c >= this.cells(t) || Math.floor((x - 1) / this.pitch) >= g.cols) return null;
-      if (c === 0) return { table: t.id, kind: "page0", index: 0 };
-      if (c <= t.page_count) return { table: t.id, kind: "data", index: c };
-      return { table: t.id, kind: "model", index: c - t.page_count };
+      if (x < 1 || c < 0 || c >= 1 + g.data + g.model || Math.floor((x - 1) / this.pitch) >= g.cols) return null;
+      return this.pageOfCell(g, c);
     }
     return null;
   }
@@ -120,12 +156,20 @@ export class BucketView {
   cellCentre(p: PageRef): [number, number] | null {
     const g = this.grids.find((x) => x.table.id === p.table);
     if (!g) return null;
-    const [x, y] = this.xy(g, this.cellIndex(g.table, p));
+    const [x, y] = this.xy(g, this.cellIndex(g, p));
     return [x + this.cell / 2, y + this.cell / 2];
   }
 
+  /// Count the pages a finished scene's responses delivered.
   addHeat(scene: Scene) {
-    for (const l of scene.lanes) for (const r of l.reqs) for (const p of r.pages) this.heat.set(pageKey(p), (this.heat.get(pageKey(p)) ?? 0) + 1);
+    for (const l of [...scene.setup, ...scene.lanes])
+      for (const r of l.reqs)
+        for (const p of r.pages) {
+          const t = scene.tables.find((x) => x.id === p.table);
+          if (!t) continue;
+          const k = `${t.file}|${pageKey(p)}`;
+          this.heatMap.set(k, (this.heatMap.get(k) ?? 0) + 1);
+        }
     this.dirty = true;
   }
 
@@ -142,12 +186,13 @@ export class BucketView {
       b.font = "11px ui-sans-serif, system-ui, sans-serif";
       b.fillStyle = C.muted;
       const extra = t.id === 3 ? " · the baseline's table" : "";
-      b.fillText(`  ${t.page_count.toLocaleString()} pages${extra}`, 1 + nameW, g.labelY);
-      const n = this.cells(t);
+      const per = this.per > 1 ? ` · one cell is ${this.per.toLocaleString()} pages` : "";
+      b.fillText(`  ${t.page_count.toLocaleString()} pages${extra}${per}`, 1 + nameW, g.labelY);
+      const n = 1 + g.data + g.model;
       for (let c = 0; c < n; c++) {
         const [x, y] = this.xy(g, c);
-        const p: PageRef = c === 0 ? { table: t.id, kind: "page0", index: 0 } : c <= t.page_count ? { table: t.id, kind: "data", index: c } : { table: t.id, kind: "model", index: c - t.page_count };
-        const h = this.heat.get(pageKey(p)) ?? 0;
+        const p = this.pageOfCell(g, c);
+        const h = this.per === 1 ? this.heat(p) : 0;
         b.fillStyle = c === 0 ? C.page0 : p.kind === "model" ? C.model : h ? mix(C.cell, C.heat, Math.min(1, 0.45 + 0.18 * Math.log2(h + 1))) : C.cell;
         b.fillRect(x, y, this.cell, this.cell);
       }
@@ -180,12 +225,18 @@ export class BucketView {
     if (scene) {
       const race = scene.kind === "race";
       const laneColor = (l: Lane, round: number) => (race ? LANE[l.name] : roundColor(round));
-      for (const l of scene.lanes) {
+      for (const l of [...scene.setup, ...scene.lanes]) {
         for (const r of l.reqs) {
           const s = l.offset + r.start;
           const e = l.offset + r.end;
           if (cur.t < s) continue;
           const col = laneColor(l, r.round);
+          if (r.failed) {
+            // Asked for, never delivered: outlined in red once it failed.
+            for (const p of cur.t < e ? r.asked : []) sq(p, 2, null, rgba(col, 0.6), 1);
+            if (cur.t >= e) for (const p of r.asked) sq(p, 2, null, C.bad, 1.5);
+            continue;
+          }
           for (const p of r.pages) {
             if (cur.t < e) {
               const pulse = 0.5 + 0.5 * Math.sin((cur.t - s) / 60);

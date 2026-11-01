@@ -2,7 +2,9 @@
 // to when its body landed, on the drive's real clock, grouped by round.
 // The client's own computations (each `step`) are the small ticks on the
 // lane's line: everything between them is waiting on the network. A race
-// puts both clients on one axis.
+// puts both clients on one axis, after their two opening drives (drawn
+// collapsed, one row each). A failed request stays drawn, outlined red; the
+// tamper demonstration's flip is marked at the moment it happened.
 
 import type { Focus } from "./bucket.ts";
 import { type Cursor, type Lane, type PageRef, type Scene, esc, fileShort, kb, ms, pagesOf } from "./model.ts";
@@ -45,7 +47,9 @@ interface Row {
   label: string;
   bytes: number;
   status: number;
-  tampered: boolean;
+  failed: boolean;
+  /// When the tamper demonstration flipped a byte of this response.
+  tamperT: number | null;
 }
 
 function rowsOf(scene: Scene, li: number): Row[] {
@@ -59,10 +63,11 @@ function rowsOf(scene: Scene, li: number): Row[] {
     label: reqLabel(scene, r.file, r.offset, r.length),
     bytes: r.bytes,
     status: r.status,
-    tampered: !!r.tampered,
+    failed: r.failed,
+    tamperT: r.tampered ? r.tampered.t : null,
   }));
   for (const q of l.sent) {
-    rows.push({ lane: li, round: q.round, index: q.index, start: l.offset + q.start, end: null, label: reqLabel(scene, q.file, q.offset, q.length), bytes: 0, status: 0, tampered: false });
+    rows.push({ lane: li, round: q.round, index: q.index, start: l.offset + q.start, end: null, label: reqLabel(scene, q.file, q.offset, q.length), bytes: 0, status: 0, failed: false, tamperT: null });
   }
   rows.sort((a, b) => a.round - b.round || a.index - b.index);
   return rows;
@@ -70,7 +75,7 @@ function rowsOf(scene: Scene, li: number): Row[] {
 
 export function sceneEnd(scene: Scene): number {
   let t = 0;
-  for (const l of scene.lanes) {
+  for (const l of [...scene.setup, ...scene.lanes]) {
     t = Math.max(t, l.offset + l.ms);
     for (const r of l.reqs) t = Math.max(t, l.offset + r.end);
   }
@@ -98,6 +103,37 @@ export function renderWaterfall(scene: Scene | null, cur: Cursor, focus: Focus, 
   let y = AXIS + 4;
   const laneY: number[] = [];
   const body: string[] = [];
+  const steps = (l: Lane) => {
+    for (const s of l.steps) {
+      const a = l.offset + s.start;
+      if (a > cur.t) continue;
+      const b = Math.min(l.offset + s.end, cur.t);
+      const w = Math.max(2, x(b) - x(a));
+      body.push(`<rect x="${x(a)}" y="${y + 3}" width="${w}" height="10" rx="1.5" fill="${C.ink2}" opacity="0.8"><title>client computed ${ms(s.end - s.start)}${s.round === 0 ? " (the call that began the drive)" : ` (step after round ${s.round})`}</title></rect>`);
+    }
+  };
+  // A race's setup: each fresh client proving the head, collapsed to one row.
+  scene.setup.forEach((l, si) => {
+    if (l.offset > cur.t) return;
+    const who = l.name === "baseline" ? "by-hash" : "path-keyed";
+    body.push(`<text x="4" y="${y + 12}" font-size="11" font-weight="600" class="t-muted">${esc(`setup · opening the ${who} client`)}</text>`);
+    body.push(`<line x1="${gutter}" x2="${W - right}" y1="${y + 8}" y2="${y + 8}" stroke="${C.grid}"/>`);
+    steps(l);
+    const shown = l.reqs.filter((r) => l.offset + r.start <= cur.t);
+    const inflight = l.sent.filter((q) => l.offset + q.start <= cur.t).length;
+    const rounds = new Set(shown.map((r) => r.round)).size;
+    y += HEAD - 2;
+    body.push(`<text x="42" y="${y + 11}" font-size="10.5" class="t-muted">${esc(`${shown.length} requests, ${rounds} rounds${inflight ? `, ${inflight} in flight` : ""}${l.error ? ` · failed: ${l.error}` : ""}`)}</text>`);
+    for (const r of shown) {
+      const id = `s${si}:${r.round}:${r.index ?? 0}`;
+      const a = l.offset + r.start;
+      const landed = l.offset + r.end <= cur.t;
+      const e = landed ? l.offset + r.end : cur.t;
+      const bad = landed && r.failed;
+      body.push(`<g class="req" data-req="${id}"><rect x="${x(a)}" y="${y + 4}" width="${Math.max(2, x(e) - x(a))}" height="${ROW - 8}" rx="2" fill="${bad ? "none" : rgba(C.slate, landed ? 0.75 : 0.3)}"${bad ? ` stroke="${C.bad}"` : ""}${focus.reqs.has(id) ? ` stroke="#fff" stroke-width="1.2"` : ""}/></g>`);
+    }
+    y += ROW + 6;
+  });
   lanes.forEach((rows, li) => {
     const l = scene.lanes[li]!;
     laneY.push(y);
@@ -106,13 +142,7 @@ export function renderWaterfall(scene: Scene | null, cur: Cursor, focus: Focus, 
     body.push(`<text x="4" y="${y + 12}" font-size="11.5" font-weight="600" fill="${lc}">${esc(title)}</text>`);
     // The client's computations, on the lane's line.
     body.push(`<line x1="${gutter}" x2="${W - right}" y1="${y + 8}" y2="${y + 8}" stroke="${C.grid}"/>`);
-    for (const s of l.steps) {
-      const a = l.offset + s.start;
-      if (a > cur.t) continue;
-      const b = Math.min(l.offset + s.end, cur.t);
-      const w = Math.max(2, x(b) - x(a));
-      body.push(`<rect x="${x(a)}" y="${y + 3}" width="${w}" height="10" rx="1.5" fill="${C.ink2}" opacity="0.8"><title>client computed ${ms(s.end - s.start)}${s.round === 0 ? " (the call that began the read)" : ` (step after round ${s.round})`}</title></rect>`);
-    }
+    steps(l);
     if (l.done && l.offset + l.ms <= cur.t) {
       body.push(`<text x="${x(l.offset + l.ms) + 6}" y="${y + 12}" font-size="11" class="t-ink2">${esc(ms(l.ms))}</text>`);
     }
@@ -132,15 +162,29 @@ export function renderWaterfall(scene: Scene | null, cur: Cursor, focus: Focus, 
       const e = landed ? r.end! : cur.t;
       const bx = x(r.start);
       const bw = Math.max(2, x(e) - bx);
-      const fill = landed ? (r.tampered ? C.bad : col) : rgba(col, 0.35);
+      const failed = landed && r.failed;
+      const flipped = r.tamperT !== null && r.tamperT <= cur.t;
+      const fill = failed ? rgba(C.bad, 0.12) : landed ? col : rgba(col, 0.35);
       body.push(`<g class="req" data-req="${id}">`);
       body.push(`<rect x="0" y="${y}" width="${W}" height="${ROW}" fill="${foc ? rgba("#ffffff", 0.06) : "transparent"}"/>`);
       body.push(`<text x="42" y="${y + 11}" font-size="10.5" class="mono ${foc ? "t-ink" : "t-ink2"}">${esc(r.label)}</text>`);
-      body.push(`<rect x="${bx}" y="${y + 3}" width="${bw}" height="${ROW - 6}" rx="2" fill="${fill}"${foc ? ` stroke="#fff" stroke-width="1.2"` : ""}${landed ? "" : ` stroke="${col}" stroke-dasharray="2 2"`}/>`);
+      body.push(`<rect x="${bx}" y="${y + 3}" width="${bw}" height="${ROW - 6}" rx="2" fill="${fill}"${foc ? ` stroke="#fff" stroke-width="1.2"` : failed ? ` stroke="${C.bad}" stroke-width="1.2"` : ""}${landed ? "" : ` stroke="${col}" stroke-dasharray="2 2"`}/>`);
+      let tx = bx + bw + 5;
+      if (flipped) {
+        // The flip: after the whole round landed, before the client's step.
+        const fx = x(r.tamperT!);
+        body.push(`<line x1="${fx}" x2="${fx}" y1="${y + 1}" y2="${y + ROW - 1}" stroke="${C.bad}" stroke-width="2"/><path d="M${fx} ${y + 2} l4 5 l-4 5 l-4 -5 z" fill="${C.bad}"/>`);
+        tx = Math.max(tx, fx + 7);
+      }
       if (landed) {
-        const st = r.status === 206 || r.status === 200 ? "" : ` · ${r.status}`;
-        const tag = r.tampered ? " · 1 byte flipped" : "";
-        body.push(`<text x="${bx + bw + 5}" y="${y + 11}" font-size="10" class="t-muted">${esc(kb(r.bytes) + st + tag)}</text>`);
+        const st = r.status === 206 || r.status === 200 ? "" : r.status === 0 ? " · failed" : ` · HTTP ${r.status}`;
+        const tag = flipped ? " · 1 byte flipped here" : "";
+        const label = kb(r.bytes) + st + tag;
+        // Near the right edge, the label goes inside the bar's end instead.
+        if (tx + label.length * 5.6 > W - 2 && bw > label.length * 5.6 + 16) {
+          const ix = (flipped ? x(r.tamperT!) : bx + bw) - 8;
+          body.push(`<text x="${ix}" y="${y + 10.5}" font-size="10" font-weight="600" text-anchor="end" fill="#ffffff">${esc(label)}</text>`);
+        } else body.push(`<text x="${tx}" y="${y + 11}" font-size="10" class="${failed || flipped ? "t-bad" : "t-muted"}">${esc(label)}</text>`);
       }
       body.push(`</g>`);
       y += ROW;
