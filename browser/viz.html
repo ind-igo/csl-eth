@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>csl-eth · what the light client does</title>
+    <style>
+      :root {
+        --bg: #0d1016;
+        --panel: #131821;
+        --panel2: #171d28;
+        --line: #252d3b;
+        --ink: #e8ecf3;
+        --ink2: #aab3c2;
+        --muted: #737d8f;
+        --faint: #4a5365;
+        --ok: #4ade80;
+        --warn: #fbbf24;
+        --bad: #f87171;
+        --accent: #3987e5;
+        --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        color-scheme: dark;
+      }
+      * { box-sizing: border-box; }
+      [hidden] { display: none !important; }
+      html, body { margin: 0; background: var(--bg); color: var(--ink); }
+      body { font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; min-height: 100vh; overflow-x: hidden; }
+      a { color: var(--accent); }
+      .mono { font-family: var(--mono); }
+      .t-ink { fill: var(--ink); color: var(--ink); }
+      .t-ink2 { fill: var(--ink2); color: var(--ink2); }
+      .t-muted { fill: var(--muted); color: var(--muted); }
+      .t-head { fill: var(--ink2); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+      .t-warn { fill: var(--warn); color: var(--warn); }
+      .t-bad { fill: var(--bad); color: var(--bad); }
+      svg text { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+      svg text.mono, svg tspan.mono { font-family: var(--mono); }
+
+      .app { display: grid; grid-template-rows: auto auto auto minmax(420px, 1fr) auto; height: 100vh; min-height: 760px; gap: 8px; padding: 10px 14px 12px; }
+      header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; }
+      header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+      header .sub { color: var(--muted); flex: 1 1 400px; }
+      header nav { color: var(--muted); font-size: 12px; }
+
+      .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+      .bar .grp { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+      .bar .sep { width: 1px; height: 22px; background: var(--line); margin: 0 4px; }
+      input, select, button { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+      input.mono { font-family: var(--mono); font-size: 12px; }
+      #key { width: min(410px, 34vw); }
+      #slot { width: 70px; }
+      button { cursor: pointer; }
+      button.primary { background: var(--accent); border-color: transparent; color: #fff; font-weight: 600; }
+      button.lane2 { background: transparent; border-color: #d55181; color: #f0a7c4; font-weight: 600; }
+      button:disabled { opacity: 0.45; cursor: default; }
+      button.chip { font-size: 12px; padding: 3px 8px; color: var(--ink2); background: transparent; border-radius: 999px; }
+      button.chip:hover:not(:disabled) { border-color: var(--ink2); color: var(--ink); }
+      label.tog { display: inline-flex; align-items: center; gap: 5px; color: var(--ink2); cursor: pointer; user-select: none; }
+      label.tog input { accent-color: var(--bad); margin: 0; }
+      .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+      #replay button { font-size: 12px; padding: 3px 8px; }
+      #replay .lbl { color: var(--muted); font-size: 12px; }
+      details.settings { position: relative; }
+      details.settings summary { cursor: pointer; color: var(--muted); font-size: 12px; list-style: none; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; }
+      details.settings summary::-webkit-details-marker { display: none; }
+      details.settings .panel { position: absolute; right: 0; top: 32px; z-index: 20; width: min(560px, 90vw); background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 10px; display: grid; grid-template-columns: max-content 1fr; gap: 6px 10px; align-items: center; box-shadow: 0 10px 30px rgba(0,0,0,.5); }
+      details.settings .panel label { color: var(--muted); font-size: 12px; }
+      details.settings .panel input { width: 100%; }
+      details.settings .panel .note { grid-column: 1 / -1; color: var(--muted); font-size: 11.5px; }
+      .statusline { display: grid; gap: 2px; min-width: 0; }
+      .statusline > * { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 18px; }
+      #status { color: var(--ink2); }
+      #caption { color: var(--muted); }
+      #caption b { color: var(--ink); font-weight: 600; }
+      #caption .cap-ev { color: var(--ink2); }
+
+      main { display: grid; grid-template-columns: minmax(190px, 240px) minmax(0, 1fr) clamp(300px, 30vw, 440px); gap: 8px; min-height: 0; }
+      .pane { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+      .pane > h2 { margin: 0; padding: 8px 10px 6px; font-size: 11px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase; color: var(--ink2); display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+      .pane > h2 span { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--muted); }
+      .scroll { overflow: auto; min-height: 0; flex: 1; }
+
+      ol.chain { list-style: none; margin: 0; padding: 4px 10px 10px; position: relative; }
+      ol.chain li { display: grid; grid-template-columns: 18px 1fr; gap: 8px; padding: 5px 0 7px; position: relative; }
+      ol.chain li::before { content: ""; position: absolute; left: 8.5px; top: 20px; bottom: -6px; width: 1px; background: var(--line); }
+      ol.chain li:last-child::before { display: none; }
+      ol.chain li.ch-ok::before { background: rgba(74, 222, 128, 0.45); }
+      ol.chain .dot { width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid var(--faint); display: grid; place-items: center; font-size: 11px; font-weight: 700; background: var(--panel); z-index: 1; }
+      ol.chain li b { display: block; font-weight: 600; font-size: 12.5px; color: var(--muted); }
+      ol.chain li span { display: block; color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
+      ol.chain li .tag { color: var(--accent); }
+      ol.chain li.ch-fetch .dot { border-color: var(--accent); animation: pulse 0.8s ease-in-out infinite alternate; }
+      ol.chain li.ch-check .dot { border-color: var(--ink2); }
+      ol.chain li.ch-ok .dot { border-color: var(--ok); color: var(--ok); background: rgba(74, 222, 128, 0.12); }
+      ol.chain li.ch-ok b { color: var(--ink); }
+      ol.chain li.ch-ok span { color: var(--ink2); }
+      ol.chain li.ch-bad .dot { border-color: var(--bad); color: var(--bad); }
+      ol.chain li.ch-bad b { color: var(--bad); }
+      ol.chain li.focus { background: rgba(255, 255, 255, 0.06); border-radius: 6px; }
+      @keyframes pulse { from { box-shadow: 0 0 0 0 rgba(57, 135, 229, 0.0); } to { box-shadow: 0 0 0 4px rgba(57, 135, 229, 0.35); } }
+
+      #triehead { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; padding: 8px 12px 0; }
+      #triehead b { font-size: 11px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase; color: var(--ink2); }
+      #triehead > span { color: var(--muted); }
+      .pill { display: inline-block; border: 1px solid var(--line); border-radius: 8px; padding: 1px 8px; font-size: 11.5px; color: var(--ink2); }
+      .pill.bad { border-color: var(--bad); color: var(--bad); background: rgba(248, 113, 113, 0.08); }
+      #trie { padding: 4px 0 8px 0; scroll-behavior: smooth; }
+      #trie .node { cursor: default; }
+
+      #bucketwrap { flex: 1; min-height: 0; position: relative; padding: 0 10px 0; }
+      #bucket { width: 100%; height: 100%; display: block; }
+      #bucketnote { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 6px 10px 8px; color: var(--muted); font-size: 11px; }
+      #bucketnote i, .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+      #bucketnote i.ring { background: transparent; border: 1.5px solid; }
+
+      .bottom { display: grid; grid-template-columns: minmax(0, 1fr) clamp(250px, 24vw, 340px); gap: 8px; height: 230px; min-height: 0; }
+      #falls { padding: 0 8px 6px 8px; }
+      #readout { padding: 6px 14px 10px; display: flex; flex-direction: column; justify-content: center; gap: 10px; }
+      .nums { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+      .big { font-size: clamp(22px, 2.2vw, 30px); font-weight: 650; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; line-height: 1.05; }
+      .big small { font-size: 14px; font-weight: 500; color: var(--ink2); letter-spacing: 0; }
+      .lbl { color: var(--muted); font-size: 11.5px; }
+      .legend { display: flex; flex-wrap: wrap; gap: 4px 10px; color: var(--muted); font-size: 11px; }
+      .race { display: grid; gap: 12px; }
+      .race .lane { display: grid; grid-template-columns: 6px 1fr; gap: 10px; }
+      .race .sw { border-radius: 3px; }
+      .race .sm { color: var(--ink2); font-size: 12px; }
+      .race .big { font-size: clamp(28px, 2.8vw, 38px); }
+
+      #tip { position: fixed; z-index: 50; pointer-events: none; max-width: 340px; background: #1c2330; border: 1px solid #364055; border-radius: 8px; padding: 7px 9px; font-size: 12px; color: var(--ink2); box-shadow: 0 8px 24px rgba(0,0,0,.5); }
+      #tip b { color: var(--ink); }
+      footer { color: var(--faint); font-size: 11px; }
+
+      @media (max-width: 1180px) {
+        main { grid-template-columns: minmax(170px, 200px) minmax(0, 1fr) clamp(260px, 28vw, 320px); }
+        #key { width: min(330px, 40vw); }
+      }
+      @media (max-width: 900px) {
+        .app { height: auto; }
+        main { grid-template-columns: 1fr; }
+        .pane.trie { min-height: 420px; }
+        .pane.bucket { height: 480px; }
+        .bottom { grid-template-columns: 1fr; height: auto; }
+        #falls { max-height: 260px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <h1>What the light client does</h1>
+        <span class="sub">Every request this tab makes and every node its client checks, drawn as it happens. Nothing is simulated.</span>
+        <nav><a href="./index.html">plain page</a> · <span id="version"></span></nav>
+      </header>
+
+      <div class="bar">
+        <div class="grp">
+          <select id="kind" aria-label="what to read">
+            <option value="account">account</option>
+            <option value="storage">storage slot</option>
+            <option value="code">code</option>
+          </select>
+          <input id="key" class="mono" placeholder="address or hashed key 0x…" aria-label="key" />
+          <label id="slotwrap" hidden><input id="slot" class="mono" placeholder="slot" aria-label="slot" /></label>
+          <button id="read" class="primary">Read</button>
+          <button id="race" class="lane2" title="Read the same key twice at once, on two fresh clients: by trie position (one round) and by node hash (a round per node).">Race vs by-hash</button>
+          <label class="tog" title="Flip one byte of one fetched page that holds a node on the path, before the client sees it."><input id="tamper" type="checkbox" /> tamper next read</label>
+        </div>
+        <div class="sep"></div>
+        <div class="grp" id="replay">
+          <span class="lbl">replay</span>
+          <button data-slow="1">1×</button>
+          <button data-slow="5">5× slower</button>
+          <button data-slow="20">20× slower</button>
+          <span class="lbl">step</span>
+          <button id="stepprev" aria-label="previous event">◀</button>
+          <button id="stepnext" aria-label="next event">▶</button>
+        </div>
+        <details class="settings" style="margin-left:auto">
+          <summary>settings</summary>
+          <div class="panel">
+            <label for="base">bucket</label><input id="base" class="mono" />
+            <label for="checkpoint">checkpoint</label><input id="checkpoint" class="mono" />
+            <label for="prefetch">pages each side</label><input id="prefetch" type="number" min="0" max="8" value="1" />
+            <label for="toplevels">top levels kept</label><input id="toplevels" type="number" min="0" max="9" value="4" />
+            <span></span><button id="reopen">Reopen with these</button>
+            <span class="note">Reopening proves the head again from the checkpoint and starts a fresh client (empty store, empty top-level cache).</span>
+          </div>
+        </details>
+        <div class="chips" id="chips" style="flex-basis:100%"></div>
+      </div>
+
+      <div class="statusline"><span id="status">loading the client module…</span><div id="caption"></div></div>
+
+      <main>
+        <section class="pane">
+          <h2>chain of trust <span>checkpoint to state root</span></h2>
+          <div class="scroll" id="chain"></div>
+        </section>
+        <section class="pane trie">
+          <div id="triehead"></div>
+          <div class="scroll" id="trie"></div>
+        </section>
+        <section class="pane bucket">
+          <h2>the bucket <span>every 4 KB page of every table</span></h2>
+          <div id="bucketwrap"><canvas id="bucket"></canvas></div>
+          <div id="bucketnote"></div>
+        </section>
+      </main>
+
+      <div class="bottom">
+        <section class="pane">
+          <h2>rounds <span>each bar is one HTTP range request, sent to landed, on the real clock; grey ticks are the client computing</span></h2>
+          <div class="scroll" id="falls"></div>
+        </section>
+        <section class="pane">
+          <div id="readout"></div>
+        </section>
+      </div>
+    </div>
+    <div id="tip" hidden></div>
+    <script type="module" src="./dist/viz.js"></script>
+  </body>
+</html>

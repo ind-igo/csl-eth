@@ -22,6 +22,20 @@ export interface RequestLog {
   status: number;
   bytes: number;
   ms: number;
+  /// Position in the round's `need` list.
+  index?: number;
+  /// When it was sent and when its body had landed, in ms since the drive
+  /// began (the visualizer's time axis).
+  start?: number;
+  end?: number;
+}
+
+/// One computation of the client: `round` 0 is the call that began the
+/// drive, `n` the `step` after round `n`; ms since the drive began.
+export interface StepLog {
+  round: number;
+  start: number;
+  end: number;
 }
 
 /// What driving a call cost on the page's side.
@@ -29,6 +43,7 @@ export interface Trip {
   log: RequestLog[];
   rounds: number;
   ms: number;
+  steps?: StepLog[];
 }
 
 export interface Head {
@@ -77,4 +92,98 @@ export interface ReadResult {
   size?: number;
   prefix?: string;
   cost: Cost;
+  /// The final walk(s), node by node (see `ReadTrace`).
+  trace?: ReadTrace;
+}
+
+/// Where a traced node's bytes came from.
+export type NodeFrom =
+  | { kind: "cache" }
+  | { kind: "embedded" }
+  | { kind: "page"; table: number; name: string; page: number }
+  | { kind: "not_served"; table?: number; name?: string; page?: number };
+
+/// One node of the client's final walk, as `csl-eth-client`'s trace has it.
+export interface TraceNode {
+  depth: number;
+  /// The nibbles consumed to reach it, hex.
+  at: string;
+  /// The hash its parent committed to; null for a node embedded in its parent.
+  hash: string | null;
+  len: number;
+  /// The table key it was looked up by.
+  key: string | null;
+  from: NodeFrom;
+  /// The client computation that first accepted it (0: the call that began
+  /// the read; n: the step after round n); null where the walk stopped on it.
+  checked_at: number | null;
+  kind: "branch" | "extension" | "leaf" | "missing" | "invalid";
+  occupied?: number;
+  next?: number;
+  taken?: boolean;
+  nibbles?: string;
+  follows?: boolean;
+  rest?: string;
+  matches?: boolean;
+  value?: string;
+  account?: { nonce: number; balance: string; storage_root: string; code_hash: string };
+  word?: { hex: string; dec: string };
+  what?: string;
+  got?: string | null;
+}
+
+export interface WalkTrace {
+  trie: "account" | "storage";
+  table: number;
+  name: string;
+  by_hash: boolean;
+  root: string;
+  key: string;
+  nodes: TraceNode[];
+}
+
+export interface TraceEnd {
+  status: "verified" | "absent" | "insufficient";
+  by?: string;
+  reason?: string;
+  kind?: string;
+  table?: number;
+  key?: string;
+  what?: string;
+  error?: string;
+}
+
+export interface ReadTrace {
+  walks: WalkTrace[];
+  code: { code_hash: string; table: number; name: string; page: number | null; blob: string | null; len: number | null } | null;
+  end: TraceEnd;
+}
+
+/// A table of the open snapshot and where its pages sit (`Client.tables`).
+export interface TableInfo {
+  id: number;
+  name: string;
+  file: string;
+  page_count: number;
+  entry_count: number;
+  epsilon_pages: number;
+  page_bytes: number;
+  record_bytes: number;
+  data_off: number;
+  model_off: number;
+  model_bytes: number;
+  model_pages: number;
+  model_record_bytes: number;
+  total_len: number;
+  error: string | null;
+}
+
+export interface TamperTarget {
+  table: number;
+  trie: "account" | "storage";
+  depth: number;
+  key: string;
+  page: number;
+  value_off: number;
+  value_len: number;
 }

@@ -10,7 +10,9 @@
 use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use csl_eth_client::{
-    Cost, HeadOpener, Hint, NoDriver, Pending, Read, Snapshot, VerifiedHead, Want,
+    trie::{decode_word, Account, Nibbles, Shape},
+    Cost, HeadOpener, Hint, NoDriver, Origin, Pending, Read, Reason, Snapshot, Trace, TraceNode,
+    Trie, VerifiedHead, WalkTrace, Want,
 };
 use js_sys::Uint8Array;
 use std::time::{Duration, SystemTime};
@@ -75,6 +77,171 @@ fn status_json<T>(r: &Read<T>) -> (&'static str, serde_json::Value) {
         Read::VerifiedAbsent(by) => ("absent", serde_json::json!(format!("{by:?}"))),
         Read::Insufficient(why) => ("insufficient", serde_json::json!(why.to_string())),
     }
+}
+
+fn nibbles_hex(n: &Nibbles) -> String {
+    (0..n.len())
+        .map(|i| char::from_digit(u32::from(n.get_unchecked(i)), 16).unwrap_or('?'))
+        .collect()
+}
+
+fn hex0x(b: &[u8]) -> String {
+    format!("0x{}", hex::encode(b))
+}
+
+fn table_name(t: u16) -> &'static str {
+    csl_eth_client::trie_table_name(t)
+}
+
+/// One node of a traced walk, for the page: where it sits, what it is,
+/// what it hashed to, where its bytes came from, and when it was checked.
+fn node_json(n: &TraceNode, trie: Trie) -> serde_json::Value {
+    let s = &n.step;
+    let from = match n.origin {
+        Origin::Cache => serde_json::json!({ "kind": "cache" }),
+        Origin::Page { table, page } => {
+            serde_json::json!({ "kind": "page", "table": table, "name": table_name(table), "page": page })
+        }
+        Origin::Embedded => serde_json::json!({ "kind": "embedded" }),
+        Origin::NotServed { searched } => match searched {
+            Some((table, page)) => {
+                serde_json::json!({ "kind": "not_served", "table": table, "name": table_name(table), "page": page })
+            }
+            None => serde_json::json!({ "kind": "not_served" }),
+        },
+    };
+    let mut v = serde_json::json!({
+        "depth": s.key.depth(),
+        "at": nibbles_hex(&s.key.path),
+        "hash": s.hash.map(|h| format!("{h}")),
+        "len": s.len,
+        "key": n.table_key.map(|k| hex0x(&k)),
+        "from": from,
+        "checked_at": n.checked_at,
+    });
+    match &s.shape {
+        Shape::Branch {
+            occupied,
+            next,
+            taken,
+        } => {
+            v["kind"] = "branch".into();
+            v["occupied"] = (*occupied).into();
+            v["next"] = (*next).into();
+            v["taken"] = (*taken).into();
+        }
+        Shape::Extension { nibbles, follows } => {
+            v["kind"] = "extension".into();
+            v["nibbles"] = nibbles_hex(nibbles).into();
+            v["follows"] = (*follows).into();
+        }
+        Shape::Leaf {
+            rest,
+            matches,
+            value,
+        } => {
+            v["kind"] = "leaf".into();
+            v["rest"] = nibbles_hex(rest).into();
+            v["matches"] = (*matches).into();
+            v["value"] = hex0x(value).into();
+            match trie {
+                Trie::Account => {
+                    if let Ok(a) = Account::decode(value) {
+                        v["account"] = serde_json::json!({
+                            "nonce": a.nonce,
+                            "balance": a.balance.to_string(),
+                            "storage_root": format!("{}", a.storage_root),
+                            "code_hash": format!("{}", a.code_hash),
+                        });
+                    }
+                }
+                Trie::Storage => {
+                    if let Ok(w) = decode_word(value) {
+                        v["word"] =
+                            serde_json::json!({ "hex": format!("{w:#x}"), "dec": w.to_string() });
+                    }
+                }
+            }
+        }
+        Shape::Missing => v["kind"] = "missing".into(),
+        Shape::Invalid { what, got } => {
+            v["kind"] = "invalid".into();
+            v["what"] = format!("{what:?}").into();
+            v["got"] = got.map(|g| format!("{g}")).into();
+        }
+    }
+    v
+}
+
+fn walk_json(w: &WalkTrace) -> serde_json::Value {
+    serde_json::json!({
+        "trie": match w.trie { Trie::Account => "account", Trie::Storage => "storage" },
+        "table": w.table,
+        "name": table_name(w.table),
+        "by_hash": w.by_hash,
+        "root": format!("{}", w.root),
+        "key": format!("{}", w.key),
+        "nodes": w.nodes.iter().map(|n| node_json(n, w.trie)).collect::<Vec<_>>(),
+    })
+}
+
+/// How the read ended, structured: the absence's shape, or the reason the
+/// answer is insufficient with the table and key it names.
+fn end_json<T>(r: &Read<T>) -> serde_json::Value {
+    match r {
+        Read::Verified(_) => serde_json::json!({ "status": "verified" }),
+        Read::VerifiedAbsent(by) => {
+            serde_json::json!({ "status": "absent", "by": format!("{by:?}") })
+        }
+        Read::Insufficient(why) => {
+            let mut v = serde_json::json!({ "status": "insufficient", "reason": why.to_string() });
+            match why {
+                Reason::NoTable(t) => {
+                    v["kind"] = "no_table".into();
+                    v["table"] = (*t).into();
+                }
+                Reason::Missing { table, key } => {
+                    v["kind"] = "missing".into();
+                    v["table"] = (*table).into();
+                    v["key"] = hex0x(key).into();
+                }
+                Reason::Invalid { table, key, what } => {
+                    v["kind"] = "invalid".into();
+                    v["table"] = (*table).into();
+                    v["key"] = hex0x(key).into();
+                    v["what"] = format!("{what:?}").into();
+                }
+                Reason::Run { table, error } => {
+                    v["kind"] = "run".into();
+                    v["table"] = (*table).into();
+                    v["error"] = error.clone().into();
+                }
+                Reason::Code(_) => v["kind"] = "code".into(),
+                Reason::Blob(_) => v["kind"] = "blob".into(),
+                Reason::Budget => v["kind"] = "budget".into(),
+                Reason::Value(_) => v["kind"] = "value".into(),
+            }
+            v
+        }
+    }
+}
+
+fn trace_json<T>(t: &Trace, r: &Read<T>) -> serde_json::Value {
+    let code = t.code.as_ref().map(|c| {
+        serde_json::json!({
+            "code_hash": format!("{}", c.code_hash),
+            "table": csl_eth_client::TABLE_CODE,
+            "name": table_name(csl_eth_client::TABLE_CODE),
+            "page": c.page,
+            "blob": c.blob,
+            "len": c.len,
+        })
+    });
+    serde_json::json!({
+        "walks": t.walks.iter().map(walk_json).collect::<Vec<_>>(),
+        "code": code,
+        "end": end_json(r),
+    })
 }
 
 fn error_json(e: impl std::fmt::Display) -> String {
@@ -189,6 +356,9 @@ impl Client {
             extra(x, &mut v);
         }
         v["cost"] = cost_json(&cost);
+        if let Some(s) = &self.snap {
+            v["trace"] = trace_json(s.trace(), &r);
+        }
         self.done(v)
     }
 }
@@ -402,6 +572,71 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// Every table of the open snapshot: its id, name, run file, page
+    /// count, and where page 0, the data pages and the model pages sit, so
+    /// the page can draw every page and map a request's byte range to page
+    /// indices. Data page `i` (1-based) is `record_bytes` at
+    /// `4096 + (i - 1) * record_bytes`; page 0 is `[0, 4096)`; model page
+    /// `m` (1-based) is `model_record_bytes` at
+    /// `model_off + (m - 1) * model_record_bytes`.
+    pub fn tables(&self) -> String {
+        let Some(s) = &self.snap else {
+            return error_json("not open");
+        };
+        let list: Vec<serde_json::Value> = s
+            .tables()
+            .into_iter()
+            .map(|t| {
+                serde_json::json!({
+                    "id": t.table_id,
+                    "name": t.name,
+                    "file": t.path,
+                    "page_count": t.page_count,
+                    "entry_count": t.entry_count,
+                    "epsilon_pages": t.epsilon_pages,
+                    "page_bytes": 4096,
+                    "page0": { "offset": 0, "length": 4096 },
+                    "record_bytes": t.record_bytes,
+                    "data_off": 4096,
+                    "model_off": t.model_off,
+                    "model_bytes": t.model_bytes,
+                    "model_pages": t.model_pages,
+                    "model_record_bytes": t.model_record_bytes,
+                    "total_len": t.total_len,
+                    "error": t.error,
+                })
+            })
+            .collect();
+        serde_json::json!({ "tables": list, "top_levels": s.top_levels }).to_string()
+    }
+
+    /// For the page's tamper demonstration only: where in `body` (the bytes
+    /// of `file` from `offset` that the page fetched for the read in
+    /// progress) the entries the read asked for this attempt sit, each with
+    /// its table, trie, depth, page and value bytes. Nothing is verified
+    /// here; the client checks whatever is supplied.
+    pub fn tamper_targets(&self, file: &str, offset: f64, body: &[u8]) -> String {
+        let Some(s) = &self.snap else {
+            return error_json("not open");
+        };
+        let list: Vec<serde_json::Value> = s
+            .entries_in(file, offset as u64, body)
+            .into_iter()
+            .map(|e| {
+                serde_json::json!({
+                    "table": e.at.table,
+                    "trie": match e.at.trie { Trie::Account => "account", Trie::Storage => "storage" },
+                    "depth": e.at.depth,
+                    "key": hex0x(&e.at.key),
+                    "page": e.page,
+                    "value_off": e.value_off,
+                    "value_len": e.value_len,
+                })
+            })
+            .collect();
+        serde_json::json!({ "targets": list }).to_string()
     }
 
     /// The verified head and the snapshot it named, once open.

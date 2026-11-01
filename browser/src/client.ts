@@ -4,7 +4,7 @@
 // until `done`. One `need` list is one round, one network round trip.
 // Nothing here verifies anything; the client checks every byte it is given.
 
-import type { Need, RequestLog, Step, Trip } from "./protocol.ts";
+import type { Need, RequestLog, Step, StepLog, Trip } from "./protocol.ts";
 
 /// The wasm `Client` as the page uses it (wasm-bindgen's generated class).
 export interface ClientLike {
@@ -16,6 +16,29 @@ export interface ClientLike {
   supply(i: number, status: number, body?: Uint8Array | null, error?: string | null): void;
   step(): string;
   head(): string;
+  /// The open snapshot's tables and where their pages sit (visualizer).
+  tables(): string;
+  /// Where the read in progress's entries sit in a response body (the
+  /// visualizer's tamper demonstration).
+  tamper_targets(file: string, offset: number, body: Uint8Array): string;
+}
+
+/// Optional observers of a drive, for the visualizer. None of them changes
+/// what is fetched; `alter` may change the bytes of a round's responses
+/// before they are supplied (and only the tamper demonstration uses it).
+export interface DriveHooks {
+  /// A round's requests are going out, `at` ms after the drive began.
+  onRound?(round: number, need: Need[], at: number): void;
+  /// One response landed (before it is supplied).
+  onResponse?(entry: RequestLog): void;
+  /// The client computed: `round` 0 is the call that began, `n` the step
+  /// after round `n`.
+  onStep?(s: StepLog): void;
+  /// Every response of the round has landed; the hook may change bodies in
+  /// place. When set, a round's responses are supplied together after it
+  /// returns instead of as each lands (the client reads none of them
+  /// before `step` either way).
+  alter?(round: number, need: Need[], bodies: (Uint8Array | undefined)[]): void;
 }
 
 export interface WasmModule {
@@ -63,19 +86,36 @@ async function fetchOne(base: string, n: Need): Promise<Fetched> {
 
 /// Drive one call of the client to its answer. `start` makes the call
 /// (`client.open()`, `client.account(key)`, …) and returns its first step.
-export async function drive<T>(client: ClientLike, base: string, start: () => string): Promise<{ result: T; trip: Trip }> {
+export async function drive<T>(
+  client: ClientLike,
+  base: string,
+  start: () => string,
+  hooks: DriveHooks = {},
+): Promise<{ result: T; trip: Trip }> {
   const t0 = performance.now();
   const log: RequestLog[] = [];
+  const steps: StepLog[] = [];
+  const timed = (round: number, f: () => string): Step => {
+    const s0 = performance.now() - t0;
+    const out = f();
+    const s: StepLog = { round, start: s0, end: performance.now() - t0 };
+    steps.push(s);
+    hooks.onStep?.(s);
+    return JSON.parse(out) as Step;
+  };
   let rounds = 0;
-  let step = JSON.parse(start()) as Step;
+  let step = timed(0, start);
   while ("need" in step) {
     rounds += 1;
     const round = rounds;
     const need = step.need;
+    hooks.onRound?.(round, need, performance.now() - t0);
+    const held: (Fetched | undefined)[] = [];
     await Promise.all(
       need.map(async (n, i) => {
+        const sent = performance.now() - t0;
         const r = await fetchOne(base, n);
-        log.push({
+        const entry: RequestLog = {
           round,
           file: n.file,
           offset: n.offset ?? null,
@@ -83,12 +123,26 @@ export async function drive<T>(client: ClientLike, base: string, start: () => st
           status: r.status,
           bytes: r.body?.length ?? 0,
           ms: r.ms,
-        });
-        client.supply(i, r.status, r.body ?? null, r.error ?? null);
+          index: i,
+          start: sent,
+          end: performance.now() - t0,
+        };
+        log.push(entry);
+        hooks.onResponse?.(entry);
+        if (hooks.alter) held[i] = r;
+        else client.supply(i, r.status, r.body ?? null, r.error ?? null);
       }),
     );
-    step = JSON.parse(client.step()) as Step;
+    if (hooks.alter) {
+      hooks.alter(
+        round,
+        need,
+        held.map((r) => r?.body),
+      );
+      held.forEach((r, i) => r && client.supply(i, r.status, r.body ?? null, r.error ?? null));
+    }
+    step = timed(round, () => client.step());
   }
   if ("error" in step) throw new Error(step.error);
-  return { result: step.done as T, trip: { log, rounds, ms: performance.now() - t0 } };
+  return { result: step.done as T, trip: { log, rounds, ms: performance.now() - t0, steps } };
 }
