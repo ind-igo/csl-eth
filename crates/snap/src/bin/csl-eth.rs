@@ -66,6 +66,11 @@ enum Cmd {
     /// bucket's responses by a lying host, read through, tabulated; passes
     /// when safe (no false answer) and exercised (every fault fired).
     Faults(csl_eth_snap::faults::Args),
+    /// The producer loop: at each chosen epoch boundary fetch the slice,
+    /// build it, wait for finality to name the block, lay out the head
+    /// files, verify, publish in order, collect old snapshots. One JSON
+    /// line per cycle on stdout and in `<work>/produce.log`.
+    Produce(csl_eth_snap::produce::Args),
     /// Build a bucket (snapshot runs, blobs, manifest) from a slice.
     Build {
         #[arg(long)]
@@ -228,13 +233,19 @@ fn parse_prefix(s: &str) -> Result<Nibbles, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,discv4=warn,reth_dns_discovery=warn,hickory=warn".into()),
-        )
-        .init();
-    match Cli::parse().cmd {
+    let cli = Cli::parse();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,discv4=warn,reth_dns_discovery=warn,hickory=warn".into());
+    if matches!(cli.cmd, Cmd::Produce(_)) {
+        // stdout carries the cycle lines only.
+        tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
+    match cli.cmd {
+        Cmd::Produce(args) => {
+            tokio::task::spawn_blocking(move || csl_eth_snap::produce::run(args)).await??;
+        }
         Cmd::Workload(args) => {
             let out = csl_eth_snap::workload::run(args)?;
             println!("{}", serde_json::to_string_pretty(&out)?);

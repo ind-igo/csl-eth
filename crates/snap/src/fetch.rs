@@ -404,6 +404,8 @@ struct Coordinator {
     /// whether a head job is queued or running.
     below: Option<Header>,
     head_job_out: bool,
+    /// Unix milliseconds when the pivot was last set.
+    pivot_set_ms: u64,
 }
 
 impl Coordinator {
@@ -439,6 +441,7 @@ impl Coordinator {
             waiting_for_head: true,
             below: None,
             head_job_out: false,
+            pivot_set_ms: 0,
         }
     }
 
@@ -456,6 +459,7 @@ impl Coordinator {
         let p = Pivot { hash: header.hash_slow(), number: header.number, timestamp: header.timestamp, state_root: header.state_root };
         info!(number = p.number, hash = %p.hash, state_root = %p.state_root, "pivot");
         self.pivot = Some(p);
+        self.pivot_set_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
         *self.shared.pivot.write().await = Some(p);
         self.waiting_for_head = false;
         self.stale_peers.clear();
@@ -749,6 +753,7 @@ impl Coordinator {
             requests: self.shared.requests.load(Ordering::Relaxed),
             wall_ms: wall.as_millis() as u64,
             repivots: self.repivots,
+            pivot_set_ms: self.pivot_set_ms,
         };
         let _ = (self.slice_lo, self.slice_hi);
         Slice { head, accounts: self.accounts.into_iter().collect(), storage: self.storage, code: self.code, boundary }

@@ -39,6 +39,11 @@ pub struct SliceHead {
     pub requests: u64,
     pub wall_ms: u64,
     pub repivots: u64,
+    /// Unix milliseconds when the (last) pivot was taken: in epoch mode,
+    /// how long after the boundary the block was found; the transfer is
+    /// from here to `fetched_at`. 0 when unknown (older slices).
+    #[serde(default)]
+    pub pivot_set_ms: u64,
 }
 
 #[derive(RlpEncodable, RlpDecodable)]

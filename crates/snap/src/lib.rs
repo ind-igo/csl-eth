@@ -10,12 +10,14 @@
 //!
 //! The `csl-eth` binary drives it: `fetch` a prefix, `build` a bucket
 //! from a slice, `check` a bucket, `peers` to probe connectivity, and the
-//! milestone 1 exit tests: [`workload`] and [`faults`].
+//! milestone 1 exit tests: [`workload`] and [`faults`]; `produce` is the
+//! loop that keeps a bucket at the finalized head ([`produce`]).
 
 pub mod discovery;
 pub mod faults;
 pub mod fetch;
 pub mod peer;
+pub mod produce;
 pub mod slice;
 pub mod workload;
 

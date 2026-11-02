@@ -2025,6 +2025,7 @@ mod tests {
                 requests: 0,
                 wall_ms: 0,
                 repivots: 0,
+                pivot_set_ms: 0,
             },
             accounts: leaves.iter().map(|a| (a.hashed, a.account)).collect(),
             storage,

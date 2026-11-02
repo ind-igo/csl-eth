@@ -1574,6 +1574,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-trie",
+ "blake3",
  "bytes",
  "clap",
  "csl-eth-client",
