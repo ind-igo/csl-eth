@@ -21,7 +21,7 @@
 
 use alloy_primitives::{fixed_bytes, B256};
 use helios_consensus_core::{
-    apply_bootstrap, apply_finality_update, apply_update, calc_sync_period,
+    apply_bootstrap, apply_update, calc_sync_period,
     consensus_spec::MainnetConsensusSpec,
     get_bits,
     types::{Bootstrap, FinalityUpdate, Fork, Forks, LightClientStore, Update},
@@ -115,13 +115,14 @@ struct Envelope<T> {
 pub enum HeadError {
     /// A file the verification needs is not in the bucket.
     Missing(String),
-    /// The bucket's period updates stop at `missing` (that period's update,
-    /// and every later one, is not published) while the clock is already
-    /// in `current`, a later period. The committees in hand can follow the
-    /// chain only through period `missing`: the producer has not published
-    /// since. Not a broken bucket, an abandoned one; nothing in it is
-    /// trusted past that period.
-    Stale { missing: u64, current: u64 },
+    /// The newest finality update in the bucket was signed in period
+    /// `signed` and the clock is already in `current`, two or more periods
+    /// later: the producer has not published since. A head is good through
+    /// the period after the one it was signed in (its committee handed over
+    /// once, at most); past that it is refused however well it verifies,
+    /// so a producer that stops, or a bucket that replays old files, cannot
+    /// keep an old head alive. Not a broken bucket, an abandoned one.
+    Stale { signed: u64, current: u64 },
     /// The source failed to read a file.
     Read(String),
     /// A file is not the object its path claims.
@@ -143,11 +144,10 @@ impl fmt::Display for HeadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HeadError::Missing(p) => write!(f, "head file missing: {p}"),
-            HeadError::Stale { missing, current } => write!(
+            HeadError::Stale { signed, current } => write!(
                 f,
-                "stale head: the bucket's head stops at period {missing} \
-                 (head/updates/{missing} is not published) while the clock is in \
-                 period {current}: the producer has not published since"
+                "stale head: the newest finality update was signed in period {signed} \
+                 and the clock is in period {current}: the producer has not published since"
             ),
             HeadError::Read(e) => write!(f, "head file unreadable: {e}"),
             HeadError::Decode { path, error } => write!(f, "{path}: {error}"),
@@ -197,84 +197,112 @@ fn read<T: for<'de> Deserialize<'de>>(src: &dyn HeadSource, path: &str) -> Resul
         .read_head(path)
         .map_err(HeadError::Read)?
         .ok_or_else(|| HeadError::Missing(path.to_string()))?;
-    let env: Envelope<T> = serde_json::from_slice(&bytes).map_err(|e| HeadError::Decode {
+    decode(path, &bytes)
+}
+
+fn decode<T: for<'de> Deserialize<'de>>(path: &str, bytes: &[u8]) -> Result<T, HeadError> {
+    let env: Envelope<T> = serde_json::from_slice(bytes).map_err(|e| HeadError::Decode {
         path: path.to_string(),
         error: e.to_string(),
     })?;
     Ok(env.data)
 }
 
+/// The bootstrap checked against `checkpoint`.
+fn checked_bootstrap(
+    bytes: &[u8],
+    checkpoint: B256,
+    chain: &Chain,
+) -> Result<Bootstrap<Spec>, HeadError> {
+    let bootstrap: Bootstrap<Spec> = decode(&paths::bootstrap(&checkpoint), bytes)?;
+    verify_bootstrap::<Spec>(&bootstrap, checkpoint, &chain.forks)
+        .map_err(|e| HeadError::Bootstrap(e.to_string()))?;
+    Ok(bootstrap)
+}
+
+/// The period updates between a proven bootstrap and a finality update not
+/// yet verified, as of `current_period`: periods `b..s`, `b` the
+/// bootstrap's and `s` the one the finality update was signed in. Each
+/// update hands over to the next committee, so after `b..s` the store
+/// holds the committee that signs in `s`. A finality update signed two or
+/// more periods before the clock's is stale; one signed after it is from
+/// the future and is refused here, before any update is asked for, so the
+/// range is bounded by the clock.
+fn periods_between(
+    bootstrap: &Bootstrap<Spec>,
+    finality: &FinalityUpdate<Spec>,
+    current_period: u64,
+) -> Result<std::ops::Range<u64>, HeadError> {
+    let first = calc_sync_period::<Spec>(bootstrap.header().beacon().slot);
+    let signed = calc_sync_period::<Spec>(*finality.signature_slot());
+    if signed > current_period {
+        return Err(HeadError::Finality(format!(
+            "signed in period {signed}, after the clock's period {current_period}"
+        )));
+    }
+    if signed + 1 < current_period {
+        return Err(HeadError::Stale {
+            signed,
+            current: current_period,
+        });
+    }
+    Ok(first..signed.max(first))
+}
+
 /// Verify the head from `src` starting at `checkpoint`, as of `now`:
-/// bootstrap, every period update from the checkpoint's period to the
-/// current one, then the finality update. Each step is checked against
+/// the bootstrap, then the finality update's signing period (a head signed
+/// two or more periods ago is stale), then the period updates from the
+/// bootstrap's period up to the one the finality update was signed in, in
+/// order, then the finality update itself. Each step is checked against
 /// what the previous one established; nothing is taken from the files on
-/// faith. `now` is a parameter so that a test can fix it.
+/// faith, not even which period a file holds: `head/updates/<p>` must
+/// attest a header of period `p`. The head is the finality update's own
+/// finalized header. `now` is a parameter so that a test can fix it.
 pub fn verify(
     src: &dyn HeadSource,
     chain: &Chain,
     checkpoint: B256,
     now: SystemTime,
 ) -> Result<VerifiedHead, HeadError> {
-    let bootstrap: Bootstrap<Spec> = read(src, &paths::bootstrap(&checkpoint))?;
-    verify_bootstrap::<Spec>(&bootstrap, checkpoint, &chain.forks)
-        .map_err(|e| HeadError::Bootstrap(e.to_string()))?;
+    let bootstrap_path = paths::bootstrap(&checkpoint);
+    let bytes = src
+        .read_head(&bootstrap_path)
+        .map_err(HeadError::Read)?
+        .ok_or(HeadError::Missing(bootstrap_path))?;
+    let bootstrap = checked_bootstrap(&bytes, checkpoint, chain)?;
     let mut store = LightClientStore::<Spec>::default();
     apply_bootstrap::<Spec>(&mut store, &bootstrap);
 
+    let finality: FinalityUpdate<Spec> = read(src, paths::FINALITY)?;
     let current_slot = current_slot(chain, now);
     let current_period = calc_sync_period::<Spec>(current_slot);
-    let mut period = calc_sync_period::<Spec>(store.finalized_header.beacon().slot);
+    let periods = periods_between(&bootstrap, &finality, current_period)?;
+
     let mut updates_applied = 0;
-    while period <= current_period {
-        let path = paths::update(period);
-        match src.read_head(&path).map_err(HeadError::Read)? {
-            Some(bytes) => {
-                let env: Envelope<Update<Spec>> =
-                    serde_json::from_slice(&bytes).map_err(|e| HeadError::Decode {
-                        path: path.clone(),
-                        error: e.to_string(),
-                    })?;
-                verify_update::<Spec>(
-                    &env.data,
-                    current_slot,
-                    &store,
-                    chain.genesis_root,
-                    &chain.forks,
-                )
-                .map_err(|e| HeadError::Update {
-                    period,
-                    error: e.to_string(),
-                })?;
-                apply_update::<Spec>(&mut store, &env.data);
-                updates_applied += 1;
-            }
-            // The current period's update exists only once a block of the
-            // period has been attested with the next committee in it; the
-            // finality update below is signed by the committee already
-            // known. An earlier period's update is required: when no later
-            // one exists either, the bucket simply stopped being updated
-            // (stale); a gap with later updates present is a broken bucket.
-            None if period == current_period => {}
-            None => {
-                for later in period + 1..=current_period {
-                    if src
-                        .read_head(&paths::update(later))
-                        .map_err(HeadError::Read)?
-                        .is_some()
-                    {
-                        return Err(HeadError::Missing(path));
-                    }
-                }
-                return Err(HeadError::Stale {
-                    missing: period,
-                    current: current_period,
-                });
-            }
+    for period in periods {
+        let update: Update<Spec> = read(src, &paths::update(period))?;
+        let attested = calc_sync_period::<Spec>(update.attested_header().beacon().slot);
+        if attested != period {
+            return Err(HeadError::Update {
+                period,
+                error: format!("attests a header of period {attested}, not {period}"),
+            });
         }
-        period += 1;
+        verify_update::<Spec>(
+            &update,
+            current_slot,
+            &store,
+            chain.genesis_root,
+            &chain.forks,
+        )
+        .map_err(|e| HeadError::Update {
+            period,
+            error: e.to_string(),
+        })?;
+        apply_update::<Spec>(&mut store, &update);
+        updates_applied += 1;
     }
 
-    let finality: FinalityUpdate<Spec> = read(src, paths::FINALITY)?;
     verify_finality_update::<Spec>(
         &finality,
         current_slot,
@@ -284,9 +312,11 @@ pub fn verify(
     )
     .map_err(|e| HeadError::Finality(e.to_string()))?;
     let participants = get_bits::<Spec>(&finality.sync_aggregate().sync_committee_bits);
-    apply_finality_update::<Spec>(&mut store, &finality);
 
-    let header = &store.finalized_header;
+    // The finality update's own header, not the store's: a period update
+    // can carry a finalized header of its own, newer or older, and the
+    // head is what `head/finality` proves.
+    let header = finality.finalized_header();
     let beacon = header.beacon();
     let exec = header.execution().map_err(|_| HeadError::NoExecution)?;
     let execution = ExecutionHead {
@@ -311,30 +341,27 @@ pub fn verify(
     })
 }
 
-/// The period updates [`verify`] will read after the bootstrap `bytes`:
-/// every period from the bootstrap's through the current one. The
-/// bootstrap is checked against `checkpoint` first, so a host that fetches
-/// these files in one round fetches them for a proven committee; an error
-/// is the one `verify` returns at the same step. This lets a host ask for
-/// the bootstrap and the finality update in one round and every period
-/// update in the next, while `verify` still checks them in order.
+/// The period updates [`verify`] will read, given the bootstrap's and the
+/// finality update's bytes: periods `b..s`, from the bootstrap's to the
+/// one before the finality update was signed in (empty when it was signed
+/// in the bootstrap's period). The bootstrap is checked against
+/// `checkpoint` first, and a stale or future finality update is refused
+/// here, so an error is the one `verify` returns at the same step. This
+/// lets a host ask for the bootstrap and the finality update in one round
+/// and the period updates in the next, while `verify` still checks them in
+/// order. The finality update is not verified here; its signing period
+/// only bounds what the next round asks for.
 pub fn update_periods(
-    bytes: &[u8],
+    bootstrap: &[u8],
+    finality: &[u8],
     checkpoint: B256,
     chain: &Chain,
     now: SystemTime,
-) -> Result<std::ops::RangeInclusive<u64>, HeadError> {
-    let path = paths::bootstrap(&checkpoint);
-    let env: Envelope<Bootstrap<Spec>> =
-        serde_json::from_slice(bytes).map_err(|e| HeadError::Decode {
-            path,
-            error: e.to_string(),
-        })?;
-    verify_bootstrap::<Spec>(&env.data, checkpoint, &chain.forks)
-        .map_err(|e| HeadError::Bootstrap(e.to_string()))?;
-    let first = calc_sync_period::<Spec>(env.data.header().beacon().slot);
+) -> Result<std::ops::Range<u64>, HeadError> {
+    let bootstrap = checked_bootstrap(bootstrap, checkpoint, chain)?;
+    let finality: FinalityUpdate<Spec> = decode(paths::FINALITY, finality)?;
     let current = calc_sync_period::<Spec>(current_slot(chain, now));
-    Ok(first..=current)
+    periods_between(&bootstrap, &finality, current)
 }
 
 /// The sync-committee period of a slot (8,192 slots, about 27 hours).

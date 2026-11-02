@@ -3,14 +3,18 @@
 // the finalized execution header, its state root, the snapshot's manifest
 // and each table's page 0. A link is drawn from the client's verdict, not
 // from timing: it turns green only once the client has accepted it, and
-// red at the step where the client refused it. The head comes in two
-// rounds: the bootstrap with the finality update, then every period update
-// at once, asked for only once the bootstrap proved the checkpoint. So a
-// request for an update is the client's acceptance of the bootstrap, the
-// manifest's request is its acceptance of every update and the finality
-// update (the verifier checks them in order before it asks), and a
-// refusal names the step: the period it stopped at, or the finality
-// update. Times come from the drive's own log and step timings.
+// red at the step where the client refused it. The head comes in at most
+// two rounds: the bootstrap with the finality update, then the period
+// updates between them (the bootstrap's period up to the one the finality
+// update was signed in; none when they share it), asked for only once the
+// bootstrap proved the checkpoint and the finality update was found fresh.
+// So a request for an update is the client's acceptance of the bootstrap,
+// the manifest's request is its acceptance of every update and the
+// finality update (the verifier checks them in order before it asks), and
+// a refusal names the step it stopped at: the bootstrap, a period's
+// update, or the finality update (a stale head among them). Links before
+// that step were accepted, links after it were never checked. Times come
+// from the drive's own log and step timings.
 
 import type { Head } from "../protocol.ts";
 import { type Cursor, type Lane, type Scene, esc, kb, short } from "./model.ts";
@@ -46,11 +50,14 @@ interface Verdict {
   acceptedBelow: number;
   /// The open failed, and the cursor has reached its refusal.
   refused: boolean;
+  /// The rank of the link the refusal names, when it names one: links
+  /// above it were never checked.
+  refusedAt: number | null;
 }
 
 /// The state of the requests whose file satisfies `pick`, at the cursor,
 /// judged by the client's verdict on the link of rank `rank`.
-function stateOf(l: Lane, li: number, cur: Cursor, v: Verdict, rank: number, pick: (file: string, offset: number | null) => boolean): { state: State; reqs: string[]; status: number[]; bytes: number; round: number } {
+function stateOf(l: Lane, li: number, cur: Cursor, v: Verdict, rank: number, pick: (file: string, offset: number | null) => boolean): { state: State; reqs: string[]; status: number[]; bytes: number; round: number; unchecked?: boolean } {
   const rs = l.reqs.filter((r) => pick(r.file, r.offset));
   const sent = l.sent.filter((q) => pick(q.file, q.offset) && l.offset + q.start <= cur.t);
   const reqs = rs.map((r) => `${li}:${r.round}:${r.index ?? 0}`);
@@ -64,6 +71,7 @@ function stateOf(l: Lane, li: number, cur: Cursor, v: Verdict, rank: number, pic
   const done = stepEndOf(l, round);
   if (done === undefined || done > cur.t) return { state: "check", reqs, status, bytes, round };
   if (rank < v.acceptedBelow) return { state: "ok", reqs, status, bytes, round };
+  if (v.refused && v.refusedAt !== null && rank > v.refusedAt) return { state: "wait", reqs, status, bytes, round, unchecked: true };
   if (v.refused) return { state: "bad", reqs, status, bytes, round };
   return { state: "check", reqs, status, bytes, round };
 }
@@ -100,46 +108,45 @@ export function renderChain(scene: Scene | null, cur: Cursor, focusReqs: Set<str
     acceptedBelow = Math.max(acceptedBelow, Math.floor(k));
   }
   if (head) acceptedBelow = Infinity;
-  const v: Verdict = { acceptedBelow, refused };
+  // A refusal names the step the verifier stopped at: everything before
+  // it was accepted, whatever was requested.
+  const at = refusalAt(refused ? l.error : undefined);
+  if (refused && at.rank !== null) acceptedBelow = at.rank;
+  else if (refused && at.headOk) acceptedBelow = Math.max(acceptedBelow, 3);
+  const v: Verdict = { acceptedBelow, refused, refusedAt: at.rank };
   const failedAtStart = refused && l.reqs.length === 0;
 
   items.push({ title: "checkpoint", sub: failedAtStart ? `${short(checkpoint, 6)} · refused: ${l.error}` : `${short(checkpoint, 6)} · the one thing trusted: a beacon block root`, state: failedAtStart ? "bad" : "ok", reqs: [] });
   const boot = stateOf(l, li, cur, v, 0, (f) => f.startsWith("head/bootstrap/"));
   items.push({ title: "sync committee", sub: boot.state === "ok" ? `the bootstrap's 512 keys, proven against the checkpoint · ${kb(boot.bytes)}` : boot.state === "bad" ? `refused: ${l.error}` : "head/bootstrap", state: boot.state, reqs: boot.reqs });
-  // Period updates: each hands over to the next committee. The client
-  // accepts a missing update only for the current period (its file is
-  // published once the period has a block attested by the next committee);
-  // an earlier period's update is required, and when none from it on is
-  // published the bucket is stale: its producer stopped.
-  const at = refusalAt(refused ? l.error : undefined);
+  // Period updates: each hands over to the next committee, from the
+  // bootstrap's period up to the one the finality update was signed in.
+  // Only those are asked for; every one of them is required.
   const ups = l.reqs.filter((r) => r.file.startsWith("head/updates/"));
   const upSent = l.sent.filter((q) => q.file.startsWith("head/updates/"));
-  const upFiles = [...new Set([...ups.map((r) => r.file), ...upSent.map((q) => q.file)])];
-  if (!upFiles.length) items.push({ title: "period update", sub: "", state: "wait", reqs: [] });
+  const upFiles = [...new Set([...ups.map((r) => r.file), ...upSent.map((q) => q.file)])].sort((a, b) => Number(a.slice(13)) - Number(b.slice(13)));
+  if (!upFiles.length) {
+    if (head || (refused && at.headOk) || (refused && at.rank !== null && at.rank >= 3)) items.push({ title: "period updates (none)", sub: "the finality update is signed in the bootstrap's period, by the committee it proves", state: "ok", reqs: [] });
+    else if (refused && at.rank !== null) items.push({ title: "period updates", sub: at.rank >= 2 ? "not asked for: the finality update was refused first" : "not asked for", state: "wait", reqs: [] });
+    else items.push({ title: "period updates", sub: "", state: "wait", reqs: [] });
+  }
   for (const f of upFiles) {
     const rank = rankOf(f, null, manifest)!;
     const s = stateOf(l, li, cur, v, rank, (x) => x === f);
     const period = f.slice("head/updates/".length);
-    const n = Number(period);
     const missing = s.status.length > 0 && s.status.every((x) => x === 404);
-    // One round fetched them all; the refusal says how far the checks got.
-    let state: State = s.state;
-    if (state === "bad" && at.pastUpdates) state = "ok";
-    else if (state === "bad" && at.period !== undefined && n < at.period) state = "ok";
-    else if (state === "bad" && at.period !== undefined && n > at.period) state = "wait";
     let sub = `head/updates/${period}`;
     let title = "period update";
-    if (state === "ok") sub = missing ? `period ${period}: not published yet; the client accepts that only for the current period, and the committee in hand signs the head` : `period ${period}: the next committee, signed by the last · ${kb(s.bytes)}`;
-    else if (state === "wait" && s.state === "bad") sub = `period ${period}: not checked; the client refused an earlier period`;
-    else if (state === "bad" && at.stale) {
-      title = "period update (not published)";
-      sub = `period ${period}: ${l.error}`;
-    } else if (state === "bad") sub = `period ${period}: refused: ${l.error}`;
-    if (missing && state === "ok") title = "period update (none yet)";
-    items.push({ title, sub, state, reqs: s.reqs });
+    if (s.state === "ok") sub = `period ${period}: the next committee, signed by the last · ${kb(s.bytes)}`;
+    else if (s.unchecked) sub = `period ${period}: not checked; the client refused an earlier link`;
+    else if (s.state === "bad") {
+      if (missing) title = "period update (not published)";
+      sub = `period ${period}: refused: ${l.error}`;
+    }
+    items.push({ title, sub, state: s.state, reqs: s.reqs });
   }
   const fin = stateOf(l, li, cur, v, 2, (f) => f === "head/finality");
-  const signers = fin.state === "bad" ? `refused: ${l.error}` : head ? `signed by ${head.participants} of 512 committee members · ${kb(fin.bytes)}` : fin.state === "ok" ? `signed by the committee in hand · ${kb(fin.bytes)}` : "head/finality";
+  const signers = fin.state === "bad" ? (at.stale ? `stale: ${l.error}` : `refused: ${l.error}`) : fin.unchecked ? "not checked; the client refused an earlier link" : head ? `signed by ${head.participants} of 512 committee members · ${kb(fin.bytes)}` : fin.state === "ok" ? `signed by the committee in hand · ${kb(fin.bytes)}` : "head/finality";
   items.push({ title: "finality update", sub: signers, state: fin.state, reqs: fin.reqs });
   // The execution header rides in the finality update, under a Merkle
   // branch to the beacon block; the client checks it in the same step.
@@ -170,17 +177,20 @@ export function renderChain(scene: Scene | null, cur: Cursor, focusReqs: Set<str
   return draw(items, focusReqs);
 }
 
-/// Where a refused open stopped, as far as the period updates go: the
-/// period whose update was missing (a stale bucket), refused or unreadable;
-/// or past them all, at the finality update or later.
-function refusalAt(err: string | undefined): { period?: number; stale?: boolean; pastUpdates?: boolean } {
-  if (!err) return {};
-  let m = err.match(/stale head: the bucket's head stops at period (\d+)/);
-  if (m) return { period: Number(m[1]), stale: true };
-  m = err.match(/update for period (\d+) rejected/) ?? err.match(/head\/updates\/(\d+)/);
-  if (m) return { period: Number(m[1]) };
-  if (/finality|no snapshot at finalized|snapshot:/.test(err)) return { pastUpdates: true };
-  return {};
+/// Where a refused open stopped: the rank of the link its error names
+/// (the bootstrap, a period's update, the finality update, the manifest),
+/// or `null` with `headOk` for a refusal after the head (the snapshot's
+/// own reads), or `null` alone when the error names no link.
+function refusalAt(err: string | undefined): { rank: number | null; stale?: boolean; headOk?: boolean } {
+  if (!err) return { rank: null };
+  if (/head\/bootstrap\/|bootstrap rejected/.test(err)) return { rank: 0 };
+  const m = err.match(/update for period (\d+) rejected/) ?? err.match(/head\/updates\/(\d+)/);
+  if (m) return { rank: rankOf(`head/updates/${m[1]}`, null, null) };
+  if (/stale head:/.test(err)) return { rank: 2, stale: true };
+  if (/finality update rejected|head\/finality|no execution payload/.test(err)) return { rank: 2 };
+  if (/no snapshot at finalized/.test(err)) return { rank: 3 };
+  if (/snapshot:/.test(err)) return { rank: null, headOk: true };
+  return { rank: null };
 }
 
 const ICON: Record<State, string> = { wait: "", fetch: "", check: "", ok: "✓", warn: "!", bad: "✗" };

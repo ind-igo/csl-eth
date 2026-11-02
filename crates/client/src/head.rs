@@ -6,13 +6,14 @@
 //! slice milestone the published snapshot must be the finalized one, and a
 //! lagging snapshot is an error that says which block it is at.
 //!
-//! Opening is rounds like everything else, and the head is two of them
-//! however old the checkpoint: the bootstrap and the finality update
-//! together, then every period update from the bootstrap's period through
-//! the current one at once (the bootstrap names the first period, the
-//! clock the last); then the manifest, then the models. The verifier still
-//! reads and checks them in its order, each against what the last
-//! established; only when the bytes are asked for changed.
+//! Opening is rounds like everything else, and the head is at most two of
+//! them however old the checkpoint: the bootstrap and the finality update
+//! together, then at once every period update from the bootstrap's period
+//! up to the one the finality update was signed in (the bootstrap names the
+//! first, the finality update the last; none when they share a period, and
+//! then there is no second round); then the manifest, then the models. The
+//! verifier still reads and checks them in its order, each against what
+//! the last established; only when the bytes are asked for changed.
 
 use crate::{manifest_path, At, Driver, Opener, Pending, Snapshot, Store, PENDING};
 use alloy_primitives::B256;
@@ -73,9 +74,10 @@ impl fmt::Display for HeadOpenError {
 impl std::error::Error for HeadOpenError {}
 
 /// Verify the head from the store, or `Pending` with the next round's
-/// files. Round 1 is the bootstrap and `head/finality`; round 2 every
-/// period update the bootstrap and the clock call for. A bootstrap that is
-/// absent or does not prove the checkpoint asks for no updates: `verify`
+/// files. Round 1 is the bootstrap and `head/finality`; round 2 the period
+/// updates between them, which the finality update's signing period bounds
+/// before it is verified. A bootstrap or finality update that is absent,
+/// does not prove the checkpoint or is stale asks for no updates: `verify`
 /// then refuses it with the same error it always did.
 fn try_verify(
     store: &Store,
@@ -85,11 +87,11 @@ fn try_verify(
     let chain = Chain::mainnet();
     let bootstrap = store.file(&paths::bootstrap(&checkpoint));
     let finality = store.file(paths::FINALITY);
-    let (Ok(bootstrap), Ok(_)) = (bootstrap, finality) else {
+    let (Ok(bootstrap), Ok(finality)) = (bootstrap, finality) else {
         return Err(Pending);
     };
-    if let Ok(Some(b)) = &bootstrap {
-        if let Ok(periods) = update_periods(b, checkpoint, &chain, now) {
+    if let (Ok(Some(b)), Ok(Some(f))) = (&bootstrap, &finality) {
+        if let Ok(periods) = update_periods(b, f, checkpoint, &chain, now) {
             let mut pending = false;
             for p in periods {
                 pending |= store.file(&paths::update(p)).is_err();

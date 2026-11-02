@@ -1,7 +1,11 @@
-//! Real mainnet objects fetched from a beacon node on 2026-10-31 (period
-//! 1898, Fulu): the head verifies from the checkpoint root alone, and
-//! every tampered or misplaced file is rejected. `now` is pinned to the
-//! fetch time so the slot arithmetic is stable.
+//! Real mainnet objects (Fulu): the head verifies from the checkpoint root
+//! alone, and every tampered, misplaced or stale file is rejected. Two sets:
+//! `fixtures/` fetched from a beacon node on 2026-10-31, a finality update
+//! signed in the bootstrap's own period 1898 (no update between them); and
+//! `fixtures/p1900/`, the producer's first published head of 2026-11-02, a
+//! bootstrap in 1898 and a finality update signed in 1900, with the period
+//! updates for 1898, 1899 and 1900. `now` is pinned to each fetch time so
+//! the slot arithmetic is stable.
 
 use alloy_primitives::B256;
 use csl_eth_head::{paths, verify, Chain, HeadError, HeadSource};
@@ -26,25 +30,35 @@ struct Fixture {
     files: Files,
 }
 
+/// The 2026-10-31 set: bootstrap and finality update both in 1898.
 fn fixture() -> Fixture {
+    load(FIX, &[1897, 1898])
+}
+
+/// The producer's set: bootstrap in 1898, finality update signed in 1900.
+fn fixture_1900() -> Fixture {
+    load(&format!("{FIX}/p1900"), &[1898, 1899, 1900])
+}
+
+fn load(dir: &str, updates: &[u64]) -> Fixture {
     let meta: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(format!("{FIX}/meta.json")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(format!("{dir}/meta.json")).unwrap()).unwrap();
     let checkpoint: B256 = meta["checkpoint"].as_str().unwrap().parse().unwrap();
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(meta["now"].as_u64().unwrap());
     let mut files = HashMap::new();
     files.insert(
         paths::bootstrap(&checkpoint),
-        std::fs::read(format!("{FIX}/bootstrap.json")).unwrap(),
+        std::fs::read(format!("{dir}/bootstrap.json")).unwrap(),
     );
-    for p in [1897u64, 1898] {
+    for p in updates {
         files.insert(
-            paths::update(p),
-            std::fs::read(format!("{FIX}/update-{p}.json")).unwrap(),
+            paths::update(*p),
+            std::fs::read(format!("{dir}/update-{p}.json")).unwrap(),
         );
     }
     files.insert(
         paths::FINALITY.to_string(),
-        std::fs::read(format!("{FIX}/finality.json")).unwrap(),
+        std::fs::read(format!("{dir}/finality.json")).unwrap(),
     );
     Fixture {
         checkpoint,
@@ -65,7 +79,10 @@ fn the_head_verifies_from_the_checkpoint_alone() {
     let h = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now).unwrap();
     assert_eq!(h.checkpoint, fx.checkpoint);
     assert_eq!(h.period, 1898);
-    assert_eq!(h.updates_applied, 1, "the checkpoint's own period update");
+    assert_eq!(
+        h.updates_applied, 0,
+        "signed in the checkpoint's own period: no committee handover between"
+    );
     assert!(
         h.participants > 341,
         "two thirds of 512: {}",
@@ -176,13 +193,7 @@ fn a_finality_update_from_the_future_is_rejected() {
     // A clock a day behind the objects: their signature slot is in the future.
     let early = fx.now - Duration::from_secs(24 * 3600);
     let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, early);
-    assert!(
-        matches!(
-            r,
-            Err(HeadError::Finality(_)) | Err(HeadError::Update { .. })
-        ),
-        "{r:?}"
-    );
+    assert!(matches!(r, Err(HeadError::Finality(_))), "{r:?}");
 }
 
 #[test]
@@ -196,19 +207,6 @@ fn a_frozen_finality_file_shows_as_lag_not_as_fresh_state() {
         h.finality_lag_secs
     );
     assert_eq!(h.execution.block_number, 26_310_853);
-}
-
-#[test]
-fn an_update_from_the_wrong_period_is_rejected() {
-    let mut fx = fixture();
-    // The 1897 update in 1898's slot: its committee proof is for another period.
-    let wrong = fx.files.0.get(&paths::update(1897)).unwrap().clone();
-    fx.files.0.insert(paths::update(1898), wrong);
-    let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
-    assert!(
-        matches!(r, Err(HeadError::Update { period: 1898, .. })),
-        "{r:?}"
-    );
 }
 
 #[test]
@@ -229,63 +227,170 @@ fn period_start(p: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(chain.genesis_time + p * 8192 * 12)
 }
 
+fn reads(fx: &Fixture, now: SystemTime) -> Vec<String> {
+    struct Log<'a>(&'a Files, std::cell::RefCell<Vec<String>>);
+    impl HeadSource for Log<'_> {
+        fn read_head(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
+            self.1.borrow_mut().push(rel.to_string());
+            self.0.read_head(rel)
+        }
+    }
+    let log = Log(&fx.files, Default::default());
+    let _ = verify(&log, &Chain::mainnet(), fx.checkpoint, now);
+    log.1.into_inner()
+}
+
 #[test]
-fn a_bucket_not_updated_since_is_stale_not_missing() {
-    let fx = fixture();
-    // An hour into period 1900 with updates through 1898: the head stops
-    // at 1899, which the clock has left. The frozen snapshot's case.
+fn a_head_signed_two_periods_ago_is_stale() {
+    let mut fx = fixture();
+    // An hour into period 1900 with the finality update signed in 1898:
+    // the producer has not published since. Refused before any period
+    // update is read, so later files in the bucket change nothing.
     let now = period_start(1900) + Duration::from_secs(3600);
+    for p in [1899, 1900] {
+        fx.files.0.insert(paths::update(p), b"not read".to_vec());
+    }
     let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, now);
     assert_eq!(
         r,
         Err(HeadError::Stale {
-            missing: 1899,
+            signed: 1898,
             current: 1900
         })
     );
     let msg = r.unwrap_err().to_string();
     assert!(
-        msg.contains("stops at period 1899") && msg.contains("clock is in period 1900"),
+        msg.contains("signed in period 1898") && msg.contains("clock is in period 1900"),
         "{msg}"
     );
     assert!(msg.contains("has not published since"), "{msg}");
-}
-
-#[test]
-fn the_period_after_the_last_update_still_verifies() {
-    let fx = fixture();
-    // In period 1899 with no 1899 update: the current period's update may
-    // not exist yet, and the 1899 committee (from 1898's update) signs.
-    // The fixture's finality update is from 1898 and still verifies; it is
-    // lag, not staleness.
-    let now = period_start(1899) + Duration::from_secs(3600);
-    let h = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, now).unwrap();
-    assert_eq!(h.execution.block_number, 26_310_853);
-}
-
-#[test]
-fn a_missing_checkpoint_period_update_is_stale() {
-    let mut fx = fixture();
-    fx.files.0.remove(&paths::update(1898));
-    let now = period_start(1899) + Duration::from_secs(60);
-    let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, now);
-    assert_eq!(
-        r,
-        Err(HeadError::Stale {
-            missing: 1898,
-            current: 1899
-        })
+    assert!(
+        reads(&fx, now)
+            .iter()
+            .all(|f| !f.starts_with("head/updates/")),
+        "{:?}",
+        reads(&fx, now)
     );
 }
 
 #[test]
-fn a_gap_before_a_later_update_is_missing_not_stale() {
+fn the_period_after_the_signing_period_still_verifies() {
     let mut fx = fixture();
-    // 1898 gone but a (here bogus) 1899 present: the producer did publish
-    // later, so the hole is a broken bucket, named by its path.
-    let later = fx.files.0.remove(&paths::update(1898)).unwrap();
-    fx.files.0.insert(paths::update(1899), later);
-    let now = period_start(1899) + Duration::from_secs(60);
-    let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, now);
-    assert_eq!(r, Err(HeadError::Missing(paths::update(1898))));
+    // In period 1899 with the finality update signed in 1898: lag, not
+    // staleness. No period update is needed, so none is read.
+    fx.files.0.retain(|k, _| !k.starts_with("head/updates/"));
+    let now = period_start(1899) + Duration::from_secs(3600);
+    let h = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, now).unwrap();
+    assert_eq!(h.execution.block_number, 26_310_853);
+    assert_eq!(h.updates_applied, 0);
+}
+
+#[test]
+fn a_head_two_periods_on_applies_the_updates_between() {
+    let fx = fixture_1900();
+    let h = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now).unwrap();
+    assert_eq!(h.updates_applied, 2, "1898 and 1899, not 1900");
+    assert_eq!(h.execution.block_number, 26_327_404);
+    assert_eq!(
+        h.execution.block_hash,
+        "0x4fc8b6c654c2a14171aee6474d12312088fa4f2a21f5df74eb97edb5f99ba8db"
+            .parse::<B256>()
+            .unwrap()
+    );
+    // The finality update's own finalized header.
+    assert_eq!(h.slot, 15_566_847);
+    assert_eq!(h.period, 1900);
+    assert!(h.participants > 341, "{}", h.participants);
+    assert_eq!(
+        reads(&fx, fx.now),
+        vec![
+            paths::bootstrap(&fx.checkpoint),
+            paths::FINALITY.to_string(),
+            paths::update(1898),
+            paths::update(1899),
+        ]
+    );
+}
+
+#[test]
+fn the_signing_periods_own_update_is_not_read() {
+    let mut fx = fixture_1900();
+    // The producer publishes 1900's update for other light clients; this
+    // verifier has the 1900 committee from 1899's update and never reads it.
+    fx.files
+        .0
+        .insert(paths::update(1900), b"not an update".to_vec());
+    let h = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now).unwrap();
+    assert_eq!(h.execution.block_number, 26_327_404);
+    fx.files.0.remove(&paths::update(1900));
+    assert!(verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now).is_ok());
+}
+
+#[test]
+fn a_missing_update_between_is_a_broken_bucket() {
+    for p in [1898, 1899] {
+        let mut fx = fixture_1900();
+        fx.files.0.remove(&paths::update(p));
+        let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
+        assert_eq!(r, Err(HeadError::Missing(paths::update(p))));
+    }
+}
+
+#[test]
+fn an_update_from_the_wrong_period_is_rejected() {
+    let mut fx = fixture_1900();
+    // The 2026-10-31 set's 1897 update in 1898's slot: it attests a 1897
+    // header, so it is not 1898's update whatever it proves.
+    let wrong = std::fs::read(format!("{FIX}/update-1897.json")).unwrap();
+    fx.files.0.insert(paths::update(1898), wrong);
+    let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
+    let Err(HeadError::Update {
+        period: 1898,
+        error,
+    }) = &r
+    else {
+        panic!("{r:?}");
+    };
+    assert!(error.contains("period 1897"), "{error}");
+}
+
+#[test]
+fn an_update_replayed_under_a_later_period_is_refused() {
+    // Update 1900 attests slot 15,564,866, above its finalized 15,564,800
+    // and above anything the store has finalized: a relevance check that
+    // compares slots alone does not refuse a copy of it. Its file name
+    // does: 1900's bytes in 1899's slot attest period 1900.
+    let mut fx = fixture_1900();
+    let u = fx.files.0[&paths::update(1900)].clone();
+    fx.files.0.insert(paths::update(1899), u.clone());
+    let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
+    let Err(HeadError::Update {
+        period: 1899,
+        error,
+    }) = &r
+    else {
+        panic!("{r:?}");
+    };
+    assert!(error.contains("period 1900"), "{error}");
+
+    // The replay as a way to keep the head alive: 1900's update copied
+    // into every later period while the clock runs on. The finality update
+    // is still the one signed in 1900, so the head is stale from 1902
+    // whatever the update files say.
+    let mut fx = fixture_1900();
+    for p in [1901, 1902] {
+        fx.files.0.insert(paths::update(p), u.clone());
+    }
+    let ok = period_start(1901) + Duration::from_secs(3600);
+    let h = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, ok).unwrap();
+    assert_eq!(h.execution.block_number, 26_327_404);
+    let later = period_start(1902) + Duration::from_secs(60);
+    let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, later);
+    assert_eq!(
+        r,
+        Err(HeadError::Stale {
+            signed: 1900,
+            current: 1902
+        })
+    );
 }

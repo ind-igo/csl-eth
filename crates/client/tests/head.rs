@@ -1,8 +1,10 @@
-//! The head through the sans-I/O opener: two rounds however many period
-//! updates the bucket holds, and every rejection the verifier makes on
-//! files read one by one it makes the same way on files fetched in two
-//! rounds. Real mainnet objects of 2026-10-31 (period 1898), the head
-//! crate's fixtures, with `now` pinned.
+//! The head through the sans-I/O opener: at most two rounds however many
+//! period updates the bucket holds, exactly the files the verifier reads,
+//! and every rejection the verifier makes on files read one by one it
+//! makes the same way on files fetched in rounds. Real mainnet objects, the
+//! head crate's fixtures: 2026-10-31's (bootstrap and finality update both
+//! in period 1898) and the producer's of 2026-11-02 (bootstrap in 1898,
+//! finality update signed in 1900), with `now` pinned.
 
 use alloy_primitives::B256;
 use csl_eth_client::{
@@ -58,25 +60,35 @@ struct Fixture {
     files: Files,
 }
 
+/// Bootstrap and finality update both in 1898.
 fn fixture() -> Fixture {
+    load(FIX, &[1897, 1898])
+}
+
+/// Bootstrap in 1898, finality update signed in 1900.
+fn fixture_1900() -> Fixture {
+    load(&format!("{FIX}/p1900"), &[1898, 1899, 1900])
+}
+
+fn load(dir: &str, updates: &[u64]) -> Fixture {
     let meta: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(format!("{FIX}/meta.json")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(format!("{dir}/meta.json")).unwrap()).unwrap();
     let checkpoint: B256 = meta["checkpoint"].as_str().unwrap().parse().unwrap();
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(meta["now"].as_u64().unwrap());
     let mut files = HashMap::new();
     files.insert(
         paths::bootstrap(&checkpoint),
-        std::fs::read(format!("{FIX}/bootstrap.json")).unwrap(),
+        std::fs::read(format!("{dir}/bootstrap.json")).unwrap(),
     );
-    for p in [1897u64, 1898] {
+    for p in updates {
         files.insert(
-            paths::update(p),
-            std::fs::read(format!("{FIX}/update-{p}.json")).unwrap(),
+            paths::update(*p),
+            std::fs::read(format!("{dir}/update-{p}.json")).unwrap(),
         );
     }
     files.insert(
         paths::FINALITY.to_string(),
-        std::fs::read(format!("{FIX}/finality.json")).unwrap(),
+        std::fs::read(format!("{dir}/finality.json")).unwrap(),
     );
     Fixture {
         checkpoint,
@@ -102,8 +114,15 @@ fn edit_json(bytes: &[u8], f: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
     serde_json::to_vec(&v).unwrap()
 }
 
+fn head_round(fx: &Fixture) -> BTreeSet<String> {
+    set(&[
+        paths::bootstrap(&fx.checkpoint),
+        paths::FINALITY.to_string(),
+    ])
+}
+
 #[test]
-fn the_head_is_two_rounds_then_the_manifest() {
+fn signed_in_the_bootstraps_period_the_head_is_one_round() {
     let fx = fixture();
     let r = open_at_head(&fx.files, fx.checkpoint, fx.now);
     // No snapshot in this bucket: the open verifies the head and stops at
@@ -113,16 +132,28 @@ fn the_head_is_two_rounds_then_the_manifest() {
     };
     assert_eq!(finalized.block_number, 26_310_853);
     let rounds = fx.files.rounds();
-    assert_eq!(
-        rounds[0],
-        set(&[
-            paths::bootstrap(&fx.checkpoint),
-            paths::FINALITY.to_string()
-        ])
+    assert_eq!(rounds[0], head_round(&fx));
+    // Bootstrap and finality update in 1898: no update between, and the
+    // 1897 and 1898 files beside them are never asked for.
+    assert!(
+        rounds[1].iter().all(|f| f.starts_with("snapshots/")),
+        "{:?}",
+        rounds[1]
     );
-    // The bootstrap is in 1898 and so is the clock: one update, and the
-    // 1897 file beside it is never asked for.
-    assert_eq!(rounds[1], set(&[paths::update(1898)]));
+}
+
+#[test]
+fn two_periods_on_the_updates_between_are_the_second_round() {
+    let fx = fixture_1900();
+    let r = open_at_head(&fx.files, fx.checkpoint, fx.now);
+    let Err(HeadOpenError::NotAtHead { finalized, .. }) = r else {
+        panic!("{:?}", r.err());
+    };
+    assert_eq!(finalized.block_number, 26_327_404);
+    let rounds = fx.files.rounds();
+    assert_eq!(rounds[0], head_round(&fx));
+    // 1898 and 1899; 1900's update is in the bucket and not asked for.
+    assert_eq!(rounds[1], set(&[paths::update(1898), paths::update(1899)]));
     assert!(
         rounds[2].iter().all(|f| f.starts_with("snapshots/")),
         "{:?}",
@@ -131,58 +162,29 @@ fn the_head_is_two_rounds_then_the_manifest() {
 }
 
 #[test]
-fn every_period_update_comes_in_the_second_round() {
-    // Two periods on, with the 1899 and 1900 updates present: still two
-    // rounds, all three updates in the second.
-    let mut fx = fixture();
-    let u = fx.files.files[&paths::update(1898)].clone();
-    // The bytes do not matter for the round count up to the refusal: 1898
-    // verifies, the copy in 1899's slot is refused by its period.
-    fx.files.files.insert(paths::update(1899), u.clone());
-    fx.files.files.insert(paths::update(1900), u);
-    let now = period_start(1900) + Duration::from_secs(600);
-    let r = verify_head(&&fx.files, fx.checkpoint, now);
-    assert!(
-        matches!(r, Err(HeadError::Update { period: 1899, .. })),
-        "{r:?}"
-    );
-    assert_eq!(r, verify(&fx.files, &Chain::mainnet(), fx.checkpoint, now));
-    let rounds = fx.files.rounds();
-    assert_eq!(rounds.len(), 2, "{rounds:?}");
-    assert_eq!(
-        rounds[1],
-        set(&[
-            paths::update(1898),
-            paths::update(1899),
-            paths::update(1900)
-        ])
-    );
-}
-
-#[test]
-fn a_missing_current_period_update_is_fine_in_the_second_round() {
-    let fx = fixture();
-    let now = period_start(1899) + Duration::from_secs(600);
-    let h = verify_head(&&fx.files, fx.checkpoint, now).unwrap();
-    assert_eq!(h.execution.block_number, 26_310_853);
-    let rounds = fx.files.rounds();
-    assert_eq!(rounds.len(), 2);
-    assert_eq!(rounds[1], set(&[paths::update(1898), paths::update(1899)]));
-}
-
-#[test]
-fn a_stale_bucket_is_refused_as_stale_in_two_rounds() {
+fn a_stale_bucket_is_refused_in_one_round() {
     let fx = fixture();
     let now = period_start(1900) + Duration::from_secs(3600);
     let r = open_at_head(&fx.files, fx.checkpoint, now);
     assert_eq!(
         r.err(),
         Some(HeadOpenError::Head(HeadError::Stale {
-            missing: 1899,
+            signed: 1898,
             current: 1900
         }))
     );
-    assert_eq!(fx.files.rounds().len(), 2);
+    assert_eq!(fx.files.rounds(), vec![head_round(&fx)]);
+}
+
+#[test]
+fn a_missing_update_between_is_refused_after_the_second_round() {
+    let mut fx = fixture_1900();
+    fx.files.files.remove(&paths::update(1898));
+    let r = verify_head(&&fx.files, fx.checkpoint, fx.now);
+    assert_eq!(r, Err(HeadError::Missing(paths::update(1898))));
+    let rounds = fx.files.rounds();
+    assert_eq!(rounds.len(), 2);
+    assert_eq!(rounds[1], set(&[paths::update(1898), paths::update(1899)]));
 }
 
 /// Each of the head crate's rejections, through the two-round opener:
@@ -191,6 +193,12 @@ fn a_stale_bucket_is_refused_as_stale_in_two_rounds() {
 #[test]
 fn every_rejection_is_the_same_through_the_opener() {
     type Tamper = Box<dyn Fn(&mut Fixture)>;
+    let on_1900 = |t: Tamper| -> Tamper {
+        Box::new(move |fx: &mut Fixture| {
+            *fx = fixture_1900();
+            t(fx)
+        })
+    };
     let finality = |f: fn(&mut serde_json::Value)| -> Tamper {
         Box::new(move |fx: &mut Fixture| {
             let b = fx.files.files.get_mut(paths::FINALITY).unwrap();
@@ -268,10 +276,59 @@ fn every_rejection_is_the_same_through_the_opener() {
         ),
         (
             "update in the wrong period's slot",
-            Box::new(|fx| {
-                let wrong = fx.files.files[&paths::update(1897)].clone();
+            on_1900(Box::new(|fx| {
+                let wrong = std::fs::read(format!("{FIX}/update-1897.json")).unwrap();
                 fx.files.files.insert(paths::update(1898), wrong);
-            }),
+            })),
+        ),
+        (
+            "1900's update replayed as 1899's",
+            on_1900(Box::new(|fx| {
+                let u = fx.files.files[&paths::update(1900)].clone();
+                fx.files.files.insert(paths::update(1899), u);
+            })),
+        ),
+        (
+            "an update between missing",
+            on_1900(Box::new(|fx| {
+                fx.files.files.remove(&paths::update(1899));
+            })),
+        ),
+        (
+            "an update between not the object",
+            on_1900(Box::new(|fx| {
+                fx.files
+                    .files
+                    .insert(paths::update(1898), b"{\"version\":\"fulu\"}".to_vec());
+            })),
+        ),
+        (
+            "an update between with a flipped signer bit",
+            on_1900(Box::new(|fx| {
+                let b = fx.files.files.get_mut(&paths::update(1899)).unwrap();
+                *b = edit_json(b, |v| {
+                    let bits = v["data"]["sync_aggregate"]["sync_committee_bits"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                    let mut raw = hex::decode(bits.trim_start_matches("0x")).unwrap();
+                    raw[3] ^= 0x01;
+                    v["data"]["sync_aggregate"]["sync_committee_bits"] =
+                        serde_json::Value::String(format!("0x{}", hex::encode(raw)));
+                });
+            })),
+        ),
+        (
+            "two periods on, stale",
+            on_1900(Box::new(|fx| {
+                fx.now = period_start(1902) + Duration::from_secs(60)
+            })),
+        ),
+        (
+            "two periods on, from the future",
+            on_1900(Box::new(|fx| {
+                fx.now = period_start(1899) + Duration::from_secs(60)
+            })),
         ),
         (
             "not the object",
