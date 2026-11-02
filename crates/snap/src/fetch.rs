@@ -817,14 +817,20 @@ fn now_secs() -> u64 {
 }
 
 /// Whether a peer whose own head has `head_timestamp` is dropped at
-/// connect as far behind the clock. Only when the pivot is chosen near the
-/// head (a peer's head, or the block at an epoch boundary), where such a
-/// peer is no use. A pivot named by hash, directly or through the pivot
-/// file, may itself be old: how far a peer's head is behind the clock says
-/// nothing about whether it can serve that root, and one that cannot
-/// answers stale, which the fetch already handles.
+/// connect as far behind what the fetch needs. Without a chosen pivot that
+/// is the clock: the pivot will be a recent head. In epoch mode it is the
+/// target's time once that has passed (the clock until then, as for the
+/// producer dialing ahead of its boundary), so a peer whose head is past an
+/// older target, or a target the fetch has been at for a while, is kept. A
+/// pivot named by hash, directly or through the pivot file, has no time
+/// known in advance, and is never a reason to drop a peer: one that cannot
+/// serve the root answers stale, which the fetch already handles.
 fn drops_behind(cfg: &Config, head_timestamp: u64, now: u64) -> bool {
-    cfg.pivot.is_none() && cfg.pivot_file.is_none() && head_timestamp + MAX_PIVOT_AGE_SECS < now
+    if cfg.pivot.is_some() || cfg.pivot_file.is_some() {
+        return false;
+    }
+    let needed = cfg.pivot_at.map_or(now, |t| t.min(now));
+    head_timestamp + MAX_PIVOT_AGE_SECS < needed
 }
 
 async fn peer_task(mut peer: Peer, shared: Arc<Shared>, tx: mpsc::Sender<Done>) {
@@ -1053,8 +1059,17 @@ mod tests {
         let auto = Config::default();
         assert!(drops_behind(&auto, head, now));
         assert!(!drops_behind(&auto, now - 60, now));
+        // The producer: a boundary just ahead, or just passed. As before.
+        let next = Config { pivot_at: Some(now + 120), ..Default::default() };
+        assert!(drops_behind(&next, head, now));
+        assert!(!drops_behind(&next, now - 60, now));
         let epoch = Config { pivot_at: Some(now - 60), ..Default::default() };
         assert!(drops_behind(&epoch, head, now));
+        // An epoch target 18 minutes ago: a head 17 minutes old is past it
+        // and kept; one 16 minutes before the target is dropped.
+        let old = Config { pivot_at: Some(now - 18 * 60), ..Default::default() };
+        assert!(!drops_behind(&old, head, now));
+        assert!(drops_behind(&old, now - 34 * 60, now));
         // An explicit pivot 18 minutes old: that peer may well serve it.
         let explicit = Config { pivot: Some(B256::repeat_byte(1)), ..Default::default() };
         assert!(!drops_behind(&explicit, head, now));

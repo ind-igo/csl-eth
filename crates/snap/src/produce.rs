@@ -36,6 +36,12 @@
 //!    content-addressed and shared, and are never deleted.
 //!
 //! A failed cycle is logged and the loop goes on to the next boundary.
+//! Pointer writes that keep failing are bounded: with more than three
+//! snapshots waiting on them (pending, and newer than the confirmed head),
+//! a cycle fetches nothing and writes the newest one's pointers again,
+//! while its head still verifies; once it cannot, one new snapshot is let
+//! in, so they grow by one per head lifetime (27 to 55 hours), not per
+//! cycle.
 //! What has been published is recorded in `<work>/state.json` as each
 //! file goes up, so a restart re-uploads neither blobs nor closed updates.
 //! Each publisher call has a deadline (`--publish-timeout-secs`) that
@@ -730,6 +736,45 @@ fn cycle(
     line.insert("boundary".into(), json!(utc(target)));
     line.insert("boundary_slot".into(), json!(boundary_slot));
 
+    // 0. Pointer writes that keep failing would leave one more protected
+    // snapshot every cycle. Past a bound, no new one is fetched while the
+    // newest of those waiting can still be made the head: its pointers are
+    // written again instead.
+    let stuck = unresolved_pending(state);
+    if stuck.len() > MAX_UNRESOLVED {
+        let msg = format!(
+            "{} snapshots wait on pointer writes (bound {MAX_UNRESOLVED})",
+            stuck.len()
+        );
+        tracing::error!("{msg}");
+        line.insert("pending_error".into(), json!(msg));
+        let mut sent = Sent { files: 0, bytes: 0 };
+        let r = retry_pointers(
+            work,
+            state,
+            publisher,
+            stuck[0],
+            args.checkpoint,
+            pending_grace(Duration::from_secs(args.publish_timeout_secs)),
+            SystemTime::now(),
+            &mut sent,
+        );
+        line.insert("published_files".into(), json!(sent.files));
+        match r.map_err(at("pointers"))? {
+            Retry::Confirmed => {
+                line.insert("retried".into(), json!(stuck[0]));
+                return Ok(());
+            }
+            // It cannot be made the head (stale, or the mirror's head
+            // reaches another block): one new snapshot is let in, so a
+            // producer whose pointer writes failed for a day or two
+            // recovers on its own once they work again.
+            Retry::Skipped(why) => {
+                line.insert("retry_skipped".into(), json!(why));
+            }
+        }
+    }
+
     // The finality update naming our block is served for one epoch only;
     // watch from now so a slow fetch cannot miss it.
     let watch = FinalityWatch::start(&args.beacon, Duration::from_secs(args.poll_secs));
@@ -1015,6 +1060,25 @@ pub fn updates_to_fetch(
         .collect()
 }
 
+/// The update periods `csl_eth_head::verify` reads from the mirror as of
+/// `now`, `b..s`: the same files and clock give the same range it walked.
+fn head_reads(
+    work: &Work,
+    checkpoint: B256,
+    chain: &Chain,
+    now: SystemTime,
+) -> Result<std::ops::Range<u64>, String> {
+    let file = |k: &str| fs::read(work.bucket.join(k)).map_err(|e| format!("{k}: {e}"));
+    csl_eth_head::update_periods(
+        &file(&paths::bootstrap(&checkpoint))?,
+        &file(paths::FINALITY)?,
+        checkpoint,
+        chain,
+        now,
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Step 5: the mirror verified as a client would see it once published.
 /// Also returns the update periods the head's verification read, `b..s`.
 fn verify(
@@ -1032,16 +1096,7 @@ fn verify(
         now,
     )
     .map_err(|e| e.to_string())?;
-    // The same files and clock give the same range the verifier walked.
-    let file = |k: &str| fs::read(work.bucket.join(k)).map_err(|e| format!("{k}: {e}"));
-    let read = csl_eth_head::update_periods(
-        &file(&paths::bootstrap(&args.checkpoint))?,
-        &file(paths::FINALITY)?,
-        args.checkpoint,
-        &chain,
-        now,
-    )
-    .map_err(|e| e.to_string())?;
+    let read = head_reads(work, args.checkpoint, &chain, now)?;
     if head.execution.block_hash != slice.head.block_hash {
         return Err(format!(
             "the head reaches block {} ({}), not ours ({})",
@@ -1181,7 +1236,20 @@ fn publish(
         state.bootstrap_published = true;
         state.save(&work.root)?;
     }
-    for period in head.verified.clone() {
+    publish_updates(work, state, p, head.verified.clone(), sent)?;
+    publish_pointers(work, state, p, hash, pending_grace, sent)
+}
+
+/// The head updates of `periods` whose bytes are not yet in the bucket;
+/// never one published final.
+fn publish_updates(
+    work: &Work,
+    state: &mut State,
+    p: &dyn Publish,
+    periods: std::ops::Range<u64>,
+    sent: &mut Sent,
+) -> Result<(), String> {
+    for period in periods {
         let key = paths::update(period);
         let file = work.bucket.join(&key);
         let Ok(bytes) = fs::read(&file) else {
@@ -1204,11 +1272,21 @@ fn publish(
         );
         state.save(&work.root)?;
     }
+    Ok(())
+}
 
-    // `latest`, then the finality update that makes this snapshot the head.
-    // The intent is journaled first: a write that fails (or times out) may
-    // have landed, or land later, so the bucket may name this snapshot,
-    // and collection must not delete it.
+/// `latest`, then the finality update that makes snapshot `hash` the head,
+/// both from the mirror. The intent is journaled first: a write that fails
+/// (or times out) may have landed, or land later, so the bucket may name
+/// this snapshot, and collection must not delete it.
+fn publish_pointers(
+    work: &Work,
+    state: &mut State,
+    p: &dyn Publish,
+    hash: B256,
+    pending_grace: u64,
+    sent: &mut Sent,
+) -> Result<(), String> {
     let started = now_secs();
     state.pending.insert(hash, started);
     state.save(&work.root)?;
@@ -1227,6 +1305,73 @@ fn publish(
     // cycle's own, too, until a later cycle confirms past its grace).
     release_pending(state, started, pending_grace);
     state.save(&work.root)
+}
+
+/// Snapshots waiting on pointer writes beyond which a cycle fetches none.
+const MAX_UNRESOLVED: usize = 3;
+
+/// Pending snapshots newer than the one `head/finality` is confirmed to
+/// name, newest first: their pointer writes failed and no confirmed pair
+/// has gone past them. (Pending ones older than it only wait out their
+/// grace; the next confirmed pair releases them, and no more are added.)
+pub fn unresolved_pending(state: &State) -> Vec<B256> {
+    let confirmed = state
+        .finality
+        .and_then(|h| state.snapshots.iter().find(|s| s.block_hash == h))
+        .map(|s| s.block_number);
+    let mut out: Vec<(u64, B256)> = state
+        .snapshots
+        .iter()
+        .filter(|s| state.pending.contains_key(&s.block_hash))
+        .filter(|s| confirmed.is_none_or(|c| s.block_number > c))
+        .map(|s| (s.block_number, s.block_hash))
+        .collect();
+    out.sort_by(|a, b| b.cmp(a));
+    out.into_iter().map(|(_, h)| h).collect()
+}
+
+enum Retry {
+    Confirmed,
+    Skipped(String),
+}
+
+/// Write the pointers for pending snapshot `hash` again, as of `now`, if
+/// the mirror's head still verifies to it. Everything else of it is in the
+/// bucket already (a snapshot becomes pending only after the rest of its
+/// cycle went up), and the mirror's head files are the ones its cycle
+/// verified unless a later cycle replaced them, in which case the head no
+/// longer reaches it. A head gone stale cannot be made the head at all.
+#[allow(clippy::too_many_arguments)]
+fn retry_pointers(
+    work: &Work,
+    state: &mut State,
+    p: &dyn Publish,
+    hash: B256,
+    checkpoint: B256,
+    pending_grace: u64,
+    now: SystemTime,
+    sent: &mut Sent,
+) -> Result<Retry, String> {
+    let chain = Chain::mainnet();
+    let head = match csl_eth_head::verify(&DirSource(work.bucket.clone()), &chain, checkpoint, now)
+    {
+        Ok(h) => h,
+        Err(e) => return Ok(Retry::Skipped(format!("the mirror's head: {e}"))),
+    };
+    if head.execution.block_hash != hash {
+        return Ok(Retry::Skipped(format!(
+            "the mirror's head is block {}, not the newest waiting, {hash}",
+            head.execution.block_hash
+        )));
+    }
+    let read = match head_reads(work, checkpoint, &chain, now) {
+        Ok(r) => r,
+        Err(e) => return Ok(Retry::Skipped(format!("the mirror's head: {e}"))),
+    };
+    publish_updates(work, state, p, read, sent)?;
+    write_atomic(&work.bucket.join(LATEST_FILE), hex::encode(hash).as_bytes())?;
+    publish_pointers(work, state, p, hash, pending_grace, sent)?;
+    Ok(Retry::Confirmed)
 }
 
 struct Collected {
@@ -1671,6 +1816,131 @@ mod tests {
         s.pending.insert(h, 7);
         s.save(&root).unwrap();
         assert_eq!(State::load(&root, ck).unwrap().pending[&h], 7);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unresolved_are_the_pending_past_the_confirmed_head() {
+        let mut s = State {
+            snapshots: (1..=7).map(|n| rec(n, n <= 3)).collect(),
+            finality: Some(B256::with_last_byte(3)),
+            ..Default::default()
+        };
+        // 2 waits out its grace behind the confirmed 3; 4 to 7 failed.
+        for n in [2, 3, 4, 5, 6, 7] {
+            s.pending.insert(B256::with_last_byte(n), 0);
+        }
+        let h = |n: u8| B256::with_last_byte(n);
+        assert_eq!(unresolved_pending(&s), vec![h(7), h(6), h(5), h(4)]);
+        s.finality = None;
+        assert_eq!(unresolved_pending(&s).len(), 6);
+    }
+
+    /// The head crate's p1900 set: the producer's first published head.
+    fn p1900(w: &Work) -> (B256, B256, u64, SystemTime) {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../head/tests/fixtures/p1900");
+        let read = |f: &str| fs::read(format!("{dir}/{f}")).unwrap();
+        let meta: Value = serde_json::from_slice(&read("meta.json")).unwrap();
+        let checkpoint: B256 = meta["checkpoint"].as_str().unwrap().parse().unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(meta["now"].as_u64().unwrap());
+        touch(
+            &w.bucket,
+            &paths::bootstrap(&checkpoint),
+            &read("bootstrap.json"),
+        );
+        for p in [1898, 1899, 1900] {
+            touch(
+                &w.bucket,
+                &paths::update(p),
+                &read(&format!("update-{p}.json")),
+            );
+        }
+        let fin = read("finality.json");
+        touch(&w.bucket, paths::FINALITY, &fin);
+        let v: Value = serde_json::from_slice(&fin).unwrap();
+        let ex = &v["data"]["finalized_header"]["execution"];
+        let hash: B256 = ex["block_hash"].as_str().unwrap().parse().unwrap();
+        let number: u64 = ex["block_number"].as_str().unwrap().parse().unwrap();
+        (checkpoint, hash, number, now)
+    }
+
+    #[test]
+    fn stuck_pointers_are_retried_for_the_newest_while_its_head_verifies() {
+        let root = tmp("retry");
+        let w = Work::new(&root).unwrap();
+        let (checkpoint, hash, number, now) = p1900(&w);
+        let rec_of = |h: B256, n: u64, complete: bool| SnapRec {
+            block_hash: h,
+            block_number: n,
+            boundary: n,
+            keys: vec![],
+            complete,
+            slice: format!("{n}"),
+        };
+        // Confirmed head 1; 2, 3 and 4 and then ours failed at a pointer.
+        let mut s = State {
+            checkpoint,
+            bootstrap_published: true,
+            snapshots: vec![
+                rec_of(B256::with_last_byte(1), number - 40, true),
+                rec_of(B256::with_last_byte(2), number - 30, false),
+                rec_of(B256::with_last_byte(3), number - 20, false),
+                rec_of(B256::with_last_byte(4), number - 10, false),
+                rec_of(hash, number, false),
+            ],
+            finality: Some(B256::with_last_byte(1)),
+            latest: Some(B256::with_last_byte(1)),
+            ..Default::default()
+        };
+        for h in [2, 3, 4]
+            .map(B256::with_last_byte)
+            .into_iter()
+            .chain([hash])
+        {
+            s.pending.insert(h, 0);
+        }
+        assert_eq!(unresolved_pending(&s).len(), 4);
+        let rec = Rec(Default::default());
+        let mut sent = Sent { files: 0, bytes: 0 };
+        // Two periods on, the head is stale: nothing is written.
+        let late = now + Duration::from_secs(2 * 8192 * 12);
+        let r = retry_pointers(&w, &mut s, &rec, hash, checkpoint, 3600, late, &mut sent).unwrap();
+        assert!(matches!(r, Retry::Skipped(ref e) if e.contains("stale")));
+        assert!(rec.0.lock().unwrap().is_empty());
+        // Still fresh: the updates it reads, then both pointers.
+        let r = retry_pointers(&w, &mut s, &rec, hash, checkpoint, 3600, now, &mut sent).unwrap();
+        assert!(matches!(r, Retry::Confirmed));
+        assert_eq!(
+            rec.0.lock().unwrap().clone(),
+            vec![
+                "put head/updates/1898".to_string(),
+                "put head/updates/1899".into(),
+                format!("put {LATEST_FILE}"),
+                format!("put {}", paths::FINALITY),
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(w.bucket.join(LATEST_FILE)).unwrap(),
+            hex::encode(hash)
+        );
+        assert_eq!((s.finality, s.latest), (Some(hash), Some(hash)));
+        // The others' writes began long before: released, and no longer
+        // stuck; ours stays pending until a later cycle confirms.
+        assert_eq!(s.pending.keys().collect::<Vec<_>>(), vec![&hash]);
+        assert!(unresolved_pending(&s).is_empty());
+        // A head that reaches another block is not retried for this one.
+        let r = retry_pointers(
+            &w,
+            &mut s,
+            &rec,
+            B256::with_last_byte(4),
+            checkpoint,
+            3600,
+            now,
+            &mut sent,
+        )
+        .unwrap();
+        assert!(matches!(r, Retry::Skipped(ref e) if e.contains("not the newest")));
         let _ = fs::remove_dir_all(&root);
     }
 
