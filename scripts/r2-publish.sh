@@ -29,7 +29,8 @@ case "${1:-}" in
       head/* | manifest.json | */manifest.json) ct=application/json ;;
       *) ct=application/octet-stream ;;
     esac
-    if ! out=$(cf r2 objects put "$key" --bucket-name "$bucket" --file "$file" --content-type "$ct" 2>&1); then
+    # cf answers a declined prompt with "Aborted." and may still exit 0.
+    if ! out=$(cf r2 objects put "$key" --bucket-name "$bucket" --file "$file" --content-type "$ct" 2>&1) || grep -q '^Aborted' <<<"$out"; then
       echo "put $key: $out" >&2
       exit 1
     fi
@@ -37,7 +38,8 @@ case "${1:-}" in
   delete)
     [ $# -eq 2 ] || usage
     key=$2
-    if ! out=$(cf r2 objects delete "$key" --bucket-name "$bucket" 2>&1); then
+    # Without --force cf asks, and a non-interactive run answers "Aborted.".
+    if ! out=$(cf r2 objects delete "$key" --bucket-name "$bucket" --force 2>&1) || grep -q '^Aborted' <<<"$out"; then
       echo "delete $key: $out" >&2
       exit 1
     fi
