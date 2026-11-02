@@ -115,6 +115,13 @@ struct Envelope<T> {
 pub enum HeadError {
     /// A file the verification needs is not in the bucket.
     Missing(String),
+    /// The bucket's period updates stop at `missing` (that period's update,
+    /// and every later one, is not published) while the clock is already
+    /// in `current`, a later period. The committees in hand can follow the
+    /// chain only through period `missing`: the producer has not published
+    /// since. Not a broken bucket, an abandoned one; nothing in it is
+    /// trusted past that period.
+    Stale { missing: u64, current: u64 },
     /// The source failed to read a file.
     Read(String),
     /// A file is not the object its path claims.
@@ -136,6 +143,12 @@ impl fmt::Display for HeadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HeadError::Missing(p) => write!(f, "head file missing: {p}"),
+            HeadError::Stale { missing, current } => write!(
+                f,
+                "stale head: the bucket's head stops at period {missing} \
+                 (head/updates/{missing} is not published) while the clock is in \
+                 period {current}: the producer has not published since"
+            ),
             HeadError::Read(e) => write!(f, "head file unreadable: {e}"),
             HeadError::Decode { path, error } => write!(f, "{path}: {error}"),
             HeadError::Bootstrap(e) => write!(f, "bootstrap rejected: {e}"),
@@ -238,9 +251,25 @@ pub fn verify(
             // The current period's update exists only once a block of the
             // period has been attested with the next committee in it; the
             // finality update below is signed by the committee already
-            // known. An earlier period's update is required.
+            // known. An earlier period's update is required: when no later
+            // one exists either, the bucket simply stopped being updated
+            // (stale); a gap with later updates present is a broken bucket.
             None if period == current_period => {}
-            None => return Err(HeadError::Missing(path)),
+            None => {
+                for later in period + 1..=current_period {
+                    if src
+                        .read_head(&paths::update(later))
+                        .map_err(HeadError::Read)?
+                        .is_some()
+                    {
+                        return Err(HeadError::Missing(path));
+                    }
+                }
+                return Err(HeadError::Stale {
+                    missing: period,
+                    current: current_period,
+                });
+            }
         }
         period += 1;
     }

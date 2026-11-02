@@ -221,3 +221,71 @@ fn a_file_that_is_not_the_object_is_a_decode_error() {
     let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
     assert!(matches!(r, Err(HeadError::Decode { .. })), "{r:?}");
 }
+
+/// Period boundaries for the fixture: period 1898 began at this time, and
+/// each period is 8,192 slots of 12 seconds.
+fn period_start(p: u64) -> SystemTime {
+    let chain = Chain::mainnet();
+    SystemTime::UNIX_EPOCH + Duration::from_secs(chain.genesis_time + p * 8192 * 12)
+}
+
+#[test]
+fn a_bucket_not_updated_since_is_stale_not_missing() {
+    let fx = fixture();
+    // An hour into period 1900 with updates through 1898: the head stops
+    // at 1899, which the clock has left. The frozen snapshot's case.
+    let now = period_start(1900) + Duration::from_secs(3600);
+    let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, now);
+    assert_eq!(
+        r,
+        Err(HeadError::Stale {
+            missing: 1899,
+            current: 1900
+        })
+    );
+    let msg = r.unwrap_err().to_string();
+    assert!(
+        msg.contains("stops at period 1899") && msg.contains("clock is in period 1900"),
+        "{msg}"
+    );
+    assert!(msg.contains("has not published since"), "{msg}");
+}
+
+#[test]
+fn the_period_after_the_last_update_still_verifies() {
+    let fx = fixture();
+    // In period 1899 with no 1899 update: the current period's update may
+    // not exist yet, and the 1899 committee (from 1898's update) signs.
+    // The fixture's finality update is from 1898 and still verifies; it is
+    // lag, not staleness.
+    let now = period_start(1899) + Duration::from_secs(3600);
+    let h = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, now).unwrap();
+    assert_eq!(h.execution.block_number, 26_310_853);
+}
+
+#[test]
+fn a_missing_checkpoint_period_update_is_stale() {
+    let mut fx = fixture();
+    fx.files.0.remove(&paths::update(1898));
+    let now = period_start(1899) + Duration::from_secs(60);
+    let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, now);
+    assert_eq!(
+        r,
+        Err(HeadError::Stale {
+            missing: 1898,
+            current: 1899
+        })
+    );
+}
+
+#[test]
+fn a_gap_before_a_later_update_is_missing_not_stale() {
+    let mut fx = fixture();
+    // 1898 gone but a (here bogus) 1899 present: the producer did publish
+    // later, so the hole is a broken bucket, named by its path.
+    let later = fx.files.0.remove(&paths::update(1898)).unwrap();
+    fx.files.0.insert(paths::update(1899), later);
+    let now = period_start(1899) + Duration::from_secs(60);
+    let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, now);
+    assert_eq!(r, Err(HeadError::Missing(paths::update(1898))));
+}
