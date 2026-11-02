@@ -46,6 +46,8 @@ use tracing::{debug, info, warn};
 
 /// A peer's announced head older than this is not a pivot candidate.
 const MAX_PIVOT_AGE_SECS: u64 = 15 * 60;
+/// Peers serve snap for roots within about 128 blocks of their head.
+const PIVOT_SERVED_SECS: u64 = 128 * 12;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -721,8 +723,16 @@ impl Coordinator {
                 if stale {
                     self.stale_peers.insert(peer);
                 }
-                let three_stale =
-                    self.stale_peers.len() >= 3 || (!self.stale_peers.is_empty() && self.stale_peers.len() >= self.shared.connected.load(Ordering::Relaxed));
+                // Stale on three peers, or on every peer connected. Holding
+                // for a chosen pivot, "every peer" alone is not enough while
+                // the pivot is young: with one peer up, one empty answer on
+                // a root seconds old (a server whose snapshot is a block
+                // behind) would end the fetch. Retried instead while the
+                // connector dials more, until peers could no longer serve it.
+                let hold = self.cfg.pivot_at.is_some() || self.cfg.pivot_file.is_some();
+                let young = self.pivot.is_some_and(|p| Self::now_secs() < p.timestamp + PIVOT_SERVED_SECS);
+                let three_stale = self.stale_peers.len() >= 3
+                    || (!self.stale_peers.is_empty() && self.stale_peers.len() >= self.shared.connected.load(Ordering::Relaxed) && !(hold && young));
                 if stale && self.pivot.is_some() && three_stale {
                     if self.cfg.pivot_at.is_some() || self.cfg.pivot_file.is_some() {
                         return Err(FetchError::PivotStale);
