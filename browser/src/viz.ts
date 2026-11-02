@@ -833,7 +833,6 @@ const CHIPS: Chip[] = [
   { label: "a contract", kind: "account", key: "0x20ea861b3acec90d3a15b4755d9a1cf1f161496e" },
   { label: "its slot 2", kind: "storage", key: "0x20ea861b3acec90d3a15b4755d9a1cf1f161496e", slot: "2" },
   { label: "its empty slot 1", kind: "storage", key: "0x20ea861b3acec90d3a15b4755d9a1cf1f161496e", slot: "1" },
-  { label: "an account created after the snapshot", kind: "account", key: "0xa0ec455414c8ef8750e3efe831fbc98dfddd1123" },
   { label: "absent key", kind: "account", key: "0x1a7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" },
   { label: "vitalik.eth (outside the slice)", kind: "account", key: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045" },
 ];
