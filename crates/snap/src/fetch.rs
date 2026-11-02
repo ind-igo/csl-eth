@@ -111,8 +111,8 @@ impl Default for Config {
 pub enum FetchError {
     #[error("no peers could be reached")]
     NoPeers,
-    #[error("gave up after {0:?}")]
-    Timeout(Duration),
+    #[error("gave up after {wall:?} ({dials})")]
+    Timeout { wall: Duration, dials: String },
     #[error("bytecode {0} missing from every peer")]
     CodeMissing(B256),
     #[error("{0}")]
@@ -217,6 +217,23 @@ struct Shared {
     finished: AtomicBool,
     requests: AtomicU64,
     bytes_in: AtomicU64,
+    /// Dials started, handshakes accepted, and peers dropped at once
+    /// because the head they announced was far behind the clock.
+    dialed: AtomicUsize,
+    accepted: AtomicUsize,
+    behind: AtomicUsize,
+}
+
+impl Shared {
+    fn dials(&self) -> String {
+        format!(
+            "dialed {}, accepted {}, dropped {} far behind, {} connected",
+            self.dialed.load(Ordering::Relaxed),
+            self.accepted.load(Ordering::Relaxed),
+            self.behind.load(Ordering::Relaxed),
+            self.connected.load(Ordering::Relaxed)
+        )
+    }
 }
 
 struct Sub {
@@ -242,6 +259,9 @@ pub async fn fetch(cfg: Config) -> Result<Slice, FetchError> {
         finished: AtomicBool::new(false),
         requests: AtomicU64::new(0),
         bytes_in: AtomicU64::new(0),
+        dialed: AtomicUsize::new(0),
+        accepted: AtomicUsize::new(0),
+        behind: AtomicUsize::new(0),
     });
     let (tx, mut rx) = mpsc::channel::<Done>(256);
 
@@ -252,7 +272,6 @@ pub async fn fetch(cfg: Config) -> Result<Slice, FetchError> {
         let fork_filter = fork_filter.clone();
         tokio::spawn(async move {
             let dials = Arc::new(tokio::sync::Semaphore::new(shared.cfg.dial_parallel));
-            let (tried, ok) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
             while let Some(record) = candidates.recv().await {
                 if shared.finished.load(Ordering::Relaxed) {
                     break;
@@ -268,14 +287,13 @@ pub async fn fetch(cfg: Config) -> Result<Slice, FetchError> {
                 let tx = tx.clone();
                 let status = status;
                 let fork_filter = fork_filter.clone();
-                let (tried, ok) = (tried.clone(), ok.clone());
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let n = tried.fetch_add(1, Ordering::Relaxed) + 1;
+                    let n = shared.dialed.fetch_add(1, Ordering::Relaxed) + 1;
                     match Peer::connect(record, &key, status, fork_filter, shared.cfg.dial_timeout).await {
                         Ok(mut peer) => {
                             peer.timeout = shared.cfg.timeout;
-                            let k = ok.fetch_add(1, Ordering::Relaxed) + 1;
+                            let k = shared.accepted.fetch_add(1, Ordering::Relaxed) + 1;
                             if shared.connected.fetch_add(1, Ordering::Relaxed) >= shared.cfg.peers {
                                 shared.connected.fetch_sub(1, Ordering::Relaxed);
                                 peer.close().await;
@@ -312,6 +330,9 @@ pub async fn fetch(cfg: Config) -> Result<Slice, FetchError> {
                     requests = shared.requests.load(Ordering::Relaxed),
                     mib_in = shared.bytes_in.load(Ordering::Relaxed) / (1024 * 1024),
                     elapsed_s = started.elapsed().as_secs(),
+                    dialed = shared.dialed.load(Ordering::Relaxed),
+                    accepted = shared.accepted.load(Ordering::Relaxed),
+                    behind = shared.behind.load(Ordering::Relaxed),
                     "progress"
                 );
             }
@@ -358,11 +379,12 @@ pub async fn fetch(cfg: Config) -> Result<Slice, FetchError> {
     }
     let result = loop {
         let timeout = if cfg.max_wall.is_zero() { Duration::from_secs(3600 * 24) } else { cfg.max_wall.saturating_sub(started.elapsed()) };
+        let gave_up = || FetchError::Timeout { wall: cfg.max_wall, dials: shared.dials() };
         if timeout.is_zero() {
-            break Err(FetchError::Timeout(cfg.max_wall));
+            break Err(gave_up());
         }
         let done = match tokio::time::timeout(timeout, rx.recv()).await {
-            Err(_) => break Err(FetchError::Timeout(cfg.max_wall)),
+            Err(_) => break Err(gave_up()),
             Ok(None) => break Err(FetchError::NoPeers),
             Ok(Some(d)) => d,
         };
@@ -780,10 +802,24 @@ fn bounds(prefix: &Nibbles, nibble: Option<u8>) -> (B256, B256) {
     (B256::from(lo), B256::from(hi))
 }
 
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
 async fn peer_task(mut peer: Peer, shared: Arc<Shared>, tx: mpsc::Sender<Done>) {
     let id = peer.id();
     let mut err: Option<String> = None;
     match peer.own_head().await {
+        // A peer still syncing (or stuck) announces a head far behind the
+        // clock. It cannot serve snap for a recent root and never answers
+        // a recent header; held, it takes a slot from a peer that could,
+        // and in epoch mode it answers every head poll with the same old
+        // block. Dropped, so the connector dials another.
+        Ok(Some(h)) if h.timestamp + MAX_PIVOT_AGE_SECS < now_secs() => {
+            shared.behind.fetch_add(1, Ordering::Relaxed);
+            info!(peer = %id, number = h.number, behind_secs = now_secs().saturating_sub(h.timestamp), "peer head far behind the clock; dropped");
+            err = Some("head far behind".into());
+        }
         Ok(Some(h)) => {
             let _ = tx.send(Done::Head { peer: id, from_job: false, header: Box::new(h) }).await;
         }
