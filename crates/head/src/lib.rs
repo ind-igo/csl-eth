@@ -36,6 +36,16 @@ pub mod fetch;
 
 type Spec = MainnetConsensusSpec;
 
+/// Members of a sync committee.
+pub const COMMITTEE_SIZE: u64 = 512;
+
+/// Whether `participants` of the committee are the two thirds that
+/// finalization needs (342 of 512): the rule helios applies when it moves
+/// a store forward.
+pub fn has_quorum(participants: u64) -> bool {
+    participants * 3 >= COMMITTEE_SIZE * 2
+}
+
 /// Where the head files live in a bucket.
 pub mod paths {
     use alloy_primitives::B256;
@@ -132,8 +142,9 @@ pub enum HeadError {
     Bootstrap(String),
     /// A period update failed verification.
     Update { period: u64, error: String },
-    /// The finality update failed verification: bad signature, too few
-    /// participants, wrong branch, from the future.
+    /// The finality update failed verification: bad signature, under two
+    /// thirds of the committee signing, wrong branch, a finalized header
+    /// before the checkpoint, from the future.
     Finality(String),
     /// The finalized header carries no execution payload header (before
     /// Capella); nothing to read state against.
@@ -222,9 +233,11 @@ fn checked_bootstrap(
 
 /// The period updates between a proven bootstrap and a finality update not
 /// yet verified, as of `current_period`: periods `b..s`, `b` the
-/// bootstrap's and `s` the one the finality update was signed in. Each
-/// update hands over to the next committee, so after `b..s` the store
-/// holds the committee that signs in `s`. A finality update signed two or
+/// bootstrap's and `s` the one the finality update was signed in. An
+/// update applied with a quorum and a finalized header in its own period
+/// hands over to the next committee, so after `b..s` the store knows the
+/// committee that signs in `s`; an update short of that leaves the store
+/// where it was, and the finality update then fails its period check. A finality update signed two or
 /// more periods before the clock's is stale; one signed after it is from
 /// the future and is refused here, before any update is asked for, so the
 /// range is bounded by the clock.
@@ -311,13 +324,33 @@ pub fn verify(
         &chain.forks,
     )
     .map_err(|e| HeadError::Finality(e.to_string()))?;
+    // Helios checks a finality update's signature and proofs, but leaves
+    // the two-thirds quorum to the step that applies it to a store, which
+    // this path skips. Without it one committee member could sign a
+    // finalized checkpoint of its own.
     let participants = get_bits::<Spec>(&finality.sync_aggregate().sync_committee_bits);
+    if !has_quorum(participants) {
+        return Err(HeadError::Finality(format!(
+            "{participants} of {COMMITTEE_SIZE} signed, under two thirds"
+        )));
+    }
 
     // The finality update's own header, not the store's: a period update
     // can carry a finalized header of its own, newer or older, and the
     // head is what `head/finality` proves.
     let header = finality.finalized_header();
     let beacon = header.beacon();
+    // Helios reads a finalized header at slot 0 as "no finality yet" and
+    // checks neither its finality branch nor its execution proof, so its
+    // execution fields are whatever the file says. Nothing after genesis
+    // finalizes slot 0, and nothing before the checkpoint is a head.
+    if beacon.slot == 0 || beacon.slot < bootstrap.header().beacon().slot {
+        return Err(HeadError::Finality(format!(
+            "finalized slot {} is before the checkpoint's slot {}",
+            beacon.slot,
+            bootstrap.header().beacon().slot
+        )));
+    }
     let exec = header.execution().map_err(|_| HeadError::NoExecution)?;
     let execution = ExecutionHead {
         block_number: *exec.block_number(),

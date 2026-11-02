@@ -8,7 +8,7 @@
 //! the slot arithmetic is stable.
 
 use alloy_primitives::B256;
-use csl_eth_head::{paths, verify, Chain, HeadError, HeadSource};
+use csl_eth_head::{has_quorum, paths, verify, Chain, HeadError, HeadSource, COMMITTEE_SIZE};
 use std::{
     collections::HashMap,
     time::{Duration, SystemTime},
@@ -393,4 +393,35 @@ fn an_update_replayed_under_a_later_period_is_refused() {
             current: 1902
         })
     );
+}
+
+#[test]
+fn a_slot_zero_finalized_header_is_not_a_head() {
+    // Helios takes a finalized header at slot 0 for "nothing finalized yet"
+    // and checks none of its proofs; the genuine signature covers only the
+    // attested header. So these execution fields are unauthenticated and
+    // must not come back as the head.
+    let mut fx = fixture();
+    let f = fx.files.0.get_mut(paths::FINALITY).unwrap();
+    *f = edit_json(f, |v| {
+        let h = &mut v["data"]["finalized_header"];
+        h["beacon"]["slot"] = "0".into();
+        h["execution"]["state_root"] = format!("0x{}", "11".repeat(32)).into();
+        h["execution"]["block_hash"] = format!("0x{}", "22".repeat(32)).into();
+        h["execution"]["block_number"] = "1".into();
+    });
+    let r = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
+    assert!(matches!(r, Err(HeadError::Finality(_))), "{r:?}");
+}
+
+#[test]
+fn finality_needs_two_thirds_of_the_committee() {
+    // A genuinely signed subquorum update cannot be built without keys;
+    // the rule itself is checked here, and every fixture is a supermajority.
+    assert!(!has_quorum(341));
+    assert!(has_quorum(342));
+    assert_eq!(COMMITTEE_SIZE, 512);
+    let fx = fixture();
+    let h = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now).unwrap();
+    assert!(has_quorum(h.participants));
 }
