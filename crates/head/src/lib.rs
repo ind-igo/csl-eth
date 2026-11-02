@@ -311,6 +311,32 @@ pub fn verify(
     })
 }
 
+/// The period updates [`verify`] will read after the bootstrap `bytes`:
+/// every period from the bootstrap's through the current one. The
+/// bootstrap is checked against `checkpoint` first, so a host that fetches
+/// these files in one round fetches them for a proven committee; an error
+/// is the one `verify` returns at the same step. This lets a host ask for
+/// the bootstrap and the finality update in one round and every period
+/// update in the next, while `verify` still checks them in order.
+pub fn update_periods(
+    bytes: &[u8],
+    checkpoint: B256,
+    chain: &Chain,
+    now: SystemTime,
+) -> Result<std::ops::RangeInclusive<u64>, HeadError> {
+    let path = paths::bootstrap(&checkpoint);
+    let env: Envelope<Bootstrap<Spec>> =
+        serde_json::from_slice(bytes).map_err(|e| HeadError::Decode {
+            path,
+            error: e.to_string(),
+        })?;
+    verify_bootstrap::<Spec>(&env.data, checkpoint, &chain.forks)
+        .map_err(|e| HeadError::Bootstrap(e.to_string()))?;
+    let first = calc_sync_period::<Spec>(env.data.header().beacon().slot);
+    let current = calc_sync_period::<Spec>(current_slot(chain, now));
+    Ok(first..=current)
+}
+
 /// The sync-committee period of a slot (8,192 slots, about 27 hours).
 pub fn period_of(slot: u64) -> u64 {
     calc_sync_period::<Spec>(slot)

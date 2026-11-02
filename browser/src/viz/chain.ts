@@ -2,12 +2,15 @@
 // input (a beacon block root) through the sync committee's signatures to
 // the finalized execution header, its state root, the snapshot's manifest
 // and each table's page 0. A link is drawn from the client's verdict, not
-// from timing: it turns green only once the client has accepted it (the
-// verifier reads the head files one per round, each after the last
-// verified, so a request for a later link is the client's acceptance of
-// the earlier ones; the last links are accepted when the open returns its
-// head), and red at the step where the client refused it. Times come from
-// the drive's own log and step timings.
+// from timing: it turns green only once the client has accepted it, and
+// red at the step where the client refused it. The head comes in two
+// rounds: the bootstrap with the finality update, then every period update
+// at once, asked for only once the bootstrap proved the checkpoint. So a
+// request for an update is the client's acceptance of the bootstrap, the
+// manifest's request is its acceptance of every update and the finality
+// update (the verifier checks them in order before it asks), and a
+// refusal names the step: the period it stopped at, or the finality
+// update. Times come from the drive's own log and step timings.
 
 import type { Head } from "../protocol.ts";
 import { type Cursor, type Lane, type Scene, esc, kb, short } from "./model.ts";
@@ -87,10 +90,14 @@ export function renderChain(scene: Scene | null, cur: Cursor, focusReqs: Set<str
   // accepted (the requests are recorded; a request exists from the end of
   // the step that accepted what came before it). All are, once it answered
   // with a head.
+  // The finality update is asked for with the bootstrap, so its request
+  // accepts nothing; the updates are asked for together, so theirs
+  // accepts the bootstrap only.
   let acceptedBelow = 0;
   for (const r of [...l.reqs, ...l.sent]) {
     const k = rankOf(r.file, r.offset, manifest);
-    if (k !== null && l.offset + r.start <= cur.t) acceptedBelow = Math.max(acceptedBelow, k);
+    if (k === null || k === 2 || l.offset + r.start > cur.t) continue;
+    acceptedBelow = Math.max(acceptedBelow, Math.floor(k));
   }
   if (head) acceptedBelow = Infinity;
   const v: Verdict = { acceptedBelow, refused };
@@ -102,7 +109,9 @@ export function renderChain(scene: Scene | null, cur: Cursor, focusReqs: Set<str
   // Period updates: each hands over to the next committee. The client
   // accepts a missing update only for the current period (its file is
   // published once the period has a block attested by the next committee);
-  // an earlier period's update is required.
+  // an earlier period's update is required, and when none from it on is
+  // published the bucket is stale: its producer stopped.
+  const at = refusalAt(refused ? l.error : undefined);
   const ups = l.reqs.filter((r) => r.file.startsWith("head/updates/"));
   const upSent = l.sent.filter((q) => q.file.startsWith("head/updates/"));
   const upFiles = [...new Set([...ups.map((r) => r.file), ...upSent.map((q) => q.file)])];
@@ -111,11 +120,23 @@ export function renderChain(scene: Scene | null, cur: Cursor, focusReqs: Set<str
     const rank = rankOf(f, null, manifest)!;
     const s = stateOf(l, li, cur, v, rank, (x) => x === f);
     const period = f.slice("head/updates/".length);
+    const n = Number(period);
     const missing = s.status.length > 0 && s.status.every((x) => x === 404);
+    // One round fetched them all; the refusal says how far the checks got.
+    let state: State = s.state;
+    if (state === "bad" && at.pastUpdates) state = "ok";
+    else if (state === "bad" && at.period !== undefined && n < at.period) state = "ok";
+    else if (state === "bad" && at.period !== undefined && n > at.period) state = "wait";
     let sub = `head/updates/${period}`;
-    if (s.state === "ok") sub = missing ? `period ${period}: not published yet; the client accepts that only for the current period, and the committee in hand signs the head` : `period ${period}: the next committee, signed by the last · ${kb(s.bytes)}`;
-    else if (s.state === "bad") sub = `period ${period}: refused: ${l.error}`;
-    items.push({ title: missing && s.state === "ok" ? "period update (none yet)" : "period update", sub, state: s.state, reqs: s.reqs });
+    let title = "period update";
+    if (state === "ok") sub = missing ? `period ${period}: not published yet; the client accepts that only for the current period, and the committee in hand signs the head` : `period ${period}: the next committee, signed by the last · ${kb(s.bytes)}`;
+    else if (state === "wait" && s.state === "bad") sub = `period ${period}: not checked; the client refused an earlier period`;
+    else if (state === "bad" && at.stale) {
+      title = "period update (not published)";
+      sub = `period ${period}: ${l.error}`;
+    } else if (state === "bad") sub = `period ${period}: refused: ${l.error}`;
+    if (missing && state === "ok") title = "period update (none yet)";
+    items.push({ title, sub, state, reqs: s.reqs });
   }
   const fin = stateOf(l, li, cur, v, 2, (f) => f === "head/finality");
   const signers = fin.state === "bad" ? `refused: ${l.error}` : head ? `signed by ${head.participants} of 512 committee members · ${kb(fin.bytes)}` : fin.state === "ok" ? `signed by the committee in hand · ${kb(fin.bytes)}` : "head/finality";
@@ -147,6 +168,19 @@ export function renderChain(scene: Scene | null, cur: Cursor, focusReqs: Set<str
   }
   if (refused) items.push({ title: "refused", sub: l.error ?? "", state: "bad", reqs: [] });
   return draw(items, focusReqs);
+}
+
+/// Where a refused open stopped, as far as the period updates go: the
+/// period whose update was missing (a stale bucket), refused or unreadable;
+/// or past them all, at the finality update or later.
+function refusalAt(err: string | undefined): { period?: number; stale?: boolean; pastUpdates?: boolean } {
+  if (!err) return {};
+  let m = err.match(/stale head: the bucket's head stops at period (\d+)/);
+  if (m) return { period: Number(m[1]), stale: true };
+  m = err.match(/update for period (\d+) rejected/) ?? err.match(/head\/updates\/(\d+)/);
+  if (m) return { period: Number(m[1]) };
+  if (/finality|no snapshot at finalized|snapshot:/.test(err)) return { pastUpdates: true };
+  return {};
 }
 
 const ICON: Record<State, string> = { wait: "", fetch: "", check: "", ok: "✓", warn: "!", bad: "✗" };

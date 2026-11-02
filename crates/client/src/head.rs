@@ -6,13 +6,17 @@
 //! slice milestone the published snapshot must be the finalized one, and a
 //! lagging snapshot is an error that says which block it is at.
 //!
-//! Opening is rounds like everything else: the bootstrap, each period
-//! update, the finality update (the verifier reads them in that order and
-//! each depends on the last), then the manifest, then the models.
+//! Opening is rounds like everything else, and the head is two of them
+//! however old the checkpoint: the bootstrap and the finality update
+//! together, then every period update from the bootstrap's period through
+//! the current one at once (the bootstrap names the first period, the
+//! clock the last); then the manifest, then the models. The verifier still
+//! reads and checks them in its order, each against what the last
+//! established; only when the bytes are asked for changed.
 
 use crate::{manifest_path, At, Driver, Opener, Pending, Snapshot, Store, PENDING};
 use alloy_primitives::B256;
-use csl_eth_head::{verify, HeadSource};
+use csl_eth_head::{paths, update_periods, verify, HeadSource};
 pub use csl_eth_head::{Chain, ExecutionHead, HeadError, VerifiedHead};
 use csl_eth_store::Manifest;
 use std::{fmt, sync::Arc, time::SystemTime};
@@ -68,13 +72,34 @@ impl fmt::Display for HeadOpenError {
 
 impl std::error::Error for HeadOpenError {}
 
-/// Verify the head from the store, or `Pending` for the next file.
+/// Verify the head from the store, or `Pending` with the next round's
+/// files. Round 1 is the bootstrap and `head/finality`; round 2 every
+/// period update the bootstrap and the clock call for. A bootstrap that is
+/// absent or does not prove the checkpoint asks for no updates: `verify`
+/// then refuses it with the same error it always did.
 fn try_verify(
     store: &Store,
     checkpoint: B256,
     now: SystemTime,
 ) -> Result<Result<VerifiedHead, HeadError>, Pending> {
-    match verify(&StoreHead(store), &Chain::mainnet(), checkpoint, now) {
+    let chain = Chain::mainnet();
+    let bootstrap = store.file(&paths::bootstrap(&checkpoint));
+    let finality = store.file(paths::FINALITY);
+    let (Ok(bootstrap), Ok(_)) = (bootstrap, finality) else {
+        return Err(Pending);
+    };
+    if let Ok(Some(b)) = &bootstrap {
+        if let Ok(periods) = update_periods(b, checkpoint, &chain, now) {
+            let mut pending = false;
+            for p in periods {
+                pending |= store.file(&paths::update(p)).is_err();
+            }
+            if pending {
+                return Err(Pending);
+            }
+        }
+    }
+    match verify(&StoreHead(store), &chain, checkpoint, now) {
         Err(HeadError::Read(s)) if s == PENDING => Err(Pending),
         r => Ok(r),
     }

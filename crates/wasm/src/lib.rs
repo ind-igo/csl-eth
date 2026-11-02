@@ -391,7 +391,8 @@ impl Client {
         })
     }
 
-    /// Begin opening: the first `need` is the head bootstrap.
+    /// Begin opening: the first `need` is the head bootstrap and the finality
+    /// update, the second every period update.
     pub fn open(&mut self) -> String {
         if self.opener.is_none() {
             return self.fail("already open");
