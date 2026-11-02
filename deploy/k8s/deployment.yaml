@@ -1,0 +1,87 @@
+# The producer loop (`csl-eth produce`) as a k3s Deployment on fafo-0.
+#
+# No custom image, as with int: the repo is rsynced to /home/indigo/apps/csl-eth
+# and built there (deploy/k8s/apply.sh), and mounted as a hostPath into the
+# stock buildpack-deps image for Ubuntu 24.04, which matches the box's glibc
+# and carries curl for the publisher. The work directory (slice, local mirror
+# of the bucket, state.json with what is published and which pointer write is
+# pending) is data/produce under the same mount, so it survives restarts.
+#
+# One replica and Recreate: two producers would race on the bucket's
+# pointers. hostNetwork because the fetcher speaks discv4 (UDP 30399) and
+# RLPx to mainnet peers, which is how it was measured from this box.
+#
+# Credentials: Secret r2 (R2_ACCOUNT_ID, R2_ACCESS_KEY_ID,
+# R2_SECRET_ACCESS_KEY), an account token limited to object read/write on
+# csl-eth-apac and to this box's addresses. Never in the repo.
+#
+# Cycles: one JSON line each on stdout (kubectl -n csl-eth logs deploy/producer)
+# and in data/produce/produce.log.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: producer
+  namespace: csl-eth
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: producer
+  template:
+    metadata:
+      labels:
+        app: producer
+    spec:
+      hostNetwork: true
+      dnsPolicy: Default
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: produce
+          # buildpack-deps:noble-curl, pinned by digest on 2026-11-02.
+          image: buildpack-deps@sha256:a115b80bacdfad86050664accdf7e2d7be45edb87d98a3ba78b78f0f9a089c1a
+          workingDir: /work
+          command:
+            - nice
+            - "-n"
+            - "10"
+            - ./target/release/csl-eth
+            - produce
+            - --prefix
+            - 1a7
+            - --work
+            - data/produce
+            - --checkpoint
+            - "0xe59d78041964322427cc209a44edcad243487378b78895a6cc0bfa7a7577cf0b"
+            - --publish
+            - /work/scripts/r2-s3-publish.sh
+            - --every-mins
+            - "60"
+            - --keep
+            - "3"
+          env:
+            - name: HOME
+              value: /tmp
+          envFrom:
+            - secretRef:
+                name: r2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 3Gi
+          volumeMounts:
+            - name: repo
+              mountPath: /work
+      volumes:
+        - name: repo
+          hostPath:
+            path: /home/indigo/apps/csl-eth
+            type: Directory
