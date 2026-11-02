@@ -1,8 +1,8 @@
 //! `csl-eth produce`: the producer loop. A snapshot is only a head while
 //! the bucket's head files can be followed to it: its finality update is
-//! signed in some period P, and a client needs the period updates through
-//! the clock's period, so a frozen snapshot stops opening once period P+2
-//! begins. This loop keeps the bucket current by doing, at each chosen
+//! signed in some period P, and a client refuses a head signed two periods
+//! before its clock as stale, so a frozen snapshot stops opening once
+//! period P+2 begins. This loop keeps the bucket current by doing, at each chosen
 //! epoch boundary, what was done by hand once:
 //!
 //! 1. fetch the slice over snap with the pivot at the boundary (the block
@@ -19,17 +19,23 @@
 //!    it closes), and `head/finality`;
 //! 5. verify the mirror as a client would: the head reaches exactly this
 //!    block and the manifest's state root, and sampled accounts, slots and
-//!    code from the slice read back verified through it;
+//!    code from the slice read back verified through it (head files
+//!    fetched this cycle count only from here: if verification fails they
+//!    are discarded, and the next cycle fetches them again);
 //! 6. publish so that a reader never sees a pointer to something not yet
 //!    there: run files, manifest, new blobs, changed head updates,
 //!    `snapshots/latest`, and `head/finality` last;
 //! 7. delete snapshots beyond `--keep` from the bucket and the mirror, and
-//!    old slices, never the snapshot `head/finality` or `latest` names.
-//!    Blobs are content-addressed and shared, and are left alone.
+//!    old slices; never the newest, the one `head/finality` or `latest`
+//!    names, or one a pointer write may have named (a write that failed is
+//!    not known not to have landed). Blobs are content-addressed and
+//!    shared, and are left alone.
 //!
 //! A failed cycle is logged and the loop goes on to the next boundary.
 //! What has been published is recorded in `<work>/state.json` as each
 //! file goes up, so a restart re-uploads neither blobs nor closed updates.
+//! Each publisher call has a deadline (`--publish-timeout-secs`); one that
+//! passes it is killed with its process group and is a failure.
 
 use crate::{fetch, FetchConfig, Slice};
 use alloy_primitives::{keccak256, B256};
@@ -55,6 +61,9 @@ use std::{
 /// Seconds in an epoch: 32 slots of 12 seconds.
 const EPOCH_SECS: u64 = 32 * 12;
 
+/// `produce.log` is rotated to `produce.log.1` above this size.
+const LOG_MAX: u64 = 10 << 20;
+
 #[derive(ClapArgs, Debug, Clone)]
 pub struct Args {
     /// Hex nibbles of the slice, e.g. `1a7` for 1/4096 of state.
@@ -77,7 +86,8 @@ pub struct Args {
     /// Snapshots kept in the bucket.
     #[arg(long, default_value_t = 3)]
     pub keep: usize,
-    /// Minimum spacing between published snapshots, in minutes.
+    /// Minimum spacing between published snapshots, in minutes; the next
+    /// boundary is the first epoch boundary past it.
     #[arg(long, default_value_t = 60)]
     pub every_mins: u64,
     /// Run one cycle and exit with its status.
@@ -113,6 +123,10 @@ pub struct Args {
     /// Uploads in flight.
     #[arg(long, default_value_t = 8)]
     pub publish_parallel: usize,
+    /// Deadline for each publisher call; past it the program and its
+    /// process group are killed and the call is a failure.
+    #[arg(long, default_value_t = 300)]
+    pub publish_timeout_secs: u64,
 }
 
 /// What has been published, kept across restarts.
@@ -134,6 +148,12 @@ pub struct State {
     pub finality: Option<B256>,
     /// The block the bucket's `snapshots/latest` names.
     pub latest: Option<B256>,
+    /// Snapshots a pointer write (`latest` or `head/finality`) was started
+    /// for and not both confirmed: a failed or timed-out write may still
+    /// have landed, so the bucket may name any of them. Protected from
+    /// collection until a later cycle writes both pointers.
+    #[serde(default)]
+    pub pending: BTreeSet<B256>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -240,9 +260,20 @@ pub fn next_target(genesis: u64, now: u64, lead: u64, last: Option<u64>, every: 
 
 /// Snapshots to delete: incomplete ones (a cycle that failed while
 /// publishing), and complete ones beyond the newest `keep`; never the
-/// ones `head/finality` or `latest` name.
+/// ones `head/finality` or `latest` name, any a pointer write is pending
+/// for, or the newest by block number.
 pub fn gc_plan(state: &State, keep: usize) -> Vec<B256> {
-    let protected = |h: &B256| state.finality == Some(*h) || state.latest == Some(*h);
+    let newest = state
+        .snapshots
+        .iter()
+        .max_by_key(|s| s.block_number)
+        .map(|s| s.block_hash);
+    let protected = |h: &B256| {
+        state.finality == Some(*h)
+            || state.latest == Some(*h)
+            || state.pending.contains(h)
+            || newest == Some(*h)
+    };
     let mut complete: Vec<&SnapRec> = state.snapshots.iter().filter(|s| s.complete).collect();
     complete.sort_by_key(|s| s.block_number);
     let excess = complete.len().saturating_sub(keep);
@@ -271,29 +302,80 @@ pub trait Publish: Sync {
 }
 
 /// An external program, `<program> put <key> <file>` / `<program> delete
-/// <key>`.
-pub struct Program(pub String);
+/// <key>`, each call with a deadline.
+pub struct Program {
+    pub program: String,
+    pub timeout: Duration,
+}
 
 impl Program {
     fn run(&self, args: &[&std::ffi::OsStr]) -> Result<(), String> {
-        let out = Command::new(&self.0)
-            .args(args)
-            .output()
-            .map_err(|e| format!("{}: {e}", self.0))?;
-        if out.status.success() {
+        use std::io::Read as _;
+        let shown = || {
+            format!(
+                "{} {}",
+                self.program,
+                args.iter()
+                    .map(|a| a.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+        let mut cmd = Command::new(&self.program);
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // Its own process group, so a timeout kills what it started too
+        // (a shell script's `cf` or `curl`), and the pipes close.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut child = cmd.spawn().map_err(|e| format!("{}: {e}", self.program))?;
+        let drain = |r: Option<Box<dyn std::io::Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut v = Vec::new();
+                if let Some(mut r) = r {
+                    let _ = r.read_to_end(&mut v);
+                }
+                v
+            })
+        };
+        let out = drain(child.stdout.take().map(|x| Box::new(x) as _));
+        let err = drain(child.stderr.take().map(|x| Box::new(x) as _));
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break Some(st),
+                Ok(None) if Instant::now() >= deadline => break None,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => return Err(format!("{}: {e}", shown())),
+            }
+        };
+        let Some(status) = status else {
+            #[cfg(unix)]
+            let _ = Command::new("kill")
+                .args(["-KILL", &format!("-{}", child.id())])
+                .status();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = (out.join(), err.join());
+            return Err(format!(
+                "{}: no answer in {} s; killed",
+                shown(),
+                self.timeout.as_secs()
+            ));
+        };
+        let so = out.join().unwrap_or_default();
+        let se = err.join().unwrap_or_default();
+        if status.success() {
             return Ok(());
         }
-        let err = String::from_utf8_lossy(&out.stderr);
-        let so = String::from_utf8_lossy(&out.stdout);
+        let (se, so) = (String::from_utf8_lossy(&se), String::from_utf8_lossy(&so));
         Err(format!(
-            "{} {}: {}: {}{}",
-            self.0,
-            args.iter()
-                .map(|a| a.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(" "),
-            out.status,
-            err.trim(),
+            "{}: {}: {}{}",
+            shown(),
+            status,
+            se.trim(),
             if so.trim().is_empty() {
                 String::new()
             } else {
@@ -403,11 +485,12 @@ impl Work {
         let s = line.to_string();
         println!("{s}");
         let _ = std::io::stdout().flush();
-        if let Ok(mut f) = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.root.join("produce.log"))
-        {
+        let path = self.root.join("produce.log");
+        // One generation kept: above the cap the log becomes produce.log.1.
+        if fs::metadata(&path).is_ok_and(|m| m.len() > LOG_MAX) {
+            let _ = fs::rename(&path, self.root.join("produce.log.1"));
+        }
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
             let _ = writeln!(f, "{s}");
         }
     }
@@ -418,7 +501,10 @@ pub fn run(args: Args) -> Result<(), String> {
     parse_prefix(&args.prefix)?;
     let work = Work::new(&args.work)?;
     let mut state = State::load(&work.root, args.checkpoint)?;
-    let publisher = Program(args.publish.clone());
+    let publisher = Program {
+        program: args.publish.clone(),
+        timeout: Duration::from_secs(args.publish_timeout_secs),
+    };
     let chain = Chain::mainnet();
     loop {
         let target = next_target(
@@ -634,8 +720,19 @@ fn cycle(
     line.insert("head_secs".into(), json!(secs(t.elapsed())));
     line.insert("updates_fetched".into(), json!(head.fetched));
 
-    // 5. Verify as a client would.
-    let v = verify(args, work, &slice, &produced.manifest).map_err(at("verify"))?;
+    // 5. Verify as a client would. The head files fetched this cycle are
+    // kept (and a closed period's update marked final) only if it passes.
+    let v = match verify(args, work, &slice, &produced.manifest) {
+        Ok(v) => v,
+        Err(e) => {
+            head.discard(work, state);
+            return Err(Failed {
+                step: "verify",
+                error: e,
+            });
+        }
+    };
+    head.commit(work, state).map_err(at("verify"))?;
     line.insert("verify".into(), v);
 
     // 6. Publish in order.
@@ -658,13 +755,52 @@ fn cycle(
     r.map_err(at("publish"))
 }
 
-/// What step 4 laid out.
+/// What step 4 laid out, not yet trusted: until the cycle's verification
+/// passes, nothing fetched is marked final, and on failure it is removed.
 struct HeadFiles {
     /// Periods fetched from the beacon node this cycle.
     fetched: Vec<u64>,
-    /// The update periods the head reads: checkpoint's through current.
+    /// The update periods laid out: the checkpoint's through current.
     first: u64,
     current: u64,
+    /// The bootstrap was fetched this cycle.
+    fresh_bootstrap: bool,
+    /// The mirror's `head/finality` before this cycle, restored on failure.
+    old_finality: Option<Vec<u8>>,
+}
+
+impl HeadFiles {
+    /// Verification passed: a closed period's update fetched this cycle is
+    /// final from now on, and the current period's is not.
+    fn commit(&self, work: &Work, state: &mut State) -> Result<(), String> {
+        for &p in &self.fetched {
+            if p < self.current {
+                state.updates_final_local.insert(p);
+            } else {
+                state.updates_final_local.remove(&p);
+            }
+        }
+        state.save(&work.root)
+    }
+
+    /// Verification failed (or step 4 did): remove what this cycle fetched,
+    /// so the next one fetches it again, and put the mirror's
+    /// `head/finality` back.
+    fn discard(&self, work: &Work, state: &mut State) {
+        for &p in &self.fetched {
+            let _ = fs::remove_file(work.bucket.join(paths::update(p)));
+            state.updates_final_local.remove(&p);
+        }
+        if self.fresh_bootstrap {
+            let _ = fs::remove_file(work.bucket.join(paths::bootstrap(&state.checkpoint)));
+        }
+        let fin = work.bucket.join(paths::FINALITY);
+        let _ = match &self.old_finality {
+            Some(b) => write_atomic(&fin, b),
+            None => fs::remove_file(&fin).map_err(|e| e.to_string()),
+        };
+        let _ = state.save(&work.root);
+    }
 }
 
 fn head_files(
@@ -673,6 +809,29 @@ fn head_files(
     state: &mut State,
     finality: &[u8],
 ) -> Result<HeadFiles, String> {
+    let mut h = HeadFiles {
+        fetched: Vec::new(),
+        first: 0,
+        current: 0,
+        fresh_bootstrap: false,
+        old_finality: fs::read(work.bucket.join(paths::FINALITY)).ok(),
+    };
+    match lay_out_head(args, work, state, finality, &mut h) {
+        Ok(()) => Ok(h),
+        Err(e) => {
+            h.discard(work, state);
+            Err(e)
+        }
+    }
+}
+
+fn lay_out_head(
+    args: &Args,
+    work: &Work,
+    state: &State,
+    finality: &[u8],
+    h: &mut HeadFiles,
+) -> Result<(), String> {
     let chain = Chain::mainnet();
     let beacon = Beacon::new(&args.beacon);
     let bpath = work.bucket.join(paths::bootstrap(&args.checkpoint));
@@ -681,6 +840,7 @@ fn head_files(
         Err(_) => {
             let (b, _) = beacon.bootstrap(args.checkpoint)?;
             write_atomic(&bpath, &b)?;
+            h.fresh_bootstrap = true;
             b
         }
     };
@@ -692,33 +852,21 @@ fn head_files(
                 .and_then(|s| s.parse::<u64>().ok())
         })
         .ok_or("bootstrap without a slot")?;
-    let first = csl_eth_head::period_of(slot);
-    let current = csl_eth_head::period_of(csl_eth_head::current_slot(&chain, SystemTime::now()));
-    let need = updates_to_fetch(state, first, current, |p| {
+    h.first = csl_eth_head::period_of(slot);
+    h.current = csl_eth_head::period_of(csl_eth_head::current_slot(&chain, SystemTime::now()));
+    let need = updates_to_fetch(state, h.first, h.current, |p| {
         work.bucket.join(paths::update(p)).exists()
     });
-    let mut fetched = Vec::new();
     if let (Some(&lo), Some(&hi)) = (need.first(), need.last()) {
         for u in beacon.updates(lo, hi)? {
             if !need.contains(&u.period) {
                 continue;
             }
+            h.fetched.push(u.period);
             write_atomic(&work.bucket.join(paths::update(u.period)), &u.bytes)?;
-            if u.period < current {
-                state.updates_final_local.insert(u.period);
-            } else {
-                state.updates_final_local.remove(&u.period);
-            }
-            fetched.push(u.period);
         }
     }
-    write_atomic(&work.bucket.join(paths::FINALITY), finality)?;
-    state.save(&work.root)?;
-    Ok(HeadFiles {
-        fetched,
-        first,
-        current,
-    })
+    write_atomic(&work.bucket.join(paths::FINALITY), finality)
 }
 
 /// The period updates to fetch: every period from `first` through
@@ -915,6 +1063,11 @@ fn publish(
     }
 
     // `latest`, then the finality update that makes this snapshot the head.
+    // The intent is journaled first: a write that fails (or times out) may
+    // still have landed, so until both are confirmed the bucket may name
+    // this snapshot, and collection must not delete it.
+    state.pending.insert(hash);
+    state.save(&work.root)?;
     put_one(p, LATEST_FILE, &work.bucket.join(LATEST_FILE), sent)?;
     state.latest = Some(hash);
     state.save(&work.root)?;
@@ -923,6 +1076,10 @@ fn publish(
     if let Some(s) = state.snapshots.iter_mut().find(|s| s.block_hash == hash) {
         s.complete = true;
     }
+    state.save(&work.root)?;
+    // Both pointers name this snapshot now; whatever earlier cycles left
+    // pending is named by neither.
+    state.pending.clear();
     state.save(&work.root)
 }
 
@@ -1054,14 +1211,11 @@ mod tests {
             latest: Some(B256::with_last_byte(4)),
             ..Default::default()
         };
-        // Keep 2: delete 1 and 2 (oldest first), and the failed 5.
+        // Keep 2: delete 1 and 2 (oldest first). The failed 5 is the
+        // newest, and stays until a newer one exists.
         assert_eq!(
             gc_plan(&s, 2),
-            vec![
-                B256::with_last_byte(1),
-                B256::with_last_byte(2),
-                B256::with_last_byte(5)
-            ]
+            vec![B256::with_last_byte(1), B256::with_last_byte(2)]
         );
         // Keep 0 still never deletes what finality names.
         s.snapshots.retain(|r| r.complete);
@@ -1200,6 +1354,8 @@ mod tests {
             fetched: vec![],
             first: 1898,
             current: 1899,
+            fresh_bootstrap: false,
+            old_finality: None,
         };
         let rec = Rec(Default::default());
         let mut sent = Sent { files: 0, bytes: 0 };
@@ -1235,6 +1391,7 @@ mod tests {
         assert_eq!(sent.files, 10);
         assert!(s.snapshots[0].complete);
         assert_eq!(s.finality, Some(B256::with_last_byte(1)));
+        assert!(s.pending.is_empty(), "both pointers confirmed");
         // Reloaded from disk, as after a restart.
         let mut s = State::load(&root, B256::repeat_byte(9)).unwrap();
         assert!(s.updates[&1898].is_final && !s.updates[&1899].is_final);
@@ -1294,6 +1451,226 @@ mod tests {
         assert!(!w.slices.join("1").exists() && w.slices.join("2").exists());
         assert!(w.bucket.join("blobs/aa").exists());
         assert_eq!(s.snapshots.len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gc_spares_pending_pointers_and_the_newest() {
+        let mut s = State {
+            snapshots: vec![rec(1, true), rec(2, true), rec(3, false), rec(4, false)],
+            finality: Some(B256::with_last_byte(2)),
+            latest: Some(B256::with_last_byte(2)),
+            ..Default::default()
+        };
+        // 4 is the newest: kept even though incomplete; 3 goes.
+        assert_eq!(
+            gc_plan(&s, 0),
+            vec![B256::with_last_byte(1), B256::with_last_byte(3)]
+        );
+        // A pointer write for 3 failed: it may be what the bucket names.
+        s.pending.insert(B256::with_last_byte(3));
+        assert_eq!(gc_plan(&s, 0), vec![B256::with_last_byte(1)]);
+    }
+
+    /// Fails `put` for one key.
+    struct FailOn(&'static str, Rec);
+
+    impl Publish for FailOn {
+        fn put(&self, key: &str, file: &Path) -> Result<(), String> {
+            if key == self.0 {
+                return Err(format!("{key}: timed out"));
+            }
+            self.1.put(key, file)
+        }
+        fn delete(&self, key: &str) -> Result<(), String> {
+            self.1.delete(key)
+        }
+    }
+
+    #[test]
+    fn a_failed_pointer_write_stays_protected_until_a_later_commit() {
+        let root = tmp("pending");
+        let w = Work::new(&root).unwrap();
+        let mut s = State {
+            checkpoint: B256::repeat_byte(9),
+            ..Default::default()
+        };
+        touch(&w.bucket, &paths::bootstrap(&s.checkpoint), b"boot");
+        let head = HeadFiles {
+            fetched: vec![],
+            first: 1898,
+            current: 1898,
+            fresh_bootstrap: false,
+            old_finality: None,
+        };
+        let mut sent = Sent { files: 0, bytes: 0 };
+        let ok = Rec(Default::default());
+        lay_out(&w, 1, &[], &[(1898, b"u")]);
+        publish(
+            &w,
+            &mut s,
+            &ok,
+            &fake_slice(1),
+            100,
+            "1",
+            &head,
+            1,
+            &mut sent,
+        )
+        .unwrap();
+        // Cycle 2's finality write fails: it may or may not have landed.
+        lay_out(&w, 2, &[], &[(1898, b"u")]);
+        let fail = FailOn(paths::FINALITY, Rec(Default::default()));
+        assert!(publish(
+            &w,
+            &mut s,
+            &fail,
+            &fake_slice(2),
+            200,
+            "2",
+            &head,
+            1,
+            &mut sent
+        )
+        .is_err());
+        let h2 = B256::with_last_byte(2);
+        assert!(s.pending.contains(&h2));
+        // Cycle 3 fails at `latest`: 2 and 3 both pending, across a restart.
+        lay_out(&w, 3, &[], &[(1898, b"u")]);
+        let fail = FailOn(LATEST_FILE, Rec(Default::default()));
+        assert!(publish(
+            &w,
+            &mut s,
+            &fail,
+            &fake_slice(3),
+            300,
+            "3",
+            &head,
+            1,
+            &mut sent
+        )
+        .is_err());
+        let mut s = State::load(&root, B256::repeat_byte(9)).unwrap();
+        let h3 = B256::with_last_byte(3);
+        assert!(s.pending.contains(&h2) && s.pending.contains(&h3));
+        // Collection with keep 0 deletes nothing a pointer may name.
+        let c = collect(&w, &mut s, &Rec(Default::default()), 0);
+        assert!(c.deleted.is_empty(), "{:?}", c.deleted);
+        // Cycle 4 commits both pointers: 2 and 3 are fair game again.
+        lay_out(&w, 4, &[], &[(1898, b"u")]);
+        publish(
+            &w,
+            &mut s,
+            &ok,
+            &fake_slice(4),
+            400,
+            "4",
+            &head,
+            1,
+            &mut sent,
+        )
+        .unwrap();
+        assert!(s.pending.is_empty());
+        assert_eq!(
+            gc_plan(&s, 1),
+            vec![
+                B256::with_last_byte(1),
+                B256::with_last_byte(2),
+                B256::with_last_byte(3)
+            ]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn head_files_of_a_failed_cycle_are_discarded() {
+        let root = tmp("discard");
+        let w = Work::new(&root).unwrap();
+        let mut s = State {
+            checkpoint: B256::repeat_byte(9),
+            ..Default::default()
+        };
+        touch(&w.bucket, &paths::bootstrap(&s.checkpoint), b"boot");
+        touch(&w.bucket, &paths::update(1898), b"u1898 kept");
+        touch(&w.bucket, &paths::update(1899), b"u1899 fetched");
+        touch(&w.bucket, &paths::update(1900), b"u1900 fetched");
+        touch(&w.bucket, paths::FINALITY, b"new");
+        s.updates_final_local.insert(1898);
+        let head = HeadFiles {
+            fetched: vec![1899, 1900],
+            first: 1898,
+            current: 1900,
+            fresh_bootstrap: true,
+            old_finality: Some(b"old".to_vec()),
+        };
+        head.discard(&w, &mut s);
+        assert!(!w.bucket.join(paths::update(1899)).exists());
+        assert!(!w.bucket.join(paths::update(1900)).exists());
+        assert!(w.bucket.join(paths::update(1898)).exists());
+        assert!(!w.bucket.join(paths::bootstrap(&s.checkpoint)).exists());
+        assert_eq!(fs::read(w.bucket.join(paths::FINALITY)).unwrap(), b"old");
+        // The next cycle fetches them again; 1899 was never marked final.
+        let have = |p: u64| w.bucket.join(paths::update(p)).exists();
+        assert_eq!(updates_to_fetch(&s, 1898, 1900, have), vec![1899, 1900]);
+        // A passing cycle marks the closed one final, not the current one.
+        let mut s2 = s.clone();
+        head.commit(&w, &mut s2).unwrap();
+        assert!(s2.updates_final_local.contains(&1899));
+        assert!(!s2.updates_final_local.contains(&1900));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_publisher_past_its_deadline_is_killed() {
+        let root = tmp("timeout");
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("slow.sh");
+        // The child it starts holds stdout open: the group kill closes it.
+        fs::write(&script, "#!/bin/sh\nsleep 30 &\nsleep 30\n").unwrap();
+        fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let p = Program {
+            program: script.to_string_lossy().into(),
+            timeout: Duration::from_secs(1),
+        };
+        let t = Instant::now();
+        let e = p.delete("k").unwrap_err();
+        assert!(e.contains("killed"), "{e}");
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+        let ok = root.join("ok.sh");
+        fs::write(&ok, "#!/bin/sh\necho fine\n").unwrap();
+        fs::set_permissions(&ok, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let p = Program {
+            program: ok.to_string_lossy().into(),
+            timeout: Duration::from_secs(5),
+        };
+        p.delete("k").unwrap();
+        let bad = root.join("bad.sh");
+        fs::write(&bad, "#!/bin/sh\necho nope >&2\nexit 3\n").unwrap();
+        fs::set_permissions(&bad, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let p = Program {
+            program: bad.to_string_lossy().into(),
+            timeout: Duration::from_secs(5),
+        };
+        let e = p.delete("k").unwrap_err();
+        assert!(e.contains("nope"), "{e}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_log_rotates_above_its_cap() {
+        let root = tmp("log");
+        let w = Work::new(&root).unwrap();
+        fs::write(root.join("produce.log"), vec![b'x'; LOG_MAX as usize + 1]).unwrap();
+        w.log(&json!({"ok": true}));
+        assert_eq!(
+            fs::metadata(root.join("produce.log.1")).unwrap().len(),
+            LOG_MAX + 1
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("produce.log")).unwrap(),
+            "{\"ok\":true}\n"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
