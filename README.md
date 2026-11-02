@@ -22,7 +22,7 @@ implementation.
 | `crates/client` (`csl-eth-client`) | the client as a state machine over a `Store` of fetched bytes: `try_account` / `try_storage` / `try_code` compute from what the store holds and return `Pending` with the round's wants (`Want::Range`, `Want::File`) when they need more; a `Driver` (a directory, HTTP over threads) fetches each round for the synchronous `account` / `storage` / `code`; one speculative round over depths `0..=D`, the walk, repairs, with requests, bytes and rounds per read |
 | `crates/head` (`csl-eth-head`) | the beacon light-client protocol from files: `head/bootstrap/<root>`, `head/updates/<period>`, `head/finality`, verified with helios-consensus-core from one checkpoint root to the finalized execution block |
 | `crates/wasm` (`csl-eth-wasm`) | the client and the head verifier for the browser: wasm-bindgen bindings over the step loop (`open` / `account` / `storage` / `code` return a `need` list, `supply` hands bytes back, `step` continues to `done`); the page fetches every round with `Promise.all` |
-| `crates/snap` (`csl-eth-snap`, bin `csl-eth`) | mainnet state with no node: peers from the EIP-1459 DNS tree and discv4, RLPx with eth/68–69 and snap/1–2 over reth's wire crates, account and storage ranges verified by rebuilding, bytecode by hash; `fetch` writes a slice, `build` makes a bucket from it with the range proofs as the trie boundary |
+| `crates/snap` (`csl-eth-snap`, bin `csl-eth`) | mainnet state with no node: peers from the EIP-1459 DNS tree and discv4, RLPx with eth/68–69 and snap/1–2 over reth's wire crates, account and storage ranges verified by rebuilding, bytecode by hash; `fetch` writes a slice, `build` makes a bucket from it with the range proofs as the trie boundary; `produce` loops both at epoch boundaries, waits for finality, and publishes |
 
 ```
 cargo test --workspace
@@ -94,7 +94,9 @@ status and cost. The client does no I/O: `browser/src/client.ts` drives its
 the main thread (`cache: "no-store"`, or Chromium queues same-URL ranges
 behind its cache lock). Deployed at https://csl-eth.indigo-db8.workers.dev;
 `?open` opens on load, `?bucket=<url>&checkpoint=<root>` change the inputs.
-From Taipei through a VPN: the head in 8 requests and 5 rounds (about 1 s),
+From Taipei through a VPN: the head in 8 requests and 5 rounds (about 1 s;
+two rounds since 2026-11-02 however old the checkpoint, measured on the CLI,
+not yet on the redeployed page),
 an account in 2 to 4 requests and one round (120 to 310 ms), a storage slot
 in 10 requests and one round (250 to 310 ms).
 
@@ -122,4 +124,12 @@ Milestone 1 is closed: `csl-eth workload` and `csl-eth faults` are its exit test
 
 The visualizer is at https://csl-eth.indigo-db8.workers.dev/viz.html (`browser/viz.html`, `browser/src/viz/`): the chain of trust lighting as the head verifies, the trie path node by node from the state root, every page of every table with each request's pages lit in its round's colour, and a waterfall of the rounds on the real clock. It can race the path-keyed read against the by-hash baseline on two cold clients, flip a byte of a fetched page to show the client refuse, and replay a read in slow motion. Nothing on it is simulated. Live, on the real clock, it draws every request the tab makes (race setup included) and every step the client computes; after a read answers, it replays the final verified walk from the trace the read returns (`done.trace`: per node its depth, kind, hash, the slot taken and the run-file page it was read from), each check attributed to the client step that made it. Tracing is a client switch, off by default and on in the wasm client; a test shows it changes no request and no cost.
 
-Not yet built, in order: a producer loop that follows finality (a frozen snapshot stops opening once the sync-committee period after its finality update begins), the head's period updates batched into one round.
+The producer loop is in (2026-11-02): `csl-eth produce` fetches the slice at an epoch boundary, builds it, waits for the finality update to name the block, lays out the head files, verifies the result as a client would, publishes it through a program (`scripts/r2-publish.sh` for R2, `scripts/dir-publish.sh` for a directory) in an order that never exposes a pointer to something not yet there, and deletes snapshots beyond `--keep`. A snapshot whose finality update is signed in period P opens until period P+2 begins, so the loop runs at most every `--every-mins` (60) and a bucket it stops feeding is refused as `stale head` with the period it stops at. The head opens in two rounds: the bootstrap with `head/finality`, then every period update at once.
+
+```
+CSL_ETH_PUBLISH_DIR=$PWD/data/pub ./target/release/csl-eth produce --once --prefix 1a7 --work data/produce \
+    --checkpoint 0x<root> --publish scripts/dir-publish.sh       # one cycle, one JSON line
+./target/release/csl-eth produce --prefix 1a7 --work data/produce --checkpoint 0x<root> --publish scripts/r2-publish.sh
+```
+
+Not yet built: the loop as a service (nothing starts it, restarts it, or alerts when a cycle fails), and adopting the snapshot already in the R2 bucket from before the loop (the loop's state file knows only what it published, so that snapshot stays until removed by hand).
