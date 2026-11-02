@@ -19,23 +19,28 @@
 //!    it closes), and `head/finality`;
 //! 5. verify the mirror as a client would: the head reaches exactly this
 //!    block and the manifest's state root, and sampled accounts, slots and
-//!    code from the slice read back verified through it (head files
-//!    fetched this cycle count only from here: if verification fails they
-//!    are discarded, and the next cycle fetches them again);
+//!    code from the slice read back verified through it. Head files count
+//!    only from here, and only those the head's verification read: the
+//!    bootstrap and the updates for periods `b..s` (`s` the finality
+//!    update's signing period). If verification fails, what was fetched
+//!    is discarded and the next cycle fetches it again; if it passes,
+//!    updates fetched for `s` or later, which it did not read, are dropped
+//!    from the mirror and not published;
 //! 6. publish so that a reader never sees a pointer to something not yet
-//!    there: run files, manifest, new blobs, changed head updates,
-//!    `snapshots/latest`, and `head/finality` last;
+//!    there: run files, manifest, new blobs, changed head updates of
+//!    `b..s`, `snapshots/latest`, and `head/finality` last;
 //! 7. delete snapshots beyond `--keep` from the bucket and the mirror, and
 //!    old slices; never the newest, the one `head/finality` or `latest`
 //!    names, or one a pointer write may have named (a write that failed is
-//!    not known not to have landed). Blobs are content-addressed and
-//!    shared, and are left alone.
+//!    not known not to have landed, nor to be over). Blobs are
+//!    content-addressed and shared, and are never deleted.
 //!
 //! A failed cycle is logged and the loop goes on to the next boundary.
 //! What has been published is recorded in `<work>/state.json` as each
 //! file goes up, so a restart re-uploads neither blobs nor closed updates.
-//! Each publisher call has a deadline (`--publish-timeout-secs`); one that
-//! passes it is killed with its process group and is a failure.
+//! Each publisher call has a deadline (`--publish-timeout-secs`) that
+//! covers the program and anything it leaves holding its output: past it
+//! the process group is killed and the call is a failure.
 
 use crate::{fetch, FetchConfig, Slice};
 use alloy_primitives::{keccak256, B256};
@@ -149,11 +154,55 @@ pub struct State {
     /// The block the bucket's `snapshots/latest` names.
     pub latest: Option<B256>,
     /// Snapshots a pointer write (`latest` or `head/finality`) was started
-    /// for and not both confirmed: a failed or timed-out write may still
-    /// have landed, so the bucket may name any of them. Protected from
-    /// collection until a later cycle writes both pointers.
-    #[serde(default)]
-    pub pending: BTreeSet<B256>,
+    /// for, with when (unix seconds; the latest attempt's). A write that
+    /// failed or timed out may have landed, or may still land: killing the
+    /// publisher does not cancel a request the store is already serving.
+    /// So the bucket may name any of them, and they are protected from
+    /// collection until both pointers have been written and confirmed by a
+    /// write that began at least the grace after (see [`release_pending`]).
+    /// A `state.json` from before the times were kept lists bare hashes;
+    /// they load as started now.
+    #[serde(default, deserialize_with = "pending_compat")]
+    pub pending: BTreeMap<B256, u64>,
+}
+
+fn pending_compat<'de, D>(d: D) -> Result<BTreeMap<B256, u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Pending {
+        Since(BTreeMap<B256, u64>),
+        Bare(BTreeSet<B256>),
+    }
+    Ok(match Pending::deserialize(d)? {
+        Pending::Since(m) => m,
+        Pending::Bare(s) => {
+            let now = now_secs();
+            s.into_iter().map(|h| (h, now)).collect()
+        }
+    })
+}
+
+/// How long a pointer write that was not confirmed is assumed able to
+/// land: an hour, or four publisher deadlines if that is longer, well past
+/// any request's lifetime (the publisher is killed at its deadline, and the
+/// R2 publisher's curl gives up at 240 s a try).
+pub fn pending_grace(publish_timeout: Duration) -> u64 {
+    (4 * publish_timeout.as_secs()).max(3600)
+}
+
+/// Both pointers were written and confirmed by writes that began at
+/// `started`. An entry is released only if its own writes began at least
+/// `grace` before that: by then none of them can still land, so the
+/// confirmed writes are the bucket's last word. An entry younger than that
+/// stays, since a write of it landing after `started` would name it again;
+/// a later cycle releases it.
+pub fn release_pending(state: &mut State, started: u64, grace: u64) {
+    state
+        .pending
+        .retain(|_, since| since.saturating_add(grace) > started);
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -271,7 +320,7 @@ pub fn gc_plan(state: &State, keep: usize) -> Vec<B256> {
     let protected = |h: &B256| {
         state.finality == Some(*h)
             || state.latest == Some(*h)
-            || state.pending.contains(h)
+            || state.pending.contains_key(h)
             || newest == Some(*h)
     };
     let mut complete: Vec<&SnapRec> = state.snapshots.iter().filter(|s| s.complete).collect();
@@ -308,9 +357,23 @@ pub struct Program {
     pub timeout: Duration,
 }
 
+/// After a kill, how long to wait for the output pipes to close.
+const PIPE_GRACE: Duration = Duration::from_secs(2);
+
 impl Program {
+    /// The deadline bounds the whole call: the program's exit, then the
+    /// end of its stdout and stderr, which a process it started can hold
+    /// open after it exits (`cmd &`). Past it, the process group is killed;
+    /// a reader still blocked after a short grace (a descendant that left
+    /// the group) is abandoned, not joined. The program's exit status
+    /// decides the call: one that exited 0 but left something holding its
+    /// output has done its work, and that straggler is killed and logged.
     fn run(&self, args: &[&std::ffi::OsStr]) -> Result<(), String> {
-        use std::io::Read as _;
+        use std::{
+            io::Read as _,
+            sync::{Arc, Mutex},
+            thread::JoinHandle,
+        };
         let shown = || {
             format!(
                 "{} {}",
@@ -331,17 +394,44 @@ impl Program {
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
         let mut child = cmd.spawn().map_err(|e| format!("{}: {e}", self.program))?;
-        let drain = |r: Option<Box<dyn std::io::Read + Send>>| {
-            std::thread::spawn(move || {
-                let mut v = Vec::new();
-                if let Some(mut r) = r {
-                    let _ = r.read_to_end(&mut v);
-                }
-                v
-            })
+        let pid = child.id();
+        let kill_group = || {
+            #[cfg(unix)]
+            let _ = Command::new("kill")
+                .args(["-KILL", &format!("-{pid}")])
+                .status();
         };
-        let out = drain(child.stdout.take().map(|x| Box::new(x) as _));
-        let err = drain(child.stderr.take().map(|x| Box::new(x) as _));
+        // Read into shared buffers, so what arrived is there even if a
+        // reader is abandoned.
+        let drain = |r: Option<Box<dyn std::io::Read + Send>>| {
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let b = buf.clone();
+            let t = std::thread::spawn(move || {
+                let Some(mut r) = r else { return };
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match r.read(&mut chunk) {
+                        Ok(0) => return,
+                        Ok(n) => b.lock().unwrap().extend_from_slice(&chunk[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => return,
+                    }
+                }
+            });
+            (t, buf)
+        };
+        let (out_t, out) = drain(child.stdout.take().map(|x| Box::new(x) as _));
+        let (err_t, err) = drain(child.stderr.take().map(|x| Box::new(x) as _));
+        let readers = [out_t, err_t];
+        let drained_by = |readers: &[JoinHandle<()>], until: Instant| loop {
+            if readers.iter().all(|t| t.is_finished()) {
+                return true;
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
         let deadline = Instant::now() + self.timeout;
         let status = loop {
             match child.try_wait() {
@@ -352,24 +442,36 @@ impl Program {
             }
         };
         let Some(status) = status else {
-            #[cfg(unix)]
-            let _ = Command::new("kill")
-                .args(["-KILL", &format!("-{}", child.id())])
-                .status();
+            kill_group();
             let _ = child.kill();
             let _ = child.wait();
-            let _ = (out.join(), err.join());
+            drained_by(&readers, Instant::now() + PIPE_GRACE);
             return Err(format!(
                 "{}: no answer in {} s; killed",
                 shown(),
                 self.timeout.as_secs()
             ));
         };
-        let so = out.join().unwrap_or_default();
-        let se = err.join().unwrap_or_default();
+        if !drained_by(&readers, deadline) {
+            kill_group();
+            let closed = drained_by(&readers, Instant::now() + PIPE_GRACE);
+            tracing::warn!(
+                call = %shown(),
+                %status,
+                closed,
+                "the publisher exited; its output was held open past the deadline; group killed"
+            );
+        }
+        // Finished readers are joined; one still blocked is left detached.
+        for t in readers {
+            if t.is_finished() {
+                let _ = t.join();
+            }
+        }
         if status.success() {
             return Ok(());
         }
+        let (se, so) = (err.lock().unwrap().clone(), out.lock().unwrap().clone());
         let (se, so) = (String::from_utf8_lossy(&se), String::from_utf8_lossy(&so));
         Err(format!(
             "{}: {}: {}{}",
@@ -716,13 +818,14 @@ fn cycle(
 
     // 4. Head files in the mirror.
     let t = Instant::now();
-    let head = head_files(args, work, state, &finality).map_err(at("head"))?;
+    let mut head = head_files(args, work, state, &finality).map_err(at("head"))?;
     line.insert("head_secs".into(), json!(secs(t.elapsed())));
     line.insert("updates_fetched".into(), json!(head.fetched));
 
     // 5. Verify as a client would. The head files fetched this cycle are
-    // kept (and a closed period's update marked final) only if it passes.
-    let v = match verify(args, work, &slice, &produced.manifest) {
+    // kept (and an update marked final) only if it passes, and only those
+    // it read.
+    let (v, read) = match verify(args, work, &slice, &produced.manifest) {
         Ok(v) => v,
         Err(e) => {
             head.discard(work, state);
@@ -732,7 +835,7 @@ fn cycle(
             });
         }
     };
-    head.commit(work, state).map_err(at("verify"))?;
+    head.commit(work, state, read).map_err(at("verify"))?;
     line.insert("verify".into(), v);
 
     // 6. Publish in order.
@@ -747,6 +850,7 @@ fn cycle(
         &slice_name,
         &head,
         args.publish_parallel,
+        pending_grace(Duration::from_secs(args.publish_timeout_secs)),
         &mut sent,
     );
     line.insert("publish_secs".into(), json!(secs(t.elapsed())));
@@ -763,23 +867,39 @@ struct HeadFiles {
     /// The update periods laid out: the checkpoint's through current.
     first: u64,
     current: u64,
-    /// The bootstrap was fetched this cycle.
-    fresh_bootstrap: bool,
+    /// The update periods verification read and checked, `b..s`; empty
+    /// until it passes. Only these are kept, marked final and published.
+    verified: std::ops::Range<u64>,
+    /// The mirror's bootstrap is not yet trusted: fetched this cycle, or
+    /// left by a cycle that never published it (one that failed, or
+    /// crashed between fetching and verifying). Removed on failure.
+    untrusted_bootstrap: bool,
     /// The mirror's `head/finality` before this cycle, restored on failure.
     old_finality: Option<Vec<u8>>,
 }
 
 impl HeadFiles {
-    /// Verification passed: a closed period's update fetched this cycle is
-    /// final from now on, and the current period's is not.
-    fn commit(&self, work: &Work, state: &mut State) -> Result<(), String> {
+    /// Verification passed, having read and checked the updates for
+    /// `verified` (`b..s`): one of those fetched this cycle is final from
+    /// now on (its period closed before `s` was signed). One fetched for
+    /// `s` or later was not read, so nothing vouches for it: it is removed
+    /// from the mirror, not marked final, and the next cycle fetches it
+    /// again, until a head signed after its period reads it.
+    fn commit(
+        &mut self,
+        work: &Work,
+        state: &mut State,
+        verified: std::ops::Range<u64>,
+    ) -> Result<(), String> {
         for &p in &self.fetched {
-            if p < self.current {
+            if verified.contains(&p) {
                 state.updates_final_local.insert(p);
             } else {
+                let _ = fs::remove_file(work.bucket.join(paths::update(p)));
                 state.updates_final_local.remove(&p);
             }
         }
+        self.verified = verified;
         state.save(&work.root)
     }
 
@@ -791,7 +911,7 @@ impl HeadFiles {
             let _ = fs::remove_file(work.bucket.join(paths::update(p)));
             state.updates_final_local.remove(&p);
         }
-        if self.fresh_bootstrap {
+        if self.untrusted_bootstrap {
             let _ = fs::remove_file(work.bucket.join(paths::bootstrap(&state.checkpoint)));
         }
         let fin = work.bucket.join(paths::FINALITY);
@@ -813,7 +933,8 @@ fn head_files(
         fetched: Vec::new(),
         first: 0,
         current: 0,
-        fresh_bootstrap: false,
+        verified: 0..0,
+        untrusted_bootstrap: false,
         old_finality: fs::read(work.bucket.join(paths::FINALITY)).ok(),
     };
     match lay_out_head(args, work, state, finality, &mut h) {
@@ -835,12 +956,17 @@ fn lay_out_head(
     let chain = Chain::mainnet();
     let beacon = Beacon::new(&args.beacon);
     let bpath = work.bucket.join(paths::bootstrap(&args.checkpoint));
+    // A bootstrap is published only after a cycle verified with it, so
+    // one in the mirror but not published is on probation like a fresh one.
     let boot = match fs::read(&bpath) {
-        Ok(b) => b,
+        Ok(b) => {
+            h.untrusted_bootstrap = !state.bootstrap_published;
+            b
+        }
         Err(_) => {
             let (b, _) = beacon.bootstrap(args.checkpoint)?;
             write_atomic(&bpath, &b)?;
-            h.fresh_bootstrap = true;
+            h.untrusted_bootstrap = true;
             b
         }
     };
@@ -890,17 +1016,29 @@ pub fn updates_to_fetch(
 }
 
 /// Step 5: the mirror verified as a client would see it once published.
+/// Also returns the update periods the head's verification read, `b..s`.
 fn verify(
     args: &Args,
     work: &Work,
     slice: &Slice,
     manifest: &csl_eth_store::Manifest,
-) -> Result<Value, String> {
+) -> Result<(Value, std::ops::Range<u64>), String> {
     let now = SystemTime::now();
+    let chain = Chain::mainnet();
     let head = csl_eth_head::verify(
         &DirSource(work.bucket.clone()),
-        &Chain::mainnet(),
+        &chain,
         args.checkpoint,
+        now,
+    )
+    .map_err(|e| e.to_string())?;
+    // The same files and clock give the same range the verifier walked.
+    let file = |k: &str| fs::read(work.bucket.join(k)).map_err(|e| format!("{k}: {e}"));
+    let read = csl_eth_head::update_periods(
+        &file(&paths::bootstrap(&args.checkpoint))?,
+        &file(paths::FINALITY)?,
+        args.checkpoint,
+        &chain,
         now,
     )
     .map_err(|e| e.to_string())?;
@@ -951,17 +1089,20 @@ fn verify(
             }
         }
     }
-    Ok(json!({
-        "ok": true,
-        "head_block": head.execution.block_number,
-        "period": head.period,
-        "participants": head.participants,
-        "updates_applied": head.updates_applied,
-        "finality_lag_secs": head.finality_lag_secs,
-        "accounts": accounts,
-        "slots": slots,
-        "codes": codes,
-    }))
+    Ok((
+        json!({
+            "ok": true,
+            "head_block": head.execution.block_number,
+            "period": head.period,
+            "participants": head.participants,
+            "updates_applied": head.updates_applied,
+            "finality_lag_secs": head.finality_lag_secs,
+            "accounts": accounts,
+            "slots": slots,
+            "codes": codes,
+        }),
+        read,
+    ))
 }
 
 /// Step 6. Each group goes up only after the one before it is all there,
@@ -976,6 +1117,7 @@ fn publish(
     slice_name: &str,
     head: &HeadFiles,
     parallel: usize,
+    pending_grace: u64,
     sent: &mut Sent,
 ) -> Result<(), String> {
     let hash = slice.head.block_hash;
@@ -1031,14 +1173,15 @@ fn publish(
         return Err(e);
     }
 
-    // Head: the bootstrap once, updates whose bytes changed.
+    // Head: the bootstrap once, then the updates verification read whose
+    // bytes changed (all closed and final; later ones are not published).
     if !state.bootstrap_published {
         let key = paths::bootstrap(&state.checkpoint);
         put_one(p, &key, &work.bucket.join(&key), sent)?;
         state.bootstrap_published = true;
         state.save(&work.root)?;
     }
-    for period in head.first..=head.current {
+    for period in head.verified.clone() {
         let key = paths::update(period);
         let file = work.bucket.join(&key);
         let Ok(bytes) = fs::read(&file) else {
@@ -1064,9 +1207,10 @@ fn publish(
 
     // `latest`, then the finality update that makes this snapshot the head.
     // The intent is journaled first: a write that fails (or times out) may
-    // still have landed, so until both are confirmed the bucket may name
-    // this snapshot, and collection must not delete it.
-    state.pending.insert(hash);
+    // have landed, or land later, so the bucket may name this snapshot,
+    // and collection must not delete it.
+    let started = now_secs();
+    state.pending.insert(hash, started);
     state.save(&work.root)?;
     put_one(p, LATEST_FILE, &work.bucket.join(LATEST_FILE), sent)?;
     state.latest = Some(hash);
@@ -1077,9 +1221,11 @@ fn publish(
         s.complete = true;
     }
     state.save(&work.root)?;
-    // Both pointers name this snapshot now; whatever earlier cycles left
-    // pending is named by neither.
-    state.pending.clear();
+    // Both pointers name this snapshot now, by writes that began at
+    // `started`. An earlier pending write is overridden only if it could
+    // no longer land after them; one that still could stays pending (this
+    // cycle's own, too, until a later cycle confirms past its grace).
+    release_pending(state, started, pending_grace);
     state.save(&work.root)
 }
 
@@ -1354,7 +1500,8 @@ mod tests {
             fetched: vec![],
             first: 1898,
             current: 1899,
-            fresh_bootstrap: false,
+            verified: 1898..1900,
+            untrusted_bootstrap: false,
             old_finality: None,
         };
         let rec = Rec(Default::default());
@@ -1368,6 +1515,7 @@ mod tests {
             "1",
             &head,
             1,
+            0,
             &mut sent,
         )
         .unwrap();
@@ -1414,6 +1562,7 @@ mod tests {
             "2",
             &head,
             1,
+            0,
             &mut sent,
         )
         .unwrap();
@@ -1468,8 +1617,61 @@ mod tests {
             vec![B256::with_last_byte(1), B256::with_last_byte(3)]
         );
         // A pointer write for 3 failed: it may be what the bucket names.
-        s.pending.insert(B256::with_last_byte(3));
+        s.pending.insert(B256::with_last_byte(3), 0);
         assert_eq!(gc_plan(&s, 0), vec![B256::with_last_byte(1)]);
+    }
+
+    #[test]
+    fn pending_is_released_only_past_its_grace() {
+        let (b, c, d) = (
+            B256::with_last_byte(2),
+            B256::with_last_byte(3),
+            B256::with_last_byte(4),
+        );
+        // B's finality write timed out at t=0 and may still be in flight.
+        let mut s = State {
+            pending: [(b, 0)].into(),
+            ..Default::default()
+        };
+        // C's pointers are confirmed by writes begun at t=600; B's request
+        // could land after them, so B stays, and so does C.
+        s.pending.insert(c, 600);
+        release_pending(&mut s, 600, 3600);
+        assert_eq!(s.pending.keys().collect::<Vec<_>>(), vec![&b, &c]);
+        // D's, begun at t=3700, are past B's grace and not C's.
+        s.pending.insert(d, 3700);
+        release_pending(&mut s, 3700, 3600);
+        assert_eq!(s.pending.keys().collect::<Vec<_>>(), vec![&c, &d]);
+        assert_eq!(pending_grace(Duration::from_secs(300)), 3600);
+        assert_eq!(pending_grace(Duration::from_secs(1800)), 7200);
+    }
+
+    #[test]
+    fn a_state_file_with_bare_pending_hashes_loads() {
+        let root = tmp("compat");
+        fs::create_dir_all(&root).unwrap();
+        let ck = B256::repeat_byte(9);
+        let h = B256::with_last_byte(2);
+        let mut v = serde_json::to_value(State {
+            checkpoint: ck,
+            ..Default::default()
+        })
+        .unwrap();
+        // As written before the times were kept, and before `pending`.
+        v["pending"] = json!([h]);
+        fs::write(root.join("state.json"), v.to_string()).unwrap();
+        let before = now_secs();
+        let s = State::load(&root, ck).unwrap();
+        assert!(s.pending[&h] >= before && s.pending[&h] <= now_secs());
+        v.as_object_mut().unwrap().remove("pending");
+        fs::write(root.join("state.json"), v.to_string()).unwrap();
+        assert!(State::load(&root, ck).unwrap().pending.is_empty());
+        // And the new form round-trips.
+        let mut s = s;
+        s.pending.insert(h, 7);
+        s.save(&root).unwrap();
+        assert_eq!(State::load(&root, ck).unwrap().pending[&h], 7);
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Fails `put` for one key.
@@ -1500,7 +1702,8 @@ mod tests {
             fetched: vec![],
             first: 1898,
             current: 1898,
-            fresh_bootstrap: false,
+            verified: 1898..1899,
+            untrusted_bootstrap: false,
             old_finality: None,
         };
         let mut sent = Sent { files: 0, bytes: 0 };
@@ -1515,6 +1718,7 @@ mod tests {
             "1",
             &head,
             1,
+            0,
             &mut sent,
         )
         .unwrap();
@@ -1530,11 +1734,12 @@ mod tests {
             "2",
             &head,
             1,
+            0,
             &mut sent
         )
         .is_err());
         let h2 = B256::with_last_byte(2);
-        assert!(s.pending.contains(&h2));
+        assert!(s.pending.contains_key(&h2));
         // Cycle 3 fails at `latest`: 2 and 3 both pending, across a restart.
         lay_out(&w, 3, &[], &[(1898, b"u")]);
         let fail = FailOn(LATEST_FILE, Rec(Default::default()));
@@ -1547,12 +1752,13 @@ mod tests {
             "3",
             &head,
             1,
+            0,
             &mut sent
         )
         .is_err());
         let mut s = State::load(&root, B256::repeat_byte(9)).unwrap();
         let h3 = B256::with_last_byte(3);
-        assert!(s.pending.contains(&h2) && s.pending.contains(&h3));
+        assert!(s.pending.contains_key(&h2) && s.pending.contains_key(&h3));
         // Collection with keep 0 deletes nothing a pointer may name.
         let c = collect(&w, &mut s, &Rec(Default::default()), 0);
         assert!(c.deleted.is_empty(), "{:?}", c.deleted);
@@ -1567,6 +1773,7 @@ mod tests {
             "4",
             &head,
             1,
+            0,
             &mut sent,
         )
         .unwrap();
@@ -1600,7 +1807,8 @@ mod tests {
             fetched: vec![1899, 1900],
             first: 1898,
             current: 1900,
-            fresh_bootstrap: true,
+            verified: 0..0,
+            untrusted_bootstrap: true,
             old_finality: Some(b"old".to_vec()),
         };
         head.discard(&w, &mut s);
@@ -1612,11 +1820,70 @@ mod tests {
         // The next cycle fetches them again; 1899 was never marked final.
         let have = |p: u64| w.bucket.join(paths::update(p)).exists();
         assert_eq!(updates_to_fetch(&s, 1898, 1900, have), vec![1899, 1900]);
-        // A passing cycle marks the closed one final, not the current one.
-        let mut s2 = s.clone();
-        head.commit(&w, &mut s2).unwrap();
-        assert!(s2.updates_final_local.contains(&1899));
-        assert!(!s2.updates_final_local.contains(&1900));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_updates_the_head_read_are_kept_and_final() {
+        let root = tmp("commit");
+        let w = Work::new(&root).unwrap();
+        let s = State {
+            checkpoint: B256::repeat_byte(9),
+            updates_final_local: [1898].into(),
+            ..Default::default()
+        };
+        let fetched = |w: &Work| {
+            touch(&w.bucket, &paths::update(1898), b"u1898 kept");
+            touch(&w.bucket, &paths::update(1899), b"u1899 fetched");
+            touch(&w.bucket, &paths::update(1900), b"u1900 fetched");
+            HeadFiles {
+                fetched: vec![1899, 1900],
+                first: 1898,
+                current: 1900,
+                verified: 0..0,
+                untrusted_bootstrap: false,
+                old_finality: None,
+            }
+        };
+        let have = |p: u64| w.bucket.join(paths::update(p)).exists();
+        // Signed in 1900: verification read 1898 and 1899. 1899 is final;
+        // 1900 was not read, so it is dropped and fetched again.
+        let (mut s1, mut head) = (s.clone(), fetched(&w));
+        head.commit(&w, &mut s1, 1898..1900).unwrap();
+        assert_eq!(head.verified, 1898..1900);
+        assert_eq!(s1.updates_final_local, [1898, 1899].into());
+        assert!(!have(1900));
+        assert_eq!(updates_to_fetch(&s1, 1898, 1900, have), vec![1900]);
+        // The rollover: signed in 1899, prepared once 1900 began. 1899 is
+        // closed and was fetched, but verification never read it: not
+        // final, not kept, and fetched again until a head signed in 1900
+        // reads it.
+        let (mut s2, mut head) = (s.clone(), fetched(&w));
+        head.commit(&w, &mut s2, 1898..1899).unwrap();
+        assert_eq!(s2.updates_final_local, [1898].into());
+        assert!(have(1898) && !have(1899) && !have(1900));
+        assert_eq!(updates_to_fetch(&s2, 1898, 1900, have), vec![1899, 1900]);
+        // Nor is it published.
+        lay_out(&w, 1, &[], &[]);
+        touch(&w.bucket, &paths::bootstrap(&s2.checkpoint), b"boot");
+        let rec = Rec(Default::default());
+        let mut sent = Sent { files: 0, bytes: 0 };
+        publish(
+            &w,
+            &mut s2,
+            &rec,
+            &fake_slice(1),
+            100,
+            "1",
+            &head,
+            1,
+            0,
+            &mut sent,
+        )
+        .unwrap();
+        let calls = rec.0.lock().unwrap().clone();
+        assert!(calls.contains(&"put head/updates/1898".to_string()));
+        assert!(!calls.iter().any(|c| c.contains("head/updates/1899")));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1654,6 +1921,54 @@ mod tests {
         };
         let e = p.delete("k").unwrap_err();
         assert!(e.contains("nope"), "{e}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_publisher_that_leaves_its_output_open_is_bounded() {
+        let root = tmp("straggler");
+        fs::create_dir_all(&root).unwrap();
+        let pid = root.join("pid");
+        // Exits at once, successfully, but its child holds stdout and
+        // stderr for a day: the readers never see EOF on their own.
+        let script = root.join("straggler.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 86400 &\necho $! > {}\nexit 0\n",
+                pid.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let p = Program {
+            program: script.to_string_lossy().into(),
+            timeout: Duration::from_secs(1),
+        };
+        let t = Instant::now();
+        p.put("k", &script).unwrap();
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+        // The straggler was killed with the group.
+        let pid = fs::read_to_string(&pid).unwrap().trim().to_string();
+        let gone = (0..100).any(|_| {
+            let alive = Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if alive {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            !alive
+        });
+        assert!(gone, "sleep {pid} still running");
+        // The same shape exiting nonzero is a failure, also bounded.
+        fs::write(&script, "#!/bin/sh\nsleep 86400 &\necho nope >&2\nexit 4\n").unwrap();
+        let t = Instant::now();
+        let e = p.delete("k").unwrap_err();
+        assert!(e.contains("nope"), "{e}");
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
         let _ = fs::remove_dir_all(&root);
     }
 
