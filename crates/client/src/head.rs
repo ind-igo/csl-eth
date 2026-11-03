@@ -310,26 +310,41 @@ impl<D: Driver> HeadOpener<D> {
         if self.inner.is_none() {
             let candidates = self.candidates.clone().expect("set above");
             // Every candidate's manifest in one round, so falling back
-            // costs no round of its own.
+            // costs no round of its own. A candidate is chosen only if its
+            // manifest passes every check the open makes before reading a
+            // table (its block, its format, the head's state root), so an
+            // attested snapshot that is there but unusable falls back to
+            // the finalized one too.
             let present: Vec<_> = candidates
                 .iter()
                 .map(|h| self.store.file(&manifest_path(&h.execution.block_hash)))
                 .collect();
             let mut chosen = None;
-            let mut read_error = None;
+            let mut error = None;
             for (h, p) in candidates.iter().zip(present) {
                 match p? {
-                    Ok(Some(_)) => {
-                        chosen.get_or_insert(h.clone());
+                    Ok(Some(m)) => {
+                        let ex = &h.execution;
+                        match crate::check_manifest(&m, ex.block_hash, ex.state_root) {
+                            Ok(_) => {
+                                chosen.get_or_insert(h.clone());
+                            }
+                            Err(e) => {
+                                error.get_or_insert(format!(
+                                    "{} head's snapshot: {e}",
+                                    h.tier.name()
+                                ));
+                            }
+                        }
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        read_error.get_or_insert(e);
+                        error.get_or_insert(e);
                     }
                 }
             }
             let Some(head) = chosen else {
-                if let Some(e) = read_error {
+                if let Some(e) = error {
                     return Ok(Err(HeadOpenError::Open(e)));
                 }
                 // Name the last-resort head: finalized under `Best`.

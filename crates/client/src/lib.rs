@@ -346,6 +346,34 @@ pub enum At {
 
 /// A snapshot being opened: the manifest, then every table's model, each
 /// a round.
+/// A manifest's bytes as the snapshot of block `hash` with `state_root`,
+/// in the format this client reads: every check the opener makes before
+/// it reads a table, so a caller choosing between snapshots can make them
+/// on manifests it already holds.
+pub(crate) fn check_manifest(
+    bytes: &[u8],
+    hash: B256,
+    state_root: B256,
+) -> Result<Manifest, String> {
+    let manifest = Manifest::from_json(bytes).map_err(|e| e.to_string())?;
+    if manifest.block_hash != hash {
+        return Err("manifest names a different block".into());
+    }
+    if manifest.format_version != FORMAT_VERSION {
+        return Err(format!(
+            "manifest format version {}, this client reads {FORMAT_VERSION}",
+            manifest.format_version
+        ));
+    }
+    if manifest.state_root != state_root {
+        return Err(format!(
+            "snapshot claims state_root {}, caller verified {state_root}",
+            manifest.state_root
+        ));
+    }
+    Ok(manifest)
+}
+
 pub struct Opener<D> {
     driver: Option<D>,
     store: Arc<Store>,
@@ -400,28 +428,13 @@ impl<D: Driver> Opener<D> {
             },
         };
         let manifest = match self.store.file(&manifest_path(&hash))? {
-            Ok(Some(m)) => match Manifest::from_json(&m) {
+            Ok(Some(m)) => match check_manifest(&m, hash, self.state_root) {
                 Ok(m) => m,
-                Err(e) => return Ok(Err(e.to_string())),
+                Err(e) => return Ok(Err(e)),
             },
             Ok(None) => return Ok(Err(format!("no snapshot at {hash}"))),
             Err(e) => return Ok(Err(e)),
         };
-        if manifest.block_hash != hash {
-            return Ok(Err("manifest names a different block".into()));
-        }
-        if manifest.format_version != FORMAT_VERSION {
-            return Ok(Err(format!(
-                "manifest format version {}, this client reads {FORMAT_VERSION}",
-                manifest.format_version
-            )));
-        }
-        if manifest.state_root != self.state_root {
-            return Ok(Err(format!(
-                "snapshot claims state_root {}, caller verified {}",
-                manifest.state_root, self.state_root
-            )));
-        }
         // Every table's page 0 (the top model and the model tree's root) in
         // one round: each is a range the store may lack, and a reader's
         // `prepare` is the read that wants it. A table that fails here (a

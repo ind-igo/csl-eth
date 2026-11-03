@@ -405,13 +405,17 @@ fn fixture_attested() -> Fixture {
     fx
 }
 
-fn hash_of(fx: &Fixture, rel: &str, header: &str) -> B256 {
+fn execution_of(fx: &Fixture, rel: &str, header: &str, field: &str) -> B256 {
     let v: serde_json::Value = serde_json::from_slice(&fx.files.files[rel]).unwrap();
-    v["data"][header]["execution"]["block_hash"]
+    v["data"][header]["execution"][field]
         .as_str()
         .unwrap()
         .parse()
         .unwrap()
+}
+
+fn hash_of(fx: &Fixture, rel: &str, header: &str) -> B256 {
+    execution_of(fx, rel, header, "block_hash")
 }
 
 fn attested_hash(fx: &Fixture) -> B256 {
@@ -422,13 +426,34 @@ fn finalized_hash(fx: &Fixture) -> B256 {
     hash_of(fx, paths::FINALITY, "finalized_header")
 }
 
-/// A manifest file at `hash`: enough for the opener to choose that head;
-/// the open itself then fails on the bytes, which is past what these
-/// tests are about.
+/// A manifest for the snapshot at `hash` with `state_root`, in this
+/// client's format and with no tables: the open passes every check on it
+/// and has nothing more to read.
+fn manifest(hash: B256, state_root: B256) -> csl_eth_store::Manifest {
+    csl_eth_store::Manifest {
+        format_version: csl_eth_store::FORMAT_VERSION,
+        profile_id: [0; 32],
+        block_hash: hash,
+        block_number: 0,
+        timestamp: 0,
+        state_root,
+        prefix: String::new(),
+        tables: vec![],
+    }
+}
+
+/// A manifest at `hash`, one of the fixture's two heads' blocks, with that
+/// head's state root: the snapshot opens.
 fn snapshot_at(fx: &mut Fixture, hash: B256) {
-    fx.files
-        .files
-        .insert(manifest_path(&hash), b"not a manifest".to_vec());
+    let root = if hash == attested_hash(fx) {
+        execution_of(fx, paths::OPTIMISTIC, "attested_header", "state_root")
+    } else {
+        execution_of(fx, paths::FINALITY, "finalized_header", "state_root")
+    };
+    fx.files.files.insert(
+        manifest_path(&hash),
+        manifest(hash, root).to_json().into_bytes(),
+    );
 }
 
 /// What an opener ended with: the head it chose, the FCR note it kept and
@@ -463,7 +488,7 @@ fn the_attested_head_is_preferred_when_its_snapshot_is_there() {
     snapshot_at(&mut fx, f);
     let (head, _, r) = open_with(&fx, TierChoice::Best);
     assert_eq!(head, Some((Tier::Attested, ATTESTED_BLOCK)));
-    assert!(matches!(r, Err(HeadOpenError::Open(_))), "{r:?}");
+    assert!(r.is_ok(), "{r:?}");
     let rounds = fx.files.rounds();
     assert_eq!(rounds[0], best_round(&fx));
     // One round of updates for both heads: they share 1898..=1900.
@@ -527,13 +552,65 @@ fn the_finalized_head_is_the_fallback() {
         tamper(&mut fx);
         let (head, fcr, r) = open_with(&fx, TierChoice::Best);
         assert_eq!(head, Some((Tier::Finalized, FINALIZED_BLOCK)), "{name}");
-        assert!(matches!(r, Err(HeadOpenError::Open(_))), "{name}: {r:?}");
+        assert!(r.is_ok(), "{name}: {r:?}");
         assert_eq!(fcr, None, "{name}");
         assert!(
             fx.files.rounds().len() <= 4,
             "{name}: {:?}",
             fx.files.rounds()
         );
+    }
+}
+
+#[test]
+fn an_unusable_attested_snapshot_falls_back_to_the_finalized_one() {
+    let fx0 = fixture_attested();
+    let (a, f) = (attested_hash(&fx0), finalized_hash(&fx0));
+    let root = execution_of(&fx0, paths::OPTIMISTIC, "attested_header", "state_root");
+    let bad: Vec<(&str, Vec<u8>)> = vec![
+        ("malformed", b"not a manifest".to_vec()),
+        (
+            "another state root",
+            manifest(a, B256::repeat_byte(0x42)).to_json().into_bytes(),
+        ),
+        (
+            "another block",
+            manifest(B256::repeat_byte(0x43), root)
+                .to_json()
+                .into_bytes(),
+        ),
+        (
+            "another format",
+            csl_eth_store::Manifest {
+                format_version: csl_eth_store::FORMAT_VERSION + 1,
+                ..manifest(a, root)
+            }
+            .to_json()
+            .into_bytes(),
+        ),
+    ];
+    for (name, bytes) in bad {
+        // The attested head itself is genuine and verifies; only its
+        // snapshot is unusable.
+        let mut fx = fixture_attested();
+        snapshot_at(&mut fx, f);
+        fx.files.files.insert(manifest_path(&a), bytes);
+        let (head, fcr, r) = open_with(&fx, TierChoice::Best);
+        assert_eq!(head, Some((Tier::Finalized, FINALIZED_BLOCK)), "{name}");
+        assert!(r.is_ok(), "{name}: {r:?}");
+        assert_eq!(fcr, None, "{name}");
+        // In the rounds an open of the attested one takes: both manifests
+        // were in the third.
+        let rounds = fx.files.rounds();
+        assert_eq!(rounds.len(), 3, "{name}: {rounds:?}");
+        assert_eq!(rounds[2], set(&[manifest_path(&a), manifest_path(&f)]));
+        // Forced to the attested tier, it is refused, saying why.
+        let (head, _, r) = open_with(&fx, TierChoice::Attested);
+        assert_eq!(head, Some((Tier::Attested, ATTESTED_BLOCK)), "{name}");
+        let Err(HeadOpenError::Open(e)) = r else {
+            panic!("{name}: {r:?}");
+        };
+        assert!(e.starts_with("attested head's snapshot: "), "{name}: {e}");
     }
 }
 
