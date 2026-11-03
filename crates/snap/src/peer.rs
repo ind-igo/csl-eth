@@ -1,4 +1,6 @@
 //! One RLPx connection to a mainnet peer speaking `eth` and `snap`.
+//! (Sepolia and Hoodi too, for probes: [`Net`]. There `eth/71` is offered
+//! as well, for its block access lists, and `snap` may be absent.)
 //!
 //! ECIES on a fresh node key, the `p2p` hello, the `eth` status exchange
 //! (reth's handshake, with mainnet's fork id computed from
@@ -15,24 +17,25 @@
 //! back.
 
 use alloy_consensus::Header;
-use alloy_primitives::B256;
+use alloy_primitives::{Bytes, B256};
 use futures::{SinkExt, StreamExt};
-use reth_chainspec::MAINNET;
+use reth_chainspec::{ChainSpec, HOODI, MAINNET, SEPOLIA};
 use reth_ecies::{stream::ECIESStream, ECIESError};
 use reth_eth_wire::{
     errors::{EthStreamError, P2PStreamError},
     handshake::{EthHandshake, EthRlpxHandshake},
     protocol::Protocol,
-    BlockBodies, BlockHeaders, Capability, DisconnectReason, EthMessage, EthNetworkPrimitives, EthVersion, GetBlockHeaders, HeadersDirection,
-    HelloMessageWithProtocols, P2PStream, PooledTransactions, ProtocolMessage, Receipts, UnauthedP2PStream, UnifiedStatus,
+    BlockAccessLists, BlockBodies, BlockHeaders, Capability, DisconnectReason, EthMessage, EthNetworkPrimitives, EthVersion, GetBlockAccessLists,
+    GetBlockHeaders, HeadersDirection, HelloMessageWithProtocols, P2PStream, PooledTransactions, ProtocolMessage, Receipts, UnauthedP2PStream,
+    UnifiedStatus,
 };
 use reth_eth_wire_types::message::RequestPair;
 use reth_eth_wire_types::snap::{
-    AccountRangeMessage, BlockAccessListsMessage, ByteCodesMessage, GetAccountRangeMessage, GetByteCodesMessage, GetStorageRangesMessage, RangeBound,
-    SnapMessageId, SnapProtocolMessage, StorageRangesMessage,
+    AccountRangeMessage, BlockAccessListsMessage, ByteCodesMessage, GetAccountRangeMessage, GetBlockAccessListsMessage, GetByteCodesMessage,
+    GetStorageRangesMessage, RangeBound, SnapMessageId, SnapProtocolMessage, StorageRangesMessage,
 };
 use reth_ethereum_forks::{ForkFilter, Head};
-use reth_network_peers::{pk2id, NodeRecord, PeerId};
+use reth_network_peers::{hoodi_nodes, mainnet_nodes, pk2id, sepolia_nodes, NodeRecord, PeerId};
 use secp256k1::{SecretKey, SECP256K1};
 use std::{
     net::SocketAddr,
@@ -68,16 +71,92 @@ pub enum PeerError {
     Protocol(&'static str),
 }
 
+/// The chain a connection is on. The fetcher and the producer are mainnet
+/// only; Sepolia and Hoodi are for probing what testnet peers serve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Net {
+    Mainnet,
+    Sepolia,
+    Hoodi,
+}
+
+impl Net {
+    pub fn parse(s: &str) -> Result<Net, String> {
+        match s {
+            "mainnet" => Ok(Net::Mainnet),
+            "sepolia" => Ok(Net::Sepolia),
+            "hoodi" => Ok(Net::Hoodi),
+            _ => Err(format!("unknown chain {s}: mainnet, sepolia or hoodi")),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Net::Mainnet => "mainnet",
+            Net::Sepolia => "sepolia",
+            Net::Hoodi => "hoodi",
+        }
+    }
+
+    pub fn spec(self) -> &'static ChainSpec {
+        match self {
+            Net::Mainnet => &MAINNET,
+            Net::Sepolia => &SEPOLIA,
+            Net::Hoodi => &HOODI,
+        }
+    }
+
+    /// A height above every block-number fork of the chain, so the fork id
+    /// depends only on the clock (mainnet's is [`FORK_HEAD_NUMBER`]).
+    pub fn fork_head_number(self) -> u64 {
+        match self {
+            Net::Mainnet => FORK_HEAD_NUMBER,
+            Net::Sepolia => 12_000_000,
+            Net::Hoodi => 2_000_000,
+        }
+    }
+
+    pub fn bootnodes(self) -> Vec<NodeRecord> {
+        match self {
+            Net::Mainnet => mainnet_nodes(),
+            Net::Sepolia => sepolia_nodes(),
+            Net::Hoodi => hoodi_nodes(),
+        }
+    }
+
+    /// The chain's EIP-1459 tree: the Ethereum Foundation's signing key
+    /// (geth's) at `all.<chain>.ethdisco.net`.
+    pub fn dns_tree(self) -> &'static str {
+        match self {
+            Net::Mainnet => crate::discovery::MAINNET_DNS_TREE,
+            Net::Sepolia => "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.sepolia.ethdisco.net",
+            Net::Hoodi => "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.hoodi.ethdisco.net",
+        }
+    }
+
+    /// `eth/71` (EIP-8159, block access lists) is offered off mainnet only,
+    /// so what a mainnet fetch negotiates does not change.
+    pub fn offers_eth71(self) -> bool {
+        self != Net::Mainnet
+    }
+}
+
 /// The status and fork filter to present: mainnet, the fork id for the
 /// current time, no history. `blockhash` is informational; peers do not
 /// validate it, and a client that has verified a head passes that.
 pub fn mainnet_status(blockhash: Option<B256>) -> (UnifiedStatus, ForkFilter) {
+    status_on(Net::Mainnet, blockhash)
+}
+
+/// [`mainnet_status`] for any [`Net`].
+pub fn status_on(net: Net, blockhash: Option<B256>) -> (UnifiedStatus, ForkFilter) {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let head = Head { number: FORK_HEAD_NUMBER, timestamp: now, ..Default::default() };
-    let spec = &**MAINNET;
+    let number = net.fork_head_number();
+    let head = Head { number, timestamp: now, ..Default::default() };
+    let spec = net.spec();
     let mut status = UnifiedStatus::spec_builder(spec, &head);
     status.blockhash = blockhash.unwrap_or_else(|| spec.genesis_hash());
-    status.set_history_range(FORK_HEAD_NUMBER, FORK_HEAD_NUMBER);
+    status.set_history_range(number, number);
     (status, spec.fork_filter(head))
 }
 
@@ -122,24 +201,39 @@ impl Peer {
         fork_filter: ForkFilter,
         timeout_each: Duration,
     ) -> Result<Peer, PeerError> {
+        Peer::connect_on(Net::Mainnet, record, key, status, fork_filter, timeout_each, true).await
+    }
+
+    /// [`Peer::connect`] on `net`, and without `snap` if `require_snap` is
+    /// false (then `snap_version` is 0 and every frame is `eth`'s).
+    pub async fn connect_on(
+        net: Net,
+        record: NodeRecord,
+        key: &SecretKey,
+        status: UnifiedStatus,
+        fork_filter: ForkFilter,
+        timeout_each: Duration,
+        require_snap: bool,
+    ) -> Result<Peer, PeerError> {
         let addr = SocketAddr::new(record.address, record.tcp_port);
         let tcp = timeout(timeout_each, TcpStream::connect(addr)).await.map_err(|_| PeerError::Timeout)??;
         tcp.set_nodelay(true)?;
         let ecies = ECIESStream::connect_with_timeout(tcp, *key, record.id, timeout_each).await?;
         let our_id = pk2id(&key.public_key(SECP256K1));
-        let hello = HelloMessageWithProtocols::builder(our_id)
-            .protocol(Protocol::eth_68())
-            .protocol(Protocol::eth(EthVersion::Eth69))
-            .protocol(Protocol::new(Capability::new_static("snap", 1), 8))
-            .protocol(Protocol::snap_2())
-            .client_version(CLIENT_VERSION)
-            .build();
+        let mut hello = HelloMessageWithProtocols::builder(our_id).protocol(Protocol::eth_68()).protocol(Protocol::eth(EthVersion::Eth69));
+        if net.offers_eth71() {
+            hello = hello.protocol(Protocol::eth(EthVersion::Eth71));
+        }
+        let hello = hello.protocol(Protocol::new(Capability::new_static("snap", 1), 8)).protocol(Protocol::snap_2()).client_version(CLIENT_VERSION).build();
         let (mut conn, their_hello) = timeout(timeout_each, UnauthedP2PStream::new(ecies).handshake(hello)).await.map_err(|_| PeerError::Timeout)??;
         let (eth_version, snap_offset, snap_version) = {
             let caps = conn.shared_capabilities();
             let eth_version = caps.eth_version()?;
-            let snap = caps.find(&Capability::snap_2()).or_else(|| caps.find(&Capability::new_static("snap", 1))).ok_or(PeerError::NoSnap)?;
-            (eth_version, snap.relative_message_id_offset(), snap.version())
+            match caps.find(&Capability::snap_2()).or_else(|| caps.find(&Capability::new_static("snap", 1))) {
+                Some(snap) => (eth_version, snap.relative_message_id_offset(), snap.version()),
+                None if !require_snap => (eth_version, u8::MAX, 0),
+                None => return Err(PeerError::NoSnap),
+            }
         };
         let mut status = status;
         status.version = eth_version;
@@ -279,6 +373,68 @@ impl Peer {
         }
     }
 
+    /// Up to `limit` headers from `hash` toward genesis, each checked to be
+    /// the parent of the one before (the first to hash to `hash`).
+    pub async fn headers_back(&mut self, hash: B256, limit: u64) -> Result<Vec<Header>, PeerError> {
+        let request_id = self.request_id();
+        let msg = EthMessage::<EthNetworkPrimitives>::GetBlockHeaders(RequestPair {
+            request_id,
+            message: GetBlockHeaders { start_block: hash.into(), limit, skip: 0, direction: HeadersDirection::Falling },
+        });
+        self.send_eth(msg).await?;
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            match self.next_before(deadline).await? {
+                Inbound::Eth(EthMessage::BlockHeaders(rp)) if rp.request_id == request_id => {
+                    let mut want = hash;
+                    for h in &rp.message.0 {
+                        if h.hash_slow() != want {
+                            return Err(PeerError::Protocol("headers do not chain back from the requested hash"));
+                        }
+                        want = h.parent_hash;
+                    }
+                    return Ok(rp.message.0);
+                }
+                Inbound::Eth(m) => self.service_eth(m).await?,
+                Inbound::Snap(m) => self.service_snap(m).await?,
+                Inbound::Ignored => {}
+            }
+        }
+    }
+
+    /// `eth/71` `GetBlockAccessLists`: one entry per hash, `None` where the
+    /// peer has none. The raw RLP of each list, unchecked.
+    pub async fn block_access_lists(&mut self, hashes: Vec<B256>) -> Result<Vec<Option<Bytes>>, PeerError> {
+        if self.eth_version < EthVersion::Eth71 {
+            return Err(PeerError::Protocol("block access lists need eth/71"));
+        }
+        let request_id = self.request_id();
+        let msg = EthMessage::<EthNetworkPrimitives>::GetBlockAccessLists(RequestPair { request_id, message: GetBlockAccessLists(hashes) });
+        self.send_eth(msg).await?;
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            match self.next_before(deadline).await? {
+                Inbound::Eth(EthMessage::BlockAccessLists(rp)) if rp.request_id == request_id => return Ok(rp.message.0),
+                Inbound::Eth(m) => self.service_eth(m).await?,
+                Inbound::Snap(m) => self.service_snap(m).await?,
+                Inbound::Ignored => {}
+            }
+        }
+    }
+
+    /// `snap/2` `GetBlockAccessLists` (EIP-8189), as [`Peer::block_access_lists`].
+    pub async fn snap_block_access_lists(&mut self, hashes: Vec<B256>, response_bytes: u64) -> Result<Vec<Option<Bytes>>, PeerError> {
+        if self.snap_version < 2 {
+            return Err(PeerError::Protocol("block access lists over snap need snap/2"));
+        }
+        let request_id = self.request_id();
+        let req = SnapProtocolMessage::GetBlockAccessLists(GetBlockAccessListsMessage { request_id, block_hashes: hashes, response_bytes });
+        match self.snap_request(req, SnapMessageId::BlockAccessLists, request_id).await? {
+            SnapProtocolMessage::BlockAccessLists(m) => Ok(m.block_access_lists.0),
+            _ => Err(PeerError::Protocol("wrong snap response")),
+        }
+    }
+
     /// The peer's own head header, from the hash in its status.
     pub async fn own_head(&mut self) -> Result<Option<Header>, PeerError> {
         let hash = self.status.blockhash;
@@ -366,6 +522,10 @@ impl Peer {
                 Some(EthMessage::PooledTransactions(RequestPair { request_id: rp.request_id, message: PooledTransactions(vec![]) }))
             }
             EthMessage::GetReceipts(rp) => Some(EthMessage::Receipts(RequestPair { request_id: rp.request_id, message: Receipts(vec![]) })),
+            EthMessage::GetBlockAccessLists(rp) => {
+                let none = vec![None; rp.message.0.len()];
+                Some(EthMessage::BlockAccessLists(RequestPair { request_id: rp.request_id, message: BlockAccessLists(none) }))
+            }
             _ => None,
         };
         if let Some(r) = reply {

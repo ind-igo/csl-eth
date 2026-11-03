@@ -4,7 +4,7 @@
 use alloy_primitives::{B256, U256};
 use clap::{Parser, Subcommand};
 use csl_eth_client::{open_at_head, DirDriver, Hint, Read, Reason, Snapshot, VerifiedHead};
-use csl_eth_snap::{fetch, probe, FetchConfig, Slice};
+use csl_eth_snap::{bal, fetch, peer::Net, probe, FetchConfig, Slice};
 use csl_eth_store::{produce_with, ProduceOptions};
 use csl_eth_trie::{Account, Nibbles};
 use csl_eth_trie::KECCAK_EMPTY;
@@ -144,6 +144,24 @@ enum Cmd {
         timeout_secs: u64,
         #[arg(long, default_value_t = 30399)]
         udp_port: u16,
+    },
+    /// Ask testnet peers for EIP-7928 block access lists (eth/71, snap/2)
+    /// and verify each against its header. One JSON line per peer, then a
+    /// summary.
+    BalProbe {
+        /// sepolia or hoodi.
+        #[arg(long)]
+        chain: String,
+        /// Stop after this many connected peers.
+        #[arg(long, default_value_t = 30)]
+        peers: usize,
+        /// Or after this many seconds.
+        #[arg(long, default_value_t = 180)]
+        secs: u64,
+        #[arg(long, default_value_t = 30411)]
+        udp_port: u16,
+        #[arg(long, default_value_t = 10)]
+        timeout_secs: u64,
     },
 }
 
@@ -448,6 +466,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             println!("{} peers", rows.len());
+        }
+        Cmd::BalProbe {
+            chain,
+            peers,
+            secs,
+            udp_port,
+            timeout_secs,
+        } => {
+            let net = Net::parse(&chain)?;
+            let cfg = bal::ProbeConfig {
+                net,
+                peers,
+                secs,
+                udp_port,
+                timeout: Duration::from_secs(timeout_secs),
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let printer = tokio::spawn(async move {
+                while let Some(r) = rx.recv().await {
+                    println!("{r}");
+                }
+            });
+            let probed = bal::probe(&cfg, tx).await;
+            printer.await?;
+            let mut summary = bal::summarize(&probed.reports);
+            summary["chain"] = serde_json::json!(net.name());
+            summary["dial_errors"] = serde_json::json!(probed.dial_errors);
+            println!("{}", serde_json::to_string_pretty(&summary)?);
         }
     }
     Ok(())

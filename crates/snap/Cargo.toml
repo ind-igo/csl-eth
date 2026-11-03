@@ -19,6 +19,7 @@ alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-rlp.workspace = true
 alloy-trie.workspace = true
 alloy-consensus = { version = "2.5", default-features = false, features = ["std"] }
+alloy-eip7928 = { version = "0.4", features = ["rlp"] }
 
 # reth's wire crates, pinned to a release tag (the plan: libraries, not clients).
 reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", tag = "v2.9.0" }

@@ -1,12 +1,14 @@
 //! Peer candidates: EIP-1459 DNS trees first (a signed list, no UDP
 //! needed), discv4 from the hardcoded bootnodes beside it. Records are
 //! deduplicated by node id and, where the record carries a fork id, dropped
-//! if it is incompatible with mainnet now.
+//! if it is incompatible with mainnet now. [`start_on`] does the same for
+//! another [`Net`].
 
 use reth_discv4::{DiscoveryUpdate, Discv4, Discv4Config};
 use reth_dns_discovery::{DnsDiscoveryConfig, DnsDiscoveryService, DnsResolver};
 use reth_ethereum_forks::ForkFilter;
-use reth_network_peers::{mainnet_nodes, NodeRecord, PeerId};
+use crate::peer::Net;
+use reth_network_peers::{NodeRecord, PeerId};
 use secp256k1::SecretKey;
 use std::{
     collections::HashSet,
@@ -23,6 +25,12 @@ pub const MAINNET_DNS_TREE: &str = "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPO
 /// Start the sources and return the stream of candidates. Each source
 /// that fails to start is logged and skipped; with none the receiver ends.
 pub async fn start(key: SecretKey, udp_port: u16, fork_filter: ForkFilter, use_dns: bool, use_discv4: bool) -> mpsc::Receiver<NodeRecord> {
+    start_on(Net::Mainnet, key, udp_port, fork_filter, use_dns, use_discv4).await
+}
+
+/// [`start`] on `net`: its DNS tree and bootnodes.
+pub async fn start_on(net: Net, key: SecretKey, udp_port: u16, fork_filter: ForkFilter, use_dns: bool, use_discv4: bool) -> mpsc::Receiver<NodeRecord> {
+    let tree = net.dns_tree();
     let (tx, rx) = mpsc::channel::<NodeRecord>(4096);
     // By node id and by socket address: crawlers answer from one address
     // under fresh keys, and one address is one node.
@@ -33,7 +41,7 @@ pub async fn start(key: SecretKey, udp_port: u16, fork_filter: ForkFilter, use_d
             Ok(resolver) => {
                 let (mut service, handle) = DnsDiscoveryService::new_pair(Arc::new(resolver), DnsDiscoveryConfig::default());
                 let mut updates = service.node_record_stream();
-                if let Err(e) = handle.sync_tree(MAINNET_DNS_TREE) {
+                if let Err(e) = handle.sync_tree(tree) {
                     warn!(error = %e, "dns tree link rejected");
                 } else {
                     service.spawn();
@@ -69,7 +77,7 @@ pub async fn start(key: SecretKey, udp_port: u16, fork_filter: ForkFilter, use_d
         let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), udp_port);
         let local = NodeRecord::from_secret_key(addr, &key);
         let mut builder = Discv4Config::builder();
-        builder.add_boot_nodes(mainnet_nodes());
+        builder.add_boot_nodes(net.bootnodes());
         let config = builder.build();
         match Discv4::bind(addr, local, key, config).await {
             Ok((handle, mut service)) => {
