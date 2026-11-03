@@ -13,7 +13,14 @@
 #
 # Credentials: Secret r2 (R2_ACCOUNT_ID, R2_ACCESS_KEY_ID,
 # R2_SECRET_ACCESS_KEY), an account token limited to object read/write on
-# csl-eth-apac and to this box's addresses. Never in the repo.
+# csl-eth-apac and to this box's addresses. Never in the repo. Secret fcr
+# (optional) holds CSL_ETH_FCR_RPC, the RPC whose `safe` tag head/fcr reports;
+# its URL may carry an API key, so it lives there too and the producer only
+# ever prints its host.
+#
+# Cadence: a cycle every epoch (6 min rounds up to the 6.4-min boundary),
+# each snapshot published under head/optimistic and later upgraded to
+# head/finality by the finality watcher; --keep 10 covers the finality trail.
 #
 # Cycles: one JSON line each on stdout (kubectl -n csl-eth logs deploy/producer)
 # and in data/produce/produce.log.
@@ -61,15 +68,20 @@ spec:
             - --publish
             - /work/scripts/r2-s3-publish.sh
             - --every-mins
-            - "60"
+            - "6"
             - --keep
-            - "3"
+            - "10"
+            - --lead-secs
+            - "60"
           env:
             - name: HOME
               value: /tmp
           envFrom:
             - secretRef:
                 name: r2
+            - secretRef:
+                name: fcr
+                optional: true
           resources:
             requests:
               cpu: 100m
