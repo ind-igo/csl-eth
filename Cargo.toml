@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/trie", "crates/store", "crates/client", "crates/head", "crates/snap", "crates/wasm"]
+members = ["crates/pgm", "crates/csl-run", "crates/trie", "crates/store", "crates/client", "crates/head", "crates/snap", "crates/wasm"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,10 +9,10 @@ license = "MIT"
 repository = "https://github.com/ind-igo/csl-eth"
 
 [workspace.dependencies]
-# The cold state layer format crates, one implementation shared with the
-# cinder PoC by path (see docs/decisions.md).
-csl-run = { path = "../cinder/crates/csl-run" }
-pgm = { path = "../cinder/crates/pgm" }
+# The cold state layer format crates, vendored from the cinder PoC at its
+# commit ba2b9d8 (see docs/decisions.md).
+csl-run = { path = "crates/csl-run" }
+pgm = { path = "crates/pgm" }
 
 alloy-primitives = { version = "1.7", default-features = false, features = ["std", "rlp"] }
 alloy-rlp = { version = "0.3.17", default-features = false, features = ["std", "derive"] }
@@ -21,6 +21,7 @@ blake3 = "1.8"
 hex = "0.4"
 rand = "0.9"
 rand_chacha = "0.9"
+rand_distr = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4.5", features = ["derive"] }

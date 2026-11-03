@@ -6,17 +6,20 @@ a learned index, served by any host that does byte ranges, and a client
 that proves every value and every absence from `state_root` with no RPC
 and no node at query time.
 
-The profile and the plan live in the vault
-(`wiki/projects/cold-state-layer/specs/profiles/ethereum.md`,
-`specs/poc-ethereum.md`). The reasoning behind each choice here is in
-`docs/decisions.md`. The format crates (`pgm`, `csl-run`) are the cinder
-PoC's, used by path from `../cinder/crates/`, so both PoCs share one
-implementation.
+Live against mainnet: https://csl-eth.indigo-db8.workers.dev/?open (the
+client in the browser, reading a bucket a producer refreshes every epoch)
+and https://csl-eth.indigo-db8.workers.dev/viz.html (every read's proof,
+with tampering, replay and races). The reasoning behind each choice is in
+`docs/decisions.md`, in the order it was made; the rest of this README is
+the build log. The format crates (`pgm`, `csl-run`) come from PoC 1 (cinder,
+the same layer on its own chain), vendored at its commit `ba2b9d8`.
 
 ## Crates
 
 | crate | what |
 |---|---|
+| `crates/pgm` | the learned index: a piecewise-linear fit in Q0.64 that predicts a key's page, checked against the data when a run is built |
+| `crates/csl-run` | run files: sorted fixed pages under a blake3 tree, the paged model, the canonical writer and the verifying reader, manifest codecs |
 | `crates/trie` (`csl-eth-trie`) | node positions and table keys; a streaming builder from sorted leaves that emits every hashed node and agrees with alloy's `HashBuilder` root; the verifier walk (`Present` / `Absent` by trie shape / `Missing` / `Invalid`) |
 | `crates/store` (`csl-eth-store`) | the bucket layout, the JSON manifest, and the producer: storage tries built and checked per account, the account trie checked against `state_root`, code checked against `codeHash`, four tables written through `csl-run` in the variable layout, code blobs above 3,968 B |
 | `crates/client` (`csl-eth-client`) | the client as a state machine over a `Store` of fetched bytes: `try_account` / `try_storage` / `try_code` compute from what the store holds and return `Pending` with the round's wants (`Want::Range`, `Want::File`) when they need more; a `Driver` (a directory, HTTP over threads) fetches each round for the synchronous `account` / `storage` / `code`; one speculative round over depths `0..=D`, the walk, repairs, with requests, bytes and rounds per read |

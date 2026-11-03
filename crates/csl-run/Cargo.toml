@@ -1,0 +1,30 @@
+[package]
+name = "csl-run"
+description = "Cold state layer run files: canonical writer, verifying reader, manifest and ColdRoot codecs (v1-min §2, §3, §5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pgm = { path = "../pgm" }
+blake3.workspace = true
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex = "0.4"
+clap.workspace = true
+
+[dev-dependencies]
+commonware-storage = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c4407b6907f520ea828b825829ecea942a0e9b9", default-features = false }
+commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c4407b6907f520ea828b825829ecea942a0e9b9", default-features = false }
+
+[[bin]]
+name = "csl-vectors"
+path = "src/bin/csl_vectors.rs"
+
+[[bin]]
+name = "csl-run-bench"
+path = "src/bin/csl_run_bench.rs"

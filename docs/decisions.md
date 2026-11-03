@@ -276,3 +276,7 @@ Tests: the key in the URL and quoted back in every way above never reaches an er
 ## 2026-11-03: a keyed FCR source
 
 publicnode's `safe` is the justified checkpoint, so the note only ever said "justified", about four minutes after the snapshot was up. Ankr says its `safe` is FCR-backed since 2026-10-22, and from here it is: five samples a few seconds apart had `safe` 0 or 1 blocks behind `latest`. The producer reads it from Secret `csl-eth/fcr` (`CSL_ETH_FCR_RPC`, the key in the URL's path), and since 16:27 UTC the first cycle's note says `fast-confirmed per rpc.ankr.com after 13 s`, trail 0 to 1 blocks, ready before the snapshot is published, so it is there for the head's whole life. No log line, `state.json` entry or bucket file holds the key; only the host. What it adds is a claim, not freshness: a named full node's word that the block will not reorg under synchrony, beside the committee signature the client checks.
+
+## 2026-11-03: the format crates vendored
+
+`pgm` and `csl-run` were used by path from `../cinder/crates/`, so one implementation served both PoCs. To publish this repo on its own, they are copied in as `crates/pgm` and `crates/csl-run` from cinder at `ba2b9d8` (the paged model), unchanged except that their workspace is now this one. The two copies may drift from here; this one is the one the Ethereum profile is measured with.
