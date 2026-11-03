@@ -397,6 +397,16 @@ impl UpdateWatch {
         }
     }
 
+    /// Stop polling, keeping what was seen.
+    pub fn stop(&mut self) {
+        self.inner
+            .stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+
     /// The tier this watch polls.
     pub fn tier(&self) -> Tier {
         self.tier
@@ -465,7 +475,8 @@ impl UpdateWatch {
                 }
             }
             let now = std::time::Instant::now();
-            if now >= deadline {
+            // A stopped watch sees nothing more.
+            if now >= deadline || self.thread.is_none() {
                 return Err(format!(
                     "no {} named block {block_number} within the wait; newest {}, {} polls{}",
                     match self.tier {
@@ -526,12 +537,7 @@ impl WatchSeen {
 
 impl Drop for UpdateWatch {
     fn drop(&mut self) {
-        self.inner
-            .stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        self.stop();
     }
 }
 

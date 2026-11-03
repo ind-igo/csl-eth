@@ -17,6 +17,7 @@
 pub mod bal;
 pub mod discovery;
 pub mod faults;
+pub mod fcr;
 pub mod fetch;
 pub mod peer;
 pub mod produce;

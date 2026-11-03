@@ -1,67 +1,90 @@
 //! `csl-eth produce`: the producer loop. A snapshot is only a head while
-//! the bucket's head files can be followed to it: its finality update is
-//! signed in some period P, and a client refuses a head signed two periods
-//! before its clock as stale, so a frozen snapshot stops opening once
-//! period P+2 begins. This loop keeps the bucket current by doing, at each chosen
-//! epoch boundary, what was done by hand once:
+//! the bucket's head files can be followed to it: its head update is signed
+//! in some period P, and a client refuses a head signed two periods before
+//! its clock as stale, so a frozen snapshot stops opening once period P+2
+//! begins. This loop keeps the bucket current with two heads, both over
+//! the same snapshots, each taken at an epoch boundary (the block a
+//! finality update will name 13 to 19 minutes later, and the one before it
+//! when the boundary slot is empty):
 //!
-//! 1. fetch the slice over snap with the pivot at the boundary (the block
-//!    finality will name 13 to 19 minutes later), dialing `--lead-secs`
-//!    before it;
-//! 2. build the snapshot into the local mirror of the bucket;
-//! 3. wait for the beacon node's finality update to name that block, and
-//!    keep its exact bytes (a watcher polls from the start of the cycle,
-//!    since the node serves only its newest update and the one naming our
-//!    block exists for one epoch);
+//! - `head/optimistic`, the attested tier, written by each cycle about a
+//!   slot after its block is attested by the sync committee;
+//! - `head/finality`, written by the finality upgrade when the beacon
+//!   node's finality update names a snapshot already published.
+//!
+//! Each cycle, at the next chosen boundary:
+//!
+//! 1. watch the beacon node's optimistic update from before the boundary
+//!    (it names a block for about one slot, from the slot after it), and
+//!    fetch the slice over snap with the pivot at the boundary, dialing
+//!    `--lead-secs` before it;
+//! 2. capture the optimistic update whose attested header is our block,
+//!    keeping its exact bytes (the best-signed the watch saw);
+//! 3. build the snapshot into the local mirror of the bucket;
 //! 4. lay out the head files: the bootstrap once, the period updates from
 //!    the checkpoint's period through the current one (fetching what is
 //!    missing, the current period's again, and a period's once more after
-//!    it closes), and `head/finality`;
-//! 5. verify the mirror as a client would: the head reaches exactly this
-//!    block and the manifest's state root, and sampled accounts, slots and
-//!    code from the slice read back verified through it. Head files count
-//!    only from here, and only those the head's verification read: the
-//!    bootstrap and the updates for periods `b..s` (`s` the finality
-//!    update's signing period). If verification fails, what was fetched
-//!    is discarded and the next cycle fetches it again; if it passes,
-//!    updates fetched for `s` or later, which it did not read, are dropped
-//!    from the mirror and not published;
+//!    it closes), and `head/optimistic`;
+//! 5. verify the mirror as a client would: the attested head reaches
+//!    exactly this block and the manifest's state root, and sampled
+//!    accounts, slots and code from the slice read back verified through
+//!    it. Head files count only from here, and only those the head's
+//!    verification read: the bootstrap and the updates for periods `b..s`
+//!    (`s` the update's signing period). If verification fails, what was
+//!    fetched is discarded and the next cycle fetches it again; if it
+//!    passes, updates fetched for `s` or later, which it did not read, are
+//!    dropped from the mirror and not published;
 //! 6. publish so that a reader never sees a pointer to something not yet
 //!    there: run files, manifest, new blobs, changed head updates of
-//!    `b..s`, `snapshots/latest`, and `head/finality` last;
+//!    `b..s`, `head/optimistic`, then `snapshots/latest`;
 //! 7. delete snapshots beyond `--keep` from the bucket and the mirror, and
-//!    old slices; never the newest, the one `head/finality` or `latest`
-//!    names, or one a pointer write may have named (a write that failed is
-//!    not known not to have landed, nor to be over). Blobs are
+//!    old slices; never the newest, one a head pointer or `latest` names,
+//!    or one a pointer write may have named (a write that failed is not
+//!    known not to have landed, nor to be over). Blobs are
 //!    content-addressed and shared, and are never deleted.
+//!
+//! Between steps (while sleeping and while the fetch runs, never between
+//! laying out head files and publishing them) the producer tends two
+//! things. The finality upgrade: a watch polls the finality update all the
+//! time, and when it names a published snapshot newer than the one
+//! `head/finality` names, that update is laid out, the mirror's finalized
+//! head is verified to reach the snapshot's block and state root, and the
+//! updates it read and `head/finality` are published, journaled as the
+//! cycle's pointers are. And, with `--fcr-rpc` (or `CSL_ETH_FCR_RPC`), the
+//! fast-confirmation note: a probe started at each boundary polls that
+//! RPC's `safe` and `latest` (see [`crate::fcr`]); when it confirms the
+//! block `head/optimistic` still names, `head/fcr` is published. It is
+//! unverified, a client shows it as a named source's report, and a failing
+//! source never fails or delays a cycle. Each upgrade and each probe's end
+//! is a log line of its own (`"event": "finality"`, `"event": "fcr"`).
 //!
 //! A failed cycle is logged and the loop goes on to the next boundary.
 //! Pointer writes that keep failing are bounded: with more than three
-//! snapshots waiting on them (pending, and newer than the confirmed head),
-//! a cycle fetches nothing and writes the newest one's pointers again,
-//! while its head still verifies; once it cannot, one new snapshot is let
-//! in, so they grow by one per head lifetime (27 to 55 hours), not per
-//! cycle.
+//! snapshots waiting on them (pending, and newer than the confirmed
+//! attested head), a cycle fetches nothing and writes the newest one's
+//! pointers again, while its head still verifies; once it cannot, one new
+//! snapshot is let in, so they grow by one per head lifetime (27 to 55
+//! hours), not per cycle.
 //! What has been published is recorded in `<work>/state.json` as each
 //! file goes up, so a restart re-uploads neither blobs nor closed updates.
 //! Each publisher call has a deadline (`--publish-timeout-secs`) that
 //! covers the program and anything it leaves holding its output: past it
 //! the process group is killed and the call is a failure.
 
-use crate::{fetch, FetchConfig, Slice};
+use crate::{fcr, fetch, FetchConfig, Slice};
 use alloy_primitives::{keccak256, B256};
 use clap::Args as ClapArgs;
-use csl_eth_client::{open_at_head, DirDriver, Read};
+use csl_eth_client::{open_at_head_with, DirDriver, Read, TierChoice};
 use csl_eth_head::{
-    fetch::{finalized_of, Beacon, FinalityWatch},
-    paths, Chain, DirSource,
+    fetch::{Beacon, UpdateWatch},
+    paths, verify_tier, Chain, DirSource, Tier,
 };
 use csl_eth_store::{produce_with, ProduceOptions, LATEST_FILE, MANIFEST_FILE};
 use csl_eth_trie::{Nibbles, KECCAK_EMPTY};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -74,6 +97,15 @@ const EPOCH_SECS: u64 = 32 * 12;
 
 /// `produce.log` is rotated to `produce.log.1` above this size.
 const LOG_MAX: u64 = 10 << 20;
+
+/// The fewest snapshots collection keeps. Finality names a snapshot 13 to
+/// 19 minutes after its block, two or three epoch-spaced cycles later; with
+/// fewer kept, the one finality is about to name could be collected first.
+pub const MIN_KEEP: usize = 4;
+
+/// After a finality upgrade fails for a snapshot, how long before it is
+/// tried again (the watch keeps its bytes for two hours).
+const UPGRADE_RETRY: Duration = Duration::from_secs(300);
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct Args {
@@ -94,12 +126,15 @@ pub struct Args {
     /// <key>`; a nonzero exit is a failure.
     #[arg(long)]
     pub publish: String,
-    /// Snapshots kept in the bucket.
-    #[arg(long, default_value_t = 3)]
+    /// Snapshots kept in the bucket, at least 4 (`MIN_KEEP`). A reader that
+    /// opened one can read it until it is collected, about `keep` cycles
+    /// later: 10 at one cycle an epoch is about an hour.
+    #[arg(long, default_value_t = 10)]
     pub keep: usize,
     /// Minimum spacing between published snapshots, in minutes; the next
-    /// boundary is the first epoch boundary past it.
-    #[arg(long, default_value_t = 60)]
+    /// boundary is the first epoch boundary past it (6: every epoch, when
+    /// a cycle finishes within one).
+    #[arg(long, default_value_t = 6)]
     pub every_mins: u64,
     /// Run one cycle and exit with its status.
     #[arg(long)]
@@ -111,13 +146,36 @@ pub struct Args {
     /// root for about 128 blocks, 25 minutes).
     #[arg(long, default_value_t = 1200)]
     pub max_fetch_secs: u64,
-    /// Give up waiting for finality to name the block this long after the
-    /// boundary (it normally does after 13 to 19 minutes).
+    /// With `--once`, wait this long after the boundary for finality to
+    /// name the block and `head/finality` to be published (it normally
+    /// does after 13 to 19 minutes).
     #[arg(long, default_value_t = 2400)]
     pub finality_wait_secs: u64,
     /// How often to poll the beacon node's finality update.
     #[arg(long, default_value_t = 16)]
     pub poll_secs: u64,
+    /// How often to poll the beacon node's optimistic update around a
+    /// boundary (the one attesting a block is served for about a slot).
+    #[arg(long, default_value_t = 2)]
+    pub optimistic_poll_secs: u64,
+    /// Give up on capturing the optimistic update for our block this long
+    /// after the boundary (it normally comes 12 to 30 seconds after).
+    #[arg(long, default_value_t = 120)]
+    pub attested_wait_secs: u64,
+    /// An execution RPC whose `safe` tag is reported as `head/fcr`, an
+    /// unverified note beside the attested head. Read from
+    /// `CSL_ETH_FCR_RPC` when absent; only its host is ever logged or
+    /// published, since the URL may carry a key.
+    /// Taken as given and parsed after clap, so that neither a parse error
+    /// nor `Debug` ever shows the URL.
+    #[arg(long)]
+    pub fcr_rpc: Option<fcr::Secret>,
+    /// How often the FCR probe polls `safe` and `latest`.
+    #[arg(long, default_value_t = 4)]
+    pub fcr_poll_secs: u64,
+    /// The FCR probe gives up this long after the boundary.
+    #[arg(long, default_value_t = 600)]
+    pub fcr_wait_secs: u64,
     #[arg(long, default_value_t = 8)]
     pub peers: usize,
     /// Per request to a peer.
@@ -159,18 +217,35 @@ pub struct State {
     pub finality: Option<B256>,
     /// The block the bucket's `snapshots/latest` names.
     pub latest: Option<B256>,
-    /// Snapshots a pointer write (`latest` or `head/finality`) was started
-    /// for, with when (unix seconds; the latest attempt's). A write that
-    /// failed or timed out may have landed, or may still land: killing the
-    /// publisher does not cancel a request the store is already serving.
-    /// So the bucket may name any of them, and they are protected from
-    /// collection until both pointers have been written and confirmed by a
-    /// write that began at least the grace after (see [`release_pending`]).
-    /// A `state.json` from before the times were kept lists bare hashes;
-    /// they load as started now.
+    /// The block the bucket's `head/optimistic` names.
+    #[serde(default)]
+    pub optimistic: Option<B256>,
+    /// The block the bucket's `head/fcr` names, the last one written.
+    #[serde(default)]
+    pub fcr: Option<B256>,
+    /// Snapshots a cycle's pointer write (`head/optimistic` or `latest`)
+    /// was started for, with when (unix seconds; the latest attempt's). A
+    /// write that failed or timed out may have landed, or may still land:
+    /// killing the publisher does not cancel a request the store is already
+    /// serving. So the bucket may name any of them, and they are protected
+    /// from collection until both pointers have been written and confirmed
+    /// by a write that began at least the grace after (see
+    /// [`release_pending`]). A `state.json` from before the times were kept
+    /// lists bare hashes; they load as started now.
     #[serde(default, deserialize_with = "pending_compat")]
     pub pending: BTreeMap<B256, u64>,
+    /// The same journal for `head/finality` writes, which the finality
+    /// upgrade makes on its own.
+    #[serde(default)]
+    pub pending_final: BTreeMap<B256, u64>,
+    /// 0 for a `state.json` from before the attested tier, whose `pending`
+    /// named `latest` and `head/finality` writes together; 2 since.
+    #[serde(default)]
+    pub format: u32,
 }
+
+/// The `state.json` format this producer writes.
+const STATE_FORMAT: u32 = 2;
 
 fn pending_compat<'de, D>(d: D) -> Result<BTreeMap<B256, u64>, D::Error>
 where
@@ -206,9 +281,12 @@ pub fn pending_grace(publish_timeout: Duration) -> u64 {
 /// stays, since a write of it landing after `started` would name it again;
 /// a later cycle releases it.
 pub fn release_pending(state: &mut State, started: u64, grace: u64) {
-    state
-        .pending
-        .retain(|_, since| since.saturating_add(grace) > started);
+    release(&mut state.pending, started, grace);
+}
+
+/// [`release_pending`] for one journal.
+fn release(journal: &mut BTreeMap<B256, u64>, started: u64, grace: u64) {
+    journal.retain(|_, since| since.saturating_add(grace) > started);
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -226,10 +304,15 @@ pub struct SnapRec {
     pub boundary: u64,
     /// Its keys in the bucket.
     pub keys: Vec<String>,
-    /// `head/finality` has named it: published whole.
+    /// Published whole, and a head pointer has named it (`head/optimistic`;
+    /// `head/finality` before the attested tier).
     pub complete: bool,
     /// Its slice under `<work>/slices/`.
     pub slice: String,
+    /// Its block's timestamp (unix seconds); 0 in a `state.json` from
+    /// before it was kept.
+    #[serde(default)]
+    pub timestamp: u64,
 }
 
 impl State {
@@ -240,8 +323,15 @@ impl State {
     pub fn load(work: &Path, checkpoint: B256) -> Result<State, String> {
         match fs::read(State::path(work)) {
             Ok(b) => {
-                let s: State =
+                let mut s: State =
                     serde_json::from_slice(&b).map_err(|e| format!("state.json: {e}"))?;
+                if s.format < STATE_FORMAT {
+                    // Its pending writes were of `latest` and
+                    // `head/finality` together: both journals hold them.
+                    let old = s.pending.clone();
+                    s.pending_final.extend(old);
+                    s.format = STATE_FORMAT;
+                }
                 if s.checkpoint != checkpoint {
                     return Err(format!(
                         "state.json is for checkpoint {}, not {checkpoint}; use another --work",
@@ -252,6 +342,7 @@ impl State {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State {
                 checkpoint,
+                format: STATE_FORMAT,
                 ..Default::default()
             }),
             Err(e) => Err(format!("state.json: {e}")),
@@ -265,7 +356,7 @@ impl State {
         )
     }
 
-    /// The boundary of the newest snapshot `head/finality` has named.
+    /// The boundary of the newest snapshot a head pointer has named.
     fn last_boundary(&self) -> Option<u64> {
         self.snapshots
             .iter()
@@ -315,8 +406,8 @@ pub fn next_target(genesis: u64, now: u64, lead: u64, last: Option<u64>, every: 
 
 /// Snapshots to delete: incomplete ones (a cycle that failed while
 /// publishing), and complete ones beyond the newest `keep`; never the
-/// ones `head/finality` or `latest` name, any a pointer write is pending
-/// for, or the newest by block number.
+/// ones `head/finality`, `head/optimistic` or `latest` name, any a pointer
+/// write is pending for, or the newest by block number.
 pub fn gc_plan(state: &State, keep: usize) -> Vec<B256> {
     let newest = state
         .snapshots
@@ -325,8 +416,10 @@ pub fn gc_plan(state: &State, keep: usize) -> Vec<B256> {
         .map(|s| s.block_hash);
     let protected = |h: &B256| {
         state.finality == Some(*h)
+            || state.optimistic == Some(*h)
             || state.latest == Some(*h)
             || state.pending.contains_key(h)
+            || state.pending_final.contains_key(h)
             || newest == Some(*h)
     };
     let mut complete: Vec<&SnapRec> = state.snapshots.iter().filter(|s| s.complete).collect();
@@ -604,6 +697,16 @@ impl Work {
     }
 }
 
+/// What the producer tends between a cycle's steps: the finality watch
+/// and its upgrades, and the FCR probes of published snapshots.
+struct Side {
+    finality: UpdateWatch,
+    /// Snapshots a finality upgrade failed for, and when to try again.
+    failed: HashMap<B256, Instant>,
+    fcr: Option<fcr::Source>,
+    probes: Vec<fcr::Probe>,
+}
+
 /// Run the loop (or one cycle with `--once`).
 pub fn run(args: Args) -> Result<(), String> {
     parse_prefix(&args.prefix)?;
@@ -612,6 +715,22 @@ pub fn run(args: Args) -> Result<(), String> {
     let publisher = Program {
         program: args.publish.clone(),
         timeout: Duration::from_secs(args.publish_timeout_secs),
+    };
+    let fcr = fcr::Source::from_arg_or_env(args.fcr_rpc.as_ref().map(|s| s.0.as_str()))?;
+    let keep = args.keep.max(MIN_KEEP);
+    if keep != args.keep {
+        tracing::warn!(keep, asked = args.keep, "--keep raised to the minimum");
+    }
+    tracing::info!(
+        fcr = fcr.as_ref().map(|s| s.host()),
+        keep,
+        "the producer starts"
+    );
+    let mut side = Side {
+        finality: UpdateWatch::start(&args.beacon, Duration::from_secs(args.poll_secs)),
+        failed: HashMap::new(),
+        fcr,
+        probes: Vec::new(),
     };
     let chain = Chain::mainnet();
     loop {
@@ -623,17 +742,25 @@ pub fn run(args: Args) -> Result<(), String> {
             args.every_mins * 60,
         );
         let start = target.saturating_sub(args.lead_secs);
-        let wait = start.saturating_sub(now_secs());
-        tracing::info!(target, wait_secs = wait, "next cycle at the epoch boundary");
-        if wait > 0 {
-            std::thread::sleep(Duration::from_secs(wait));
+        tracing::info!(
+            target,
+            wait_secs = start.saturating_sub(now_secs()),
+            "next cycle at the epoch boundary"
+        );
+        while now_secs() < start {
+            tend(&args, &work, &mut state, &publisher, &mut side);
+            let left = start.saturating_sub(now_secs());
+            std::thread::sleep(Duration::from_secs(left.min(2)));
         }
         let mut line = Map::new();
-        let r = cycle(&args, &work, &mut state, &publisher, target, &mut line);
+        line.insert("event".into(), json!("cycle"));
+        let r = cycle(
+            &args, &work, &mut state, &publisher, &mut side, target, &mut line,
+        );
         // Garbage is collected after every cycle: a failed one leaves a
         // built snapshot and a slice behind, and may have published part
         // of a snapshot.
-        let gc = collect(&work, &mut state, &publisher, args.keep);
+        let gc = collect(&work, &mut state, &publisher, keep);
         line.insert("deleted".into(), json!(gc.deleted));
         if let Some(e) = &gc.error {
             line.insert("gc_error".into(), json!(e));
@@ -655,7 +782,20 @@ pub fn run(args: Args) -> Result<(), String> {
             out.entry(k).or_insert(v);
         }
         work.log(&Value::Object(out));
+        tend(&args, &work, &mut state, &publisher, &mut side);
         if args.once {
+            // One cycle: and, when it published, its finality upgrade and
+            // its FCR probe, each within its own bound.
+            let until = target + args.finality_wait_secs;
+            while ok && now_secs() < until {
+                let ours = state.optimistic;
+                let finalized = ours.is_some() && state.finality == ours;
+                if finalized && side.probes.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(2));
+                tend(&args, &work, &mut state, &publisher, &mut side);
+            }
             return if ok {
                 Ok(())
             } else {
@@ -663,6 +803,214 @@ pub fn run(args: Args) -> Result<(), String> {
             };
         }
     }
+}
+
+/// The duties between steps: a finality upgrade if the watch names a
+/// published snapshot newer than `head/finality`'s, and the reports of FCR
+/// probes that have ended. Each is a log line of its own.
+fn tend(args: &Args, work: &Work, state: &mut State, p: &dyn Publish, side: &mut Side) {
+    if let Some(line) = upgrade_finality(args, work, state, p, side) {
+        work.log(&line);
+    }
+    let mut i = 0;
+    while i < side.probes.len() {
+        let Some(report) = side.probes[i].try_take() else {
+            i += 1;
+            continue;
+        };
+        let probe = side.probes.remove(i);
+        work.log(&fcr_event(work, state, p, &probe, &report));
+    }
+}
+
+/// The finality update the watch holds for the newest published snapshot
+/// past the one `head/finality` names, made that snapshot's finalized
+/// head: laid out, verified to its block and state root, published.
+fn upgrade_finality(
+    args: &Args,
+    work: &Work,
+    state: &mut State,
+    p: &dyn Publish,
+    side: &mut Side,
+) -> Option<Value> {
+    let confirmed = state
+        .finality
+        .and_then(|h| state.snapshots.iter().find(|s| s.block_hash == h))
+        .map(|s| s.block_number);
+    let now = Instant::now();
+    let (rec, seen) = state
+        .snapshots
+        .iter()
+        .filter(|s| s.complete && confirmed.is_none_or(|c| s.block_number > c))
+        .filter(|s| side.failed.get(&s.block_hash).is_none_or(|t| now >= *t))
+        .filter_map(|s| side.finality.get(&s.block_hash).map(|f| (s.clone(), f)))
+        .max_by_key(|(s, _)| s.block_number)?;
+    let t = Instant::now();
+    let mut line = Map::new();
+    line.insert("event".into(), json!("finality"));
+    line.insert("block_number".into(), json!(rec.block_number));
+    line.insert("block_hash".into(), json!(rec.block_hash));
+    line.insert("boundary".into(), json!(utc(rec.boundary)));
+    line.insert("finalized_slot".into(), json!(seen.named.head.slot));
+    line.insert("participants".into(), json!(seen.named.participants));
+    let seen_ms = unix_ms_of(seen.first_seen);
+    if rec.timestamp > 0 {
+        line.insert(
+            "named_after_block_secs".into(),
+            json!(secs(Duration::from_millis(
+                seen_ms.saturating_sub(rec.timestamp * 1000)
+            ))),
+        );
+    }
+    let mut sent = Sent { files: 0, bytes: 0 };
+    let r = finalize(args, work, state, p, &rec, &seen.bytes, &mut sent);
+    line.insert("upgrade_secs".into(), json!(secs(t.elapsed())));
+    line.insert("published_files".into(), json!(sent.files));
+    match r {
+        Ok(()) => {
+            side.failed.remove(&rec.block_hash);
+            line.insert("ok".into(), json!(true));
+            if rec.timestamp > 0 {
+                line.insert(
+                    "published_after_block_secs".into(),
+                    json!(secs(Duration::from_millis(
+                        now_ms().saturating_sub(rec.timestamp * 1000)
+                    ))),
+                );
+            }
+        }
+        Err(f) => {
+            side.failed.insert(rec.block_hash, now + UPGRADE_RETRY);
+            line.insert("ok".into(), json!(false));
+            line.insert("step".into(), json!(f.step));
+            line.insert("error".into(), json!(f.error));
+        }
+    }
+    let mut out = Map::new();
+    out.insert("ok".into(), line["ok"].clone());
+    for (k, v) in line {
+        out.entry(k).or_insert(v);
+    }
+    Some(Value::Object(out))
+}
+
+/// A finality update naming snapshot `rec` made its finalized head: the
+/// head files laid out with it, the mirror's finalized head verified to
+/// reach `rec`'s block and its manifest's state root, then the updates it
+/// read and `head/finality`, journaled.
+fn finalize(
+    args: &Args,
+    work: &Work,
+    state: &mut State,
+    p: &dyn Publish,
+    rec: &SnapRec,
+    finality: &[u8],
+    sent: &mut Sent,
+) -> Result<(), Failed> {
+    let mut head = head_files(args, work, state, Tier::Finalized, finality).map_err(at("head"))?;
+    let read = match verify_final(work, args.checkpoint, rec, SystemTime::now()) {
+        Ok(r) => r,
+        Err(e) => {
+            head.discard(work, state);
+            return Err(Failed {
+                step: "verify",
+                error: e,
+            });
+        }
+    };
+    head.commit(work, state, read).map_err(at("verify"))?;
+    let grace = pending_grace(Duration::from_secs(args.publish_timeout_secs));
+    publish_updates(work, state, p, head.verified.clone(), sent).map_err(at("publish"))?;
+    publish_final(work, state, p, rec.block_hash, grace, sent).map_err(at("publish"))
+}
+
+/// The mirror's finalized head reaches `rec`'s block and its manifest's
+/// state root; the update periods it read.
+fn verify_final(
+    work: &Work,
+    checkpoint: B256,
+    rec: &SnapRec,
+    now: SystemTime,
+) -> Result<std::ops::Range<u64>, String> {
+    let chain = Chain::mainnet();
+    let head = verify_tier(
+        &DirSource(work.bucket.clone()),
+        &chain,
+        checkpoint,
+        now,
+        Tier::Finalized,
+    )
+    .map_err(|e| e.to_string())?;
+    if head.execution.block_hash != rec.block_hash {
+        return Err(format!(
+            "the finalized head reaches block {} ({}), not the snapshot's ({})",
+            head.execution.block_number, head.execution.block_hash, rec.block_hash
+        ));
+    }
+    let m = fs::read(
+        work.bucket
+            .join(csl_eth_store::manifest_path(&rec.block_hash)),
+    )
+    .map_err(|e| format!("the snapshot's manifest: {e}"))?;
+    let m = csl_eth_store::Manifest::from_json(&m).map_err(|e| format!("manifest: {e}"))?;
+    if head.execution.state_root != m.state_root {
+        return Err(format!(
+            "the finalized head's state root {} is not the manifest's {}",
+            head.execution.state_root, m.state_root
+        ));
+    }
+    head_reads(work, checkpoint, &chain, now, Tier::Finalized)
+}
+
+/// An FCR probe's end as a log line; when it confirmed the block
+/// `head/optimistic` still names, `head/fcr` goes up first.
+fn fcr_event(
+    work: &Work,
+    state: &mut State,
+    p: &dyn Publish,
+    probe: &fcr::Probe,
+    report: &fcr::Report,
+) -> Value {
+    let mut v = report.json(probe.host());
+    v["event"] = json!("fcr");
+    if let Some(t) = probe.target() {
+        v["block_number"] = json!(t.number);
+        v["block_hash"] = json!(t.hash);
+    }
+    let fcr::Outcome::Confirmed(r) = &report.outcome else {
+        v["published"] = json!(false);
+        return v;
+    };
+    if state.optimistic != Some(r.block_hash) {
+        v["published"] = json!(false);
+        v["why"] = json!("superseded: head/optimistic names a later snapshot");
+        return v;
+    }
+    let mut sent = Sent { files: 0, bytes: 0 };
+    let file = work.bucket.join(paths::FCR);
+    let r = write_atomic(&file, &r.to_json())
+        .and_then(|()| put_one(p, paths::FCR, &file, &mut sent))
+        .and_then(|()| {
+            state.fcr = Some(r.block_hash);
+            state.save(&work.root)
+        });
+    match r {
+        Ok(()) => {
+            v["published"] = json!(true);
+            v["published_at"] = json!(utc(now_secs()));
+        }
+        Err(e) => {
+            v["published"] = json!(false);
+            v["error"] = json!(e);
+        }
+    }
+    v
+}
+
+fn unix_ms_of(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn parse_prefix(s: &str) -> Result<Nibbles, String> {
@@ -681,9 +1029,10 @@ fn parse_prefix(s: &str) -> Result<Nibbles, String> {
 }
 
 /// The fetch in a runtime of its own, dropped when it returns, so its
-/// discovery sockets and peer tasks do not outlive the cycle.
-fn fetch_blocking(cfg: FetchConfig) -> Result<Slice, String> {
-    std::thread::spawn(move || {
+/// discovery sockets and peer tasks do not outlive the cycle. `during`
+/// runs on this thread about every half second until it is done.
+fn fetch_blocking(cfg: FetchConfig, mut during: impl FnMut()) -> Result<Slice, String> {
+    let t = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -692,9 +1041,13 @@ fn fetch_blocking(cfg: FetchConfig) -> Result<Slice, String> {
         let r = rt.block_on(fetch(cfg)).map_err(|e| e.to_string());
         rt.shutdown_timeout(Duration::from_secs(2));
         r
-    })
-    .join()
-    .map_err(|_| "the fetch thread panicked".to_string())?
+    });
+    while !t.is_finished() {
+        during();
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    t.join()
+        .map_err(|_| "the fetch thread panicked".to_string())?
 }
 
 fn secs(d: Duration) -> f64 {
@@ -728,6 +1081,7 @@ fn cycle(
     work: &Work,
     state: &mut State,
     publisher: &dyn Publish,
+    side: &mut Side,
     target: u64,
     line: &mut Map<String, Value>,
 ) -> Result<(), Failed> {
@@ -775,11 +1129,30 @@ fn cycle(
         }
     }
 
-    // The finality update naming our block is served for one epoch only;
-    // watch from now so a slow fetch cannot miss it.
-    let watch = FinalityWatch::start(&args.beacon, Duration::from_secs(args.poll_secs));
+    // The optimistic update attesting our block is served for about one
+    // slot, a slot after it; watch from before the boundary so the fetch
+    // cannot make us miss it. The FCR probe starts now too, before we know
+    // the block, so its first sighting is not late.
+    let mut watch = Some(UpdateWatch::start_tier(
+        &args.beacon,
+        Tier::Attested,
+        Duration::from_secs(args.optimistic_poll_secs),
+    ));
+    let probe = side.fcr.clone().map(|src| {
+        let host = src.host().to_string();
+        line.insert("fcr_source".into(), json!(host));
+        fcr::Probe::start(
+            fcr::Http::new(src, Duration::from_secs(10)),
+            &host,
+            Duration::from_secs(args.fcr_poll_secs),
+            (target + args.fcr_wait_secs) * 1000,
+        )
+    });
 
-    // 1. Fetch at the boundary.
+    // 1. Fetch at the boundary, tending the finality upgrade meanwhile. The
+    // optimistic watch is frozen (it keeps what it saw) a few slots after
+    // the boundary: by then the update for the boundary's block, or the
+    // block before an empty boundary slot, has come and gone.
     let t = Instant::now();
     let cfg = FetchConfig {
         prefix: parse_prefix(&args.prefix).map_err(at("fetch"))?,
@@ -790,7 +1163,21 @@ fn cycle(
         max_wall: Duration::from_secs(target.saturating_sub(now_secs()) + args.max_fetch_secs),
         ..Default::default()
     };
-    let slice = fetch_blocking(cfg).map_err(at("fetch"))?;
+    let mut frozen: Option<UpdateWatch> = None;
+    let fetched = fetch_blocking(cfg, || {
+        if watch
+            .as_ref()
+            .and_then(|w| w.newest())
+            .is_some_and(|n| n.slot >= boundary_slot + 4)
+        {
+            let mut w = watch.take().expect("checked");
+            w.stop();
+            frozen = Some(w);
+        }
+        tend(args, work, state, publisher, side);
+    });
+    let watch = watch.or(frozen).expect("one of them");
+    let slice = fetched.map_err(at("fetch"))?;
     let h = &slice.head;
     let fetch_done_ms = now_ms();
     line.insert("block_number".into(), json!(h.block_number));
@@ -826,7 +1213,36 @@ fn cycle(
             error: format!("writing the slice: {e}"),
         })?;
 
-    // 2. Build into the mirror.
+    // 2. The optimistic update attesting our block, the best-signed seen.
+    let deadline = Instant::now()
+        + Duration::from_secs((target + args.attested_wait_secs).saturating_sub(now_secs()));
+    watch
+        .wait_seen(h.block_hash, h.block_number, deadline)
+        .map_err(at("attested"))?;
+    let seen = watch.get(&h.block_hash).expect("seen above");
+    drop(watch);
+    let seen_ms = unix_ms_of(seen.first_seen);
+    line.insert(
+        "attested".into(),
+        json!({
+            "slot": seen.named.head.slot,
+            "signature_slot": seen.named.signature_slot,
+            "participants": seen.named.participants,
+            "seen_after_boundary_secs":
+                secs(Duration::from_millis(seen_ms.saturating_sub(target * 1000))),
+            "seen_after_block_secs":
+                secs(Duration::from_millis(seen_ms.saturating_sub(h.timestamp * 1000))),
+        }),
+    );
+    if let Some(p) = &probe {
+        p.aim(fcr::Target {
+            number: h.block_number,
+            hash: h.block_hash,
+            timestamp: h.timestamp,
+        });
+    }
+
+    // 3. Build into the mirror.
     let t = Instant::now();
     let produced = produce_with(
         &work.bucket,
@@ -845,25 +1261,10 @@ fn cycle(
     })?;
     line.insert("build_secs".into(), json!(secs(t.elapsed())));
 
-    // 3. Finality names our block.
-    let t = Instant::now();
-    let deadline = Instant::now()
-        + Duration::from_secs((target + args.finality_wait_secs).saturating_sub(now_secs()));
-    let finality = watch
-        .wait_for(h.block_hash, h.block_number, deadline)
-        .map_err(at("finality"))?;
-    drop(watch);
-    let fin = finalized_of(&finality).map_err(at("finality"))?;
-    line.insert("finality_wait_secs".into(), json!(secs(t.elapsed())));
-    line.insert(
-        "finalized_after_boundary_secs".into(),
-        json!(now_secs().saturating_sub(target)),
-    );
-    line.insert("finalized_slot".into(), json!(fin.slot));
-
     // 4. Head files in the mirror.
     let t = Instant::now();
-    let mut head = head_files(args, work, state, &finality).map_err(at("head"))?;
+    let mut head =
+        head_files(args, work, state, Tier::Attested, &seen.bytes).map_err(at("head"))?;
     line.insert("head_secs".into(), json!(secs(t.elapsed())));
     line.insert("updates_fetched".into(), json!(head.fetched));
 
@@ -901,7 +1302,17 @@ fn cycle(
     line.insert("publish_secs".into(), json!(secs(t.elapsed())));
     line.insert("published_files".into(), json!(sent.files));
     line.insert("published_bytes".into(), json!(sent.bytes));
-    r.map_err(at("publish"))
+    r.map_err(at("publish"))?;
+    line.insert(
+        "published_after_block_secs".into(),
+        json!(secs(Duration::from_millis(
+            now_ms().saturating_sub(h.timestamp * 1000)
+        ))),
+    );
+    // Only a published snapshot's probe is kept; a failed cycle's is
+    // dropped, which stops it.
+    side.probes.extend(probe);
+    Ok(())
 }
 
 /// What step 4 laid out, not yet trusted: until the cycle's verification
@@ -919,8 +1330,11 @@ struct HeadFiles {
     /// left by a cycle that never published it (one that failed, or
     /// crashed between fetching and verifying). Removed on failure.
     untrusted_bootstrap: bool,
-    /// The mirror's `head/finality` before this cycle, restored on failure.
-    old_finality: Option<Vec<u8>>,
+    /// Whose head update was laid out: `head/optimistic` for a cycle,
+    /// `head/finality` for a finality upgrade.
+    tier: Tier,
+    /// The mirror's file for `tier` before, restored on failure.
+    old_pointer: Option<Vec<u8>>,
 }
 
 impl HeadFiles {
@@ -949,8 +1363,8 @@ impl HeadFiles {
     }
 
     /// Verification failed (or step 4 did): remove what this cycle fetched,
-    /// so the next one fetches it again, and put the mirror's
-    /// `head/finality` back.
+    /// so the next one fetches it again, and put the mirror's head update
+    /// for the tier back.
     fn discard(&self, work: &Work, state: &mut State) {
         for &p in &self.fetched {
             let _ = fs::remove_file(work.bucket.join(paths::update(p)));
@@ -959,8 +1373,8 @@ impl HeadFiles {
         if self.untrusted_bootstrap {
             let _ = fs::remove_file(work.bucket.join(paths::bootstrap(&state.checkpoint)));
         }
-        let fin = work.bucket.join(paths::FINALITY);
-        let _ = match &self.old_finality {
+        let fin = work.bucket.join(self.tier.path());
+        let _ = match &self.old_pointer {
             Some(b) => write_atomic(&fin, b),
             None => fs::remove_file(&fin).map_err(|e| e.to_string()),
         };
@@ -968,11 +1382,13 @@ impl HeadFiles {
     }
 }
 
+/// Lay out the head files with `update` as the tier's head update.
 fn head_files(
     args: &Args,
     work: &Work,
     state: &mut State,
-    finality: &[u8],
+    tier: Tier,
+    update: &[u8],
 ) -> Result<HeadFiles, String> {
     let mut h = HeadFiles {
         fetched: Vec::new(),
@@ -980,9 +1396,10 @@ fn head_files(
         current: 0,
         verified: 0..0,
         untrusted_bootstrap: false,
-        old_finality: fs::read(work.bucket.join(paths::FINALITY)).ok(),
+        tier,
+        old_pointer: fs::read(work.bucket.join(tier.path())).ok(),
     };
-    match lay_out_head(args, work, state, finality, &mut h) {
+    match lay_out_head(args, work, state, update, &mut h) {
         Ok(()) => Ok(h),
         Err(e) => {
             h.discard(work, state);
@@ -995,7 +1412,7 @@ fn lay_out_head(
     args: &Args,
     work: &Work,
     state: &State,
-    finality: &[u8],
+    update: &[u8],
     h: &mut HeadFiles,
 ) -> Result<(), String> {
     let chain = Chain::mainnet();
@@ -1037,7 +1454,7 @@ fn lay_out_head(
             write_atomic(&work.bucket.join(paths::update(u.period)), &u.bytes)?;
         }
     }
-    write_atomic(&work.bucket.join(paths::FINALITY), finality)
+    write_atomic(&work.bucket.join(h.tier.path()), update)
 }
 
 /// The period updates to fetch: every period from `first` through
@@ -1060,18 +1477,21 @@ pub fn updates_to_fetch(
         .collect()
 }
 
-/// The update periods `csl_eth_head::verify` reads from the mirror as of
-/// `now`, `b..s`: the same files and clock give the same range it walked.
+/// The update periods `verify_tier` reads from the mirror for `tier` as
+/// of `now`, `b..s`: the same files and clock give the same range it
+/// walked.
 fn head_reads(
     work: &Work,
     checkpoint: B256,
     chain: &Chain,
     now: SystemTime,
+    tier: Tier,
 ) -> Result<std::ops::Range<u64>, String> {
     let file = |k: &str| fs::read(work.bucket.join(k)).map_err(|e| format!("{k}: {e}"));
-    csl_eth_head::update_periods(
+    csl_eth_head::update_periods_for(
+        tier,
         &file(&paths::bootstrap(&checkpoint))?,
-        &file(paths::FINALITY)?,
+        &file(tier.path())?,
         checkpoint,
         chain,
         now,
@@ -1079,8 +1499,9 @@ fn head_reads(
     .map_err(|e| e.to_string())
 }
 
-/// Step 5: the mirror verified as a client would see it once published.
-/// Also returns the update periods the head's verification read, `b..s`.
+/// Step 5: the mirror verified as a client would see it once published,
+/// through the attested tier. Also returns the update periods the head's
+/// verification read, `b..s`.
 fn verify(
     args: &Args,
     work: &Work,
@@ -1089,17 +1510,18 @@ fn verify(
 ) -> Result<(Value, std::ops::Range<u64>), String> {
     let now = SystemTime::now();
     let chain = Chain::mainnet();
-    let head = csl_eth_head::verify(
+    let head = verify_tier(
         &DirSource(work.bucket.clone()),
         &chain,
         args.checkpoint,
         now,
+        Tier::Attested,
     )
     .map_err(|e| e.to_string())?;
-    let read = head_reads(work, args.checkpoint, &chain, now)?;
+    let read = head_reads(work, args.checkpoint, &chain, now, Tier::Attested)?;
     if head.execution.block_hash != slice.head.block_hash {
         return Err(format!(
-            "the head reaches block {} ({}), not ours ({})",
+            "the attested head reaches block {} ({}), not ours ({})",
             head.execution.block_number, head.execution.block_hash, slice.head.block_hash
         ));
     }
@@ -1109,8 +1531,13 @@ fn verify(
             head.execution.state_root, manifest.state_root
         ));
     }
-    let (mut snap, _) = open_at_head(DirDriver::new(&work.bucket), args.checkpoint, now)
-        .map_err(|e| e.to_string())?;
+    let (mut snap, _, _) = open_at_head_with(
+        DirDriver::new(&work.bucket),
+        args.checkpoint,
+        now,
+        TierChoice::Attested,
+    )
+    .map_err(|e| e.to_string())?;
     let stride = (slice.accounts.len() / args.samples.max(1)).max(1);
     let (mut accounts, mut slots, mut codes) = (0u64, 0u64, 0u64);
     for (i, (h, a)) in slice.accounts.iter().enumerate().step_by(stride) {
@@ -1200,6 +1627,7 @@ fn publish(
             keys,
             complete: false,
             slice: slice_name.to_string(),
+            timestamp: slice.head.timestamp,
         });
         state.save(&work.root)?;
     }
@@ -1276,10 +1704,10 @@ fn publish_updates(
     Ok(())
 }
 
-/// `latest`, then the finality update that makes snapshot `hash` the head,
-/// both from the mirror. The intent is journaled first: a write that fails
-/// (or times out) may have landed, or land later, so the bucket may name
-/// this snapshot, and collection must not delete it.
+/// `head/optimistic`, then `latest`, naming snapshot `hash`, both from
+/// the mirror. The intent is journaled first: a write that fails (or times
+/// out) may have landed, or land later, so the bucket may name this
+/// snapshot, and collection must not delete it.
 fn publish_pointers(
     work: &Work,
     state: &mut State,
@@ -1291,11 +1719,16 @@ fn publish_pointers(
     let started = now_secs();
     state.pending.insert(hash, started);
     state.save(&work.root)?;
+    put_one(
+        p,
+        paths::OPTIMISTIC,
+        &work.bucket.join(paths::OPTIMISTIC),
+        sent,
+    )?;
+    state.optimistic = Some(hash);
+    state.save(&work.root)?;
     put_one(p, LATEST_FILE, &work.bucket.join(LATEST_FILE), sent)?;
     state.latest = Some(hash);
-    state.save(&work.root)?;
-    put_one(p, paths::FINALITY, &work.bucket.join(paths::FINALITY), sent)?;
-    state.finality = Some(hash);
     if let Some(s) = state.snapshots.iter_mut().find(|s| s.block_hash == hash) {
         s.complete = true;
     }
@@ -1308,16 +1741,38 @@ fn publish_pointers(
     state.save(&work.root)
 }
 
+/// `head/finality` naming snapshot `hash`, from the mirror, journaled in
+/// `pending_final` the same way.
+fn publish_final(
+    work: &Work,
+    state: &mut State,
+    p: &dyn Publish,
+    hash: B256,
+    pending_grace: u64,
+    sent: &mut Sent,
+) -> Result<(), String> {
+    let started = now_secs();
+    state.pending_final.insert(hash, started);
+    state.save(&work.root)?;
+    put_one(p, paths::FINALITY, &work.bucket.join(paths::FINALITY), sent)?;
+    state.finality = Some(hash);
+    state.save(&work.root)?;
+    release(&mut state.pending_final, started, pending_grace);
+    state.save(&work.root)
+}
+
 /// Snapshots waiting on pointer writes beyond which a cycle fetches none.
 const MAX_UNRESOLVED: usize = 3;
 
-/// Pending snapshots newer than the one `head/finality` is confirmed to
-/// name, newest first: their pointer writes failed and no confirmed pair
-/// has gone past them. (Pending ones older than it only wait out their
-/// grace; the next confirmed pair releases them, and no more are added.)
+/// Pending snapshots newer than the one `head/optimistic` is confirmed to
+/// name (`head/finality`, for a state from before the attested tier),
+/// newest first: their pointer writes failed and no confirmed pair has
+/// gone past them. (Pending ones older than it only wait out their grace;
+/// the next confirmed pair releases them, and no more are added.)
 pub fn unresolved_pending(state: &State) -> Vec<B256> {
     let confirmed = state
-        .finality
+        .optimistic
+        .or(state.finality)
         .and_then(|h| state.snapshots.iter().find(|s| s.block_hash == h))
         .map(|s| s.block_number);
     let mut out: Vec<(u64, B256)> = state
@@ -1337,7 +1792,7 @@ enum Retry {
 }
 
 /// Write the pointers for pending snapshot `hash` again, as of `now`, if
-/// the mirror's head still verifies to it. Everything else of it is in the
+/// the mirror's attested head still verifies to it. Everything else of it is in the
 /// bucket already (a snapshot becomes pending only after the rest of its
 /// cycle went up), and the mirror's head files are the ones its cycle
 /// verified unless a later cycle replaced them, in which case the head no
@@ -1354,8 +1809,13 @@ fn retry_pointers(
     sent: &mut Sent,
 ) -> Result<Retry, String> {
     let chain = Chain::mainnet();
-    let head = match csl_eth_head::verify(&DirSource(work.bucket.clone()), &chain, checkpoint, now)
-    {
+    let head = match verify_tier(
+        &DirSource(work.bucket.clone()),
+        &chain,
+        checkpoint,
+        now,
+        Tier::Attested,
+    ) {
         Ok(h) => h,
         Err(e) => return Ok(Retry::Skipped(format!("the mirror's head: {e}"))),
     };
@@ -1365,7 +1825,7 @@ fn retry_pointers(
             head.execution.block_hash
         )));
     }
-    let read = match head_reads(work, checkpoint, &chain, now) {
+    let read = match head_reads(work, checkpoint, &chain, now, Tier::Attested) {
         Ok(r) => r,
         Err(e) => return Ok(Retry::Skipped(format!("the mirror's head: {e}"))),
     };
@@ -1486,6 +1946,7 @@ mod tests {
             keys: vec![],
             complete,
             slice: format!("{n}"),
+            timestamp: 0,
         }
     }
 
@@ -1627,7 +2088,7 @@ mod tests {
             touch(&w.bucket, &paths::update(*p), body);
         }
         touch(&w.bucket, LATEST_FILE, hex::encode(h).as_bytes());
-        touch(&w.bucket, paths::FINALITY, b"fin");
+        touch(&w.bucket, paths::OPTIMISTIC, b"opt");
         fs::create_dir_all(w.slices.join(format!("{n}"))).unwrap();
     }
 
@@ -1648,7 +2109,8 @@ mod tests {
             current: 1899,
             verified: 1898..1900,
             untrusted_bootstrap: false,
-            old_finality: None,
+            tier: Tier::Finalized,
+            old_pointer: None,
         };
         let rec = Rec(Default::default());
         let mut sent = Sent { files: 0, bytes: 0 };
@@ -1678,13 +2140,14 @@ mod tests {
                 format!("put {}", paths::bootstrap(&s.checkpoint)),
                 "put head/updates/1898".into(),
                 "put head/updates/1899".into(),
+                format!("put {}", paths::OPTIMISTIC),
                 format!("put {LATEST_FILE}"),
-                format!("put {}", paths::FINALITY),
             ]
         );
         assert_eq!(sent.files, 10);
         assert!(s.snapshots[0].complete);
-        assert_eq!(s.finality, Some(B256::with_last_byte(1)));
+        assert_eq!(s.optimistic, Some(B256::with_last_byte(1)));
+        assert_eq!(s.finality, None, "the finality upgrade writes that");
         assert!(s.pending.is_empty(), "both pointers confirmed");
         // Reloaded from disk, as after a restart.
         let mut s = State::load(&root, B256::repeat_byte(9)).unwrap();
@@ -1722,8 +2185,8 @@ mod tests {
                 format!("put {d2}/{MANIFEST_FILE}"),
                 "put blobs/cc".into(),
                 "put head/updates/1899".into(),
+                format!("put {}", paths::OPTIMISTIC),
                 format!("put {LATEST_FILE}"),
-                format!("put {}", paths::FINALITY),
             ]
         );
 
@@ -1821,6 +2284,72 @@ mod tests {
     }
 
     #[test]
+    fn a_state_file_from_before_the_attested_tier_loads() {
+        let root = tmp("compat2");
+        fs::create_dir_all(&root).unwrap();
+        let ck = B256::repeat_byte(9);
+        let (h1, h2) = (B256::with_last_byte(1), B256::with_last_byte(2));
+        // As 2026-11-02's producer wrote it: no optimistic, no
+        // pending_final, no format, snapshots without timestamps, and a
+        // pending write that was of `latest` and `head/finality` together.
+        let old = json!({
+            "checkpoint": ck,
+            "bootstrap_published": true,
+            "updates": {"1898": {"blake3": "ab", "final": true}},
+            "updates_final_local": [1898],
+            "blobs": ["blobs/aa"],
+            "snapshots": [
+                {"block_hash": h1, "block_number": 1, "boundary": 10,
+                 "keys": ["k"], "complete": true, "slice": "1"},
+                {"block_hash": h2, "block_number": 2, "boundary": 20,
+                 "keys": [], "complete": false, "slice": "2"}
+            ],
+            "finality": h1,
+            "latest": h1,
+            "pending": {h2.to_string(): 5}
+        });
+        fs::write(root.join("state.json"), old.to_string()).unwrap();
+        let s = State::load(&root, ck).unwrap();
+        assert_eq!(
+            (s.finality, s.latest, s.optimistic),
+            (Some(h1), Some(h1), None)
+        );
+        assert_eq!(s.snapshots[0].timestamp, 0);
+        assert!(s.snapshots[0].complete && s.updates[&1898].is_final);
+        // Both journals hold the old pending write, so neither pointer's
+        // confirmation alone releases it.
+        assert_eq!((s.pending[&h2], s.pending_final[&h2]), (5, 5));
+        assert_eq!(s.format, STATE_FORMAT);
+        assert_eq!(s.last_boundary(), Some(10));
+        // The confirmed head for the pointer bound is the finalized one
+        // until an attested one exists.
+        assert_eq!(unresolved_pending(&s), vec![h2]);
+        s.save(&root).unwrap();
+        let again = State::load(&root, ck).unwrap();
+        assert_eq!(again, s, "converted once");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gc_spares_what_any_head_pointer_names() {
+        let h = B256::with_last_byte;
+        let mut s = State {
+            snapshots: (1..=8).map(|n| rec(n, true)).collect(),
+            finality: Some(h(5)),
+            optimistic: Some(h(8)),
+            latest: Some(h(8)),
+            ..Default::default()
+        };
+        // Finality trails the attested head by three snapshots: with keep
+        // MIN_KEEP the one it will name next (6) is still there.
+        assert_eq!(gc_plan(&s, MIN_KEEP), vec![h(1), h(2), h(3), h(4)]);
+        s.pending_final.insert(h(2), 0);
+        assert_eq!(gc_plan(&s, MIN_KEEP), vec![h(1), h(3), h(4)]);
+        s.optimistic = Some(h(3));
+        assert_eq!(gc_plan(&s, MIN_KEEP), vec![h(1), h(4)]);
+    }
+
+    #[test]
     fn unresolved_are_the_pending_past_the_confirmed_head() {
         let mut s = State {
             snapshots: (1..=7).map(|n| rec(n, n <= 3)).collect(),
@@ -1865,11 +2394,33 @@ mod tests {
         (checkpoint, hash, number, now)
     }
 
+    /// p1900's bootstrap and updates with 2026-11-03's optimistic update
+    /// (signed in 1901) as the mirror's `head/optimistic`.
+    fn attested(w: &Work) -> (B256, B256, u64, SystemTime) {
+        let (checkpoint, ..) = p1900(w);
+        let dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../head/tests/fixtures/attested"
+        );
+        let read = |f: &str| fs::read(format!("{dir}/{f}")).unwrap();
+        let meta: Value = serde_json::from_slice(&read("meta.json")).unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(meta["now"].as_u64().unwrap());
+        let opt = read("optimistic.json");
+        touch(&w.bucket, paths::OPTIMISTIC, &opt);
+        let fin = read("finality.json");
+        touch(&w.bucket, paths::FINALITY, &fin);
+        let v: Value = serde_json::from_slice(&opt).unwrap();
+        let ex = &v["data"]["attested_header"]["execution"];
+        let hash: B256 = ex["block_hash"].as_str().unwrap().parse().unwrap();
+        let number: u64 = ex["block_number"].as_str().unwrap().parse().unwrap();
+        (checkpoint, hash, number, now)
+    }
+
     #[test]
     fn stuck_pointers_are_retried_for_the_newest_while_its_head_verifies() {
         let root = tmp("retry");
         let w = Work::new(&root).unwrap();
-        let (checkpoint, hash, number, now) = p1900(&w);
+        let (checkpoint, hash, number, now) = attested(&w);
         let rec_of = |h: B256, n: u64, complete: bool| SnapRec {
             block_hash: h,
             block_number: n,
@@ -1877,6 +2428,7 @@ mod tests {
             keys: vec![],
             complete,
             slice: format!("{n}"),
+            timestamp: 0,
         };
         // Confirmed head 1; 2, 3 and 4 and then ours failed at a pointer.
         let mut s = State {
@@ -1889,7 +2441,7 @@ mod tests {
                 rec_of(B256::with_last_byte(4), number - 10, false),
                 rec_of(hash, number, false),
             ],
-            finality: Some(B256::with_last_byte(1)),
+            optimistic: Some(B256::with_last_byte(1)),
             latest: Some(B256::with_last_byte(1)),
             ..Default::default()
         };
@@ -1916,15 +2468,16 @@ mod tests {
             vec![
                 "put head/updates/1898".to_string(),
                 "put head/updates/1899".into(),
+                "put head/updates/1900".into(),
+                format!("put {}", paths::OPTIMISTIC),
                 format!("put {LATEST_FILE}"),
-                format!("put {}", paths::FINALITY),
             ]
         );
         assert_eq!(
             fs::read_to_string(w.bucket.join(LATEST_FILE)).unwrap(),
             hex::encode(hash)
         );
-        assert_eq!((s.finality, s.latest), (Some(hash), Some(hash)));
+        assert_eq!((s.optimistic, s.latest), (Some(hash), Some(hash)));
         // The others' writes began long before: released, and no longer
         // stuck; ours stays pending until a later cycle confirms.
         assert_eq!(s.pending.keys().collect::<Vec<_>>(), vec![&hash]);
@@ -1942,6 +2495,185 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(r, Retry::Skipped(ref e) if e.contains("not the newest")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A manifest in the mirror at `hash` with `state_root`.
+    fn manifest_at(w: &Work, hash: B256, state_root: B256) {
+        let m = csl_eth_store::Manifest {
+            format_version: 1,
+            profile_id: [0; 32],
+            block_hash: hash,
+            block_number: 0,
+            timestamp: 0,
+            state_root,
+            prefix: "1a7".into(),
+            tables: vec![],
+        };
+        touch(
+            &w.bucket,
+            &csl_eth_store::manifest_path(&hash),
+            m.to_json().as_bytes(),
+        );
+    }
+
+    #[test]
+    fn a_finality_upgrade_verifies_the_snapshot_then_writes_finality_journaled() {
+        let root = tmp("upgrade");
+        let w = Work::new(&root).unwrap();
+        let (checkpoint, _, _, now) = attested(&w);
+        let fin: Value =
+            serde_json::from_slice(&fs::read(w.bucket.join(paths::FINALITY)).unwrap()).unwrap();
+        let ex = &fin["data"]["finalized_header"]["execution"];
+        let hash: B256 = ex["block_hash"].as_str().unwrap().parse().unwrap();
+        let root_: B256 = ex["state_root"].as_str().unwrap().parse().unwrap();
+        let number: u64 = ex["block_number"].as_str().unwrap().parse().unwrap();
+        let rec = SnapRec {
+            block_hash: hash,
+            block_number: number,
+            boundary: 0,
+            keys: vec![],
+            complete: true,
+            slice: "s".into(),
+            timestamp: 0,
+        };
+        // No manifest, a manifest with another state root, another block:
+        // each refused.
+        let e = verify_final(&w, checkpoint, &rec, now).unwrap_err();
+        assert!(e.contains("manifest"), "{e}");
+        manifest_at(&w, hash, B256::repeat_byte(1));
+        let e = verify_final(&w, checkpoint, &rec, now).unwrap_err();
+        assert!(e.contains("state root"), "{e}");
+        manifest_at(&w, hash, root_);
+        let other = SnapRec {
+            block_hash: B256::repeat_byte(2),
+            ..rec.clone()
+        };
+        let e = verify_final(&w, checkpoint, &other, now).unwrap_err();
+        assert!(e.contains("not the snapshot's"), "{e}");
+        // The finalized head reaches it through 1898..=1900.
+        assert_eq!(verify_final(&w, checkpoint, &rec, now), Ok(1898..1901));
+        // Its write: journaled before, released only past the grace.
+        let mut s = State {
+            checkpoint,
+            format: STATE_FORMAT,
+            snapshots: vec![rec.clone()],
+            ..Default::default()
+        };
+        let mut sent = Sent { files: 0, bytes: 0 };
+        let fail = FailOn(paths::FINALITY, Rec(Default::default()));
+        assert!(publish_final(&w, &mut s, &fail, hash, 3600, &mut sent).is_err());
+        assert!(s.pending_final.contains_key(&hash) && s.finality.is_none());
+        assert!(!gc_plan(&s, 0).contains(&hash));
+        let ok = Rec(Default::default());
+        publish_final(&w, &mut s, &ok, hash, 3600, &mut sent).unwrap();
+        assert_eq!(s.finality, Some(hash));
+        assert_eq!(
+            ok.0.lock().unwrap().clone(),
+            vec![format!("put {}", paths::FINALITY)]
+        );
+        assert!(s.pending.is_empty(), "the attested journal is untouched");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An FCR probe that has already ended with `outcome`.
+    fn ended_probe(
+        outcome: fcr::Outcome,
+        target: Option<fcr::Target>,
+    ) -> (fcr::Probe, fcr::Report) {
+        struct Never;
+        impl fcr::Rpc for Never {
+            fn block(&self, _: &str) -> Result<fcr::Tip, String> {
+                Err("never".into())
+            }
+        }
+        let mut p = fcr::Probe::start(Never, "rpc.example", Duration::from_millis(10), 0);
+        if let Some(t) = target {
+            p.aim(t);
+        }
+        while p.try_take().is_none() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let r = fcr::Report {
+            outcome,
+            polls: 3,
+            errors: 0,
+            last_error: None,
+            trail_range: Some((40, 44)),
+        };
+        (p, r)
+    }
+
+    #[test]
+    fn head_fcr_goes_up_only_for_the_block_head_optimistic_names() {
+        let root = tmp("fcr");
+        let w = Work::new(&root).unwrap();
+        let ours = B256::with_last_byte(7);
+        let mut s = State {
+            optimistic: Some(ours),
+            format: STATE_FORMAT,
+            ..Default::default()
+        };
+        let report = |hash: B256| csl_eth_head::FcrReport {
+            block_hash: hash,
+            block_number: 7,
+            confirmed_after_secs: 400,
+            trail_blocks: 41,
+            classification: csl_eth_head::FcrClass::of_trail(41),
+            source: "rpc.example".into(),
+            checked_at: 1,
+        };
+        let t = |hash| fcr::Target {
+            number: 7,
+            hash,
+            timestamp: 0,
+        };
+        let rec = Rec(Default::default());
+        let (p, r) = ended_probe(fcr::Outcome::Confirmed(report(ours)), Some(t(ours)));
+        let v = fcr_event(&w, &mut s, &rec, &p, &r);
+        assert_eq!(v["published"], true, "{v}");
+        assert_eq!(v["classification"], "justified_like");
+        assert_eq!(v["source"], "rpc.example");
+        assert_eq!(s.fcr, Some(ours));
+        assert_eq!(
+            rec.0.lock().unwrap().clone(),
+            vec![format!("put {}", paths::FCR)]
+        );
+        let back =
+            csl_eth_head::FcrReport::from_json(&fs::read(w.bucket.join(paths::FCR)).unwrap());
+        assert_eq!(back, Some(report(ours)));
+        // Superseded, unreached or in conflict: logged, not published.
+        let older = B256::with_last_byte(6);
+        for (outcome, why) in [
+            (fcr::Outcome::Confirmed(report(older)), "superseded"),
+            (
+                fcr::Outcome::Unreached {
+                    safe: Some(5),
+                    trail: Some(40),
+                },
+                "",
+            ),
+            (
+                fcr::Outcome::Conflict {
+                    theirs: older,
+                    after_secs: 9,
+                },
+                "",
+            ),
+        ] {
+            let rec = Rec(Default::default());
+            let (p, r) = ended_probe(outcome, Some(t(older)));
+            let v = fcr_event(&w, &mut s, &rec, &p, &r);
+            assert_eq!(v["published"], false, "{v}");
+            assert!(v["why"].as_str().unwrap_or("").contains(why), "{v}");
+            assert!(rec.0.lock().unwrap().is_empty());
+        }
+        // A failing publisher is an error on the line, not a failure.
+        let (p, r) = ended_probe(fcr::Outcome::Confirmed(report(ours)), Some(t(ours)));
+        let fail = FailOn(paths::FCR, Rec(Default::default()));
+        let v = fcr_event(&w, &mut s, &fail, &p, &r);
+        assert_eq!(v["published"], false);
+        assert!(v["error"].as_str().unwrap().contains("timed out"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1966,6 +2698,7 @@ mod tests {
         let w = Work::new(&root).unwrap();
         let mut s = State {
             checkpoint: B256::repeat_byte(9),
+            format: STATE_FORMAT,
             ..Default::default()
         };
         touch(&w.bucket, &paths::bootstrap(&s.checkpoint), b"boot");
@@ -1975,7 +2708,8 @@ mod tests {
             current: 1898,
             verified: 1898..1899,
             untrusted_bootstrap: false,
-            old_finality: None,
+            tier: Tier::Finalized,
+            old_pointer: None,
         };
         let mut sent = Sent { files: 0, bytes: 0 };
         let ok = Rec(Default::default());
@@ -1993,9 +2727,9 @@ mod tests {
             &mut sent,
         )
         .unwrap();
-        // Cycle 2's finality write fails: it may or may not have landed.
+        // Cycle 2's optimistic write fails: it may or may not have landed.
         lay_out(&w, 2, &[], &[(1898, b"u")]);
-        let fail = FailOn(paths::FINALITY, Rec(Default::default()));
+        let fail = FailOn(paths::OPTIMISTIC, Rec(Default::default()));
         assert!(publish(
             &w,
             &mut s,
@@ -2080,7 +2814,8 @@ mod tests {
             current: 1900,
             verified: 0..0,
             untrusted_bootstrap: true,
-            old_finality: Some(b"old".to_vec()),
+            tier: Tier::Finalized,
+            old_pointer: Some(b"old".to_vec()),
         };
         head.discard(&w, &mut s);
         assert!(!w.bucket.join(paths::update(1899)).exists());
@@ -2113,7 +2848,8 @@ mod tests {
                 current: 1900,
                 verified: 0..0,
                 untrusted_bootstrap: false,
-                old_finality: None,
+                tier: Tier::Finalized,
+                old_pointer: None,
             }
         };
         let have = |p: u64| w.bucket.join(paths::update(p)).exists();
