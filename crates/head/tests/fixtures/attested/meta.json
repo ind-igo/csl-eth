@@ -1,0 +1,1 @@
+{"checkpoint": "0xe59d78041964322427cc209a44edcad243487378b78895a6cc0bfa7a7577cf0b", "bootstrap_period": 1898, "signed_period": 1901, "now": 1793712504, "source": "https://lodestar-mainnet.chainsafe.io/eth/v1/beacon/light_client/{optimistic,finality}_update, fetched together; bootstrap and updates 1898-1900 are p1900's"}

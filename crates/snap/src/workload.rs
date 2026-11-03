@@ -1653,7 +1653,8 @@ fn open<D: Driver>(
                     "block_number": head.execution.block_number,
                     "block_hash": head.execution.block_hash,
                     "state_root": head.execution.state_root,
-                    "finality_lag_secs": head.finality_lag_secs,
+                    "tier": head.tier.name(),
+                    "lag_secs": head.lag_secs,
                 })),
             ))
         }

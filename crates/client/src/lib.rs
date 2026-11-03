@@ -57,7 +57,9 @@ pub mod http;
 pub use http::HttpDriver;
 
 pub mod head;
-pub use head::{open_at_head, HeadOpenError, HeadOpener, VerifiedHead};
+pub use head::{
+    open_at_head, open_at_head_with, FcrReport, HeadOpenError, HeadOpener, TierChoice, VerifiedHead,
+};
 
 /// Why a read could not be answered. None of these is evidence of absence.
 #[derive(Clone, Debug, PartialEq, Eq)]

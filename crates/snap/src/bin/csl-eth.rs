@@ -207,7 +207,8 @@ fn head_json(h: &VerifiedHead) -> serde_json::Value {
         "block_hash": h.execution.block_hash,
         "state_root": h.execution.state_root,
         "timestamp": h.execution.timestamp,
-        "finality_lag_secs": h.finality_lag_secs,
+        "tier": h.tier.name(),
+        "lag_secs": h.lag_secs,
     })
 }
 

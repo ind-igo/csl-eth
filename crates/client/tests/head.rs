@@ -4,14 +4,18 @@
 //! makes the same way on files fetched in rounds. Real mainnet objects, the
 //! head crate's fixtures: 2026-10-31's (bootstrap and finality update both
 //! in period 1898) and the producer's of 2026-11-02 (bootstrap in 1898,
-//! finality update signed in 1900), with `now` pinned.
+//! finality update signed in 1900), with `now` pinned; and 2026-11-03's
+//! optimistic and finality updates fetched together (both signed in 1901)
+//! for the choice between the attested and the finalized head.
 
 use alloy_primitives::B256;
 use csl_eth_client::{
-    head::{verify_head, HeadError},
-    open_at_head, Driver, Got, HeadOpenError, Want,
+    head::{verify_head, HeadError, Tier},
+    open_at_head, open_at_head_with, Driver, FcrReport, Got, HeadOpenError, HeadOpener, Pending,
+    TierChoice, Want,
 };
-use csl_eth_head::{paths, verify, Chain, HeadSource};
+use csl_eth_head::{paths, verify, Chain, FcrClass, HeadSource};
+use csl_eth_store::manifest_path;
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Mutex,
@@ -114,11 +118,21 @@ fn edit_json(bytes: &[u8], f: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
     serde_json::to_vec(&v).unwrap()
 }
 
+/// What the finalized tier alone reads first.
 fn head_round(fx: &Fixture) -> BTreeSet<String> {
     set(&[
         paths::bootstrap(&fx.checkpoint),
         paths::FINALITY.to_string(),
     ])
+}
+
+/// What the default opener reads first: both tiers' head updates and the
+/// FCR note beside the bootstrap.
+fn best_round(fx: &Fixture) -> BTreeSet<String> {
+    let mut r = head_round(fx);
+    r.insert(paths::OPTIMISTIC.to_string());
+    r.insert(paths::FCR.to_string());
+    r
 }
 
 #[test]
@@ -127,12 +141,14 @@ fn signed_in_the_bootstraps_period_the_head_is_one_round() {
     let r = open_at_head(&fx.files, fx.checkpoint, fx.now);
     // No snapshot in this bucket: the open verifies the head and stops at
     // the finalized block's manifest.
-    let Err(HeadOpenError::NotAtHead { finalized, .. }) = r else {
+    let Err(HeadOpenError::NotAtHead { head, tier, .. }) = r else {
         panic!("{:?}", r.err());
     };
-    assert_eq!(finalized.block_number, 26_310_853);
+    assert_eq!(head.block_number, 26_310_853);
+    // No `head/optimistic` in this bucket: the finalized head.
+    assert_eq!(tier, Tier::Finalized);
     let rounds = fx.files.rounds();
-    assert_eq!(rounds[0], head_round(&fx));
+    assert_eq!(rounds[0], best_round(&fx));
     // Bootstrap and finality update in 1898: no update between, and the
     // 1897 and 1898 files beside them are never asked for.
     assert!(
@@ -146,12 +162,12 @@ fn signed_in_the_bootstraps_period_the_head_is_one_round() {
 fn two_periods_on_the_updates_between_are_the_second_round() {
     let fx = fixture_1900();
     let r = open_at_head(&fx.files, fx.checkpoint, fx.now);
-    let Err(HeadOpenError::NotAtHead { finalized, .. }) = r else {
+    let Err(HeadOpenError::NotAtHead { head, .. }) = r else {
         panic!("{:?}", r.err());
     };
-    assert_eq!(finalized.block_number, 26_327_404);
+    assert_eq!(head.block_number, 26_327_404);
     let rounds = fx.files.rounds();
-    assert_eq!(rounds[0], head_round(&fx));
+    assert_eq!(rounds[0], best_round(&fx));
     // 1898 and 1899; 1900's update is in the bucket and not asked for.
     assert_eq!(rounds[1], set(&[paths::update(1898), paths::update(1899)]));
     assert!(
@@ -173,7 +189,7 @@ fn a_stale_bucket_is_refused_in_one_round() {
             current: 1900
         }))
     );
-    assert_eq!(fx.files.rounds(), vec![head_round(&fx)]);
+    assert_eq!(fx.files.rounds(), vec![best_round(&fx)]);
 }
 
 #[test]
@@ -362,4 +378,283 @@ fn every_rejection_is_the_same_through_the_opener() {
         let rounds = fx.files.rounds().len();
         assert!(rounds <= 2, "{name}: {rounds} rounds");
     }
+}
+
+// The attested tier.
+
+const ATTESTED_BLOCK: u64 = 26_334_572;
+const FINALIZED_BLOCK: u64 = 26_334_487;
+
+/// p1900's bootstrap and updates with 2026-11-03's optimistic and finality
+/// updates, both signed in 1901.
+fn fixture_attested() -> Fixture {
+    let mut fx = load(&format!("{FIX}/p1900"), &[1898, 1899, 1900]);
+    let dir = format!("{FIX}/attested");
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(format!("{dir}/meta.json")).unwrap()).unwrap();
+    fx.now = SystemTime::UNIX_EPOCH + Duration::from_secs(meta["now"].as_u64().unwrap());
+    for (rel, file) in [
+        (paths::OPTIMISTIC, "optimistic.json"),
+        (paths::FINALITY, "finality.json"),
+    ] {
+        fx.files.files.insert(
+            rel.to_string(),
+            std::fs::read(format!("{dir}/{file}")).unwrap(),
+        );
+    }
+    fx
+}
+
+fn hash_of(fx: &Fixture, rel: &str, header: &str) -> B256 {
+    let v: serde_json::Value = serde_json::from_slice(&fx.files.files[rel]).unwrap();
+    v["data"][header]["execution"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+fn attested_hash(fx: &Fixture) -> B256 {
+    hash_of(fx, paths::OPTIMISTIC, "attested_header")
+}
+
+fn finalized_hash(fx: &Fixture) -> B256 {
+    hash_of(fx, paths::FINALITY, "finalized_header")
+}
+
+/// A manifest file at `hash`: enough for the opener to choose that head;
+/// the open itself then fails on the bytes, which is past what these
+/// tests are about.
+fn snapshot_at(fx: &mut Fixture, hash: B256) {
+    fx.files
+        .files
+        .insert(manifest_path(&hash), b"not a manifest".to_vec());
+}
+
+/// What an opener ended with: the head it chose, the FCR note it kept and
+/// its result.
+type Ended = (
+    Option<(Tier, u64)>,
+    Option<FcrReport>,
+    Result<(), HeadOpenError>,
+);
+
+/// Run an opener to its end.
+fn open_with(fx: &Fixture, choice: TierChoice) -> Ended {
+    let mut o = HeadOpener::with_tier(&fx.files, fx.checkpoint, fx.now, choice);
+    let r = loop {
+        match o.try_open() {
+            Ok(r) => break r.map(|_| ()),
+            Err(Pending) => o.round(),
+        }
+    };
+    (
+        o.head().map(|h| (h.tier, h.execution.block_number)),
+        o.fcr().cloned(),
+        r,
+    )
+}
+
+#[test]
+fn the_attested_head_is_preferred_when_its_snapshot_is_there() {
+    let mut fx = fixture_attested();
+    let (a, f) = (attested_hash(&fx), finalized_hash(&fx));
+    snapshot_at(&mut fx, a);
+    snapshot_at(&mut fx, f);
+    let (head, _, r) = open_with(&fx, TierChoice::Best);
+    assert_eq!(head, Some((Tier::Attested, ATTESTED_BLOCK)));
+    assert!(matches!(r, Err(HeadOpenError::Open(_))), "{r:?}");
+    let rounds = fx.files.rounds();
+    assert_eq!(rounds[0], best_round(&fx));
+    // One round of updates for both heads: they share 1898..=1900.
+    assert_eq!(
+        rounds[1],
+        set(&[
+            paths::update(1898),
+            paths::update(1899),
+            paths::update(1900)
+        ])
+    );
+    // Both manifests in one round: falling back would have cost nothing.
+    assert_eq!(rounds[2], set(&[manifest_path(&a), manifest_path(&f)]));
+}
+
+#[test]
+fn the_finalized_head_is_the_fallback() {
+    type Tamper = Box<dyn Fn(&mut Fixture)>;
+    let cases: Vec<(&str, Tamper)> = vec![
+        (
+            "attested snapshot gone",
+            Box::new(|fx| {
+                let f = finalized_hash(fx);
+                snapshot_at(fx, f);
+            }),
+        ),
+        (
+            "no head/optimistic",
+            Box::new(|fx| {
+                let f = finalized_hash(fx);
+                snapshot_at(fx, f);
+                fx.files.files.remove(paths::OPTIMISTIC);
+            }),
+        ),
+        (
+            "attested state root forged",
+            Box::new(|fx| {
+                let (a, f) = (attested_hash(fx), finalized_hash(fx));
+                snapshot_at(fx, a);
+                snapshot_at(fx, f);
+                let b = fx.files.files.get_mut(paths::OPTIMISTIC).unwrap();
+                *b = edit_json(b, |v| {
+                    v["data"]["attested_header"]["execution"]["state_root"] =
+                        format!("{}", B256::repeat_byte(0x42)).into();
+                });
+            }),
+        ),
+        (
+            "head/optimistic not an optimistic update",
+            Box::new(|fx| {
+                let (a, f) = (attested_hash(fx), finalized_hash(fx));
+                snapshot_at(fx, a);
+                snapshot_at(fx, f);
+                let other = std::fs::read(format!("{FIX}/p1900/finality.json")).unwrap();
+                fx.files.files.insert(paths::OPTIMISTIC.to_string(), other);
+            }),
+        ),
+    ];
+    for (name, tamper) in cases {
+        let mut fx = fixture_attested();
+        tamper(&mut fx);
+        let (head, fcr, r) = open_with(&fx, TierChoice::Best);
+        assert_eq!(head, Some((Tier::Finalized, FINALIZED_BLOCK)), "{name}");
+        assert!(matches!(r, Err(HeadOpenError::Open(_))), "{name}: {r:?}");
+        assert_eq!(fcr, None, "{name}");
+        assert!(
+            fx.files.rounds().len() <= 4,
+            "{name}: {:?}",
+            fx.files.rounds()
+        );
+    }
+}
+
+#[test]
+fn neither_snapshot_present_names_the_finalized_head() {
+    let fx = fixture_attested();
+    let r = open_at_head(&fx.files, fx.checkpoint, fx.now);
+    let Err(HeadOpenError::NotAtHead { head, tier, .. }) = r else {
+        panic!("{:?}", r.err());
+    };
+    assert_eq!(
+        (tier, head.block_number),
+        (Tier::Finalized, FINALIZED_BLOCK)
+    );
+    // Forced to the attested tier, the attested head.
+    let r = open_at_head_with(&fx.files, fx.checkpoint, fx.now, TierChoice::Attested);
+    let Err(HeadOpenError::NotAtHead { head, tier, .. }) = r else {
+        panic!("{:?}", r.err().map(|e| e.to_string()));
+    };
+    assert_eq!((tier, head.block_number), (Tier::Attested, ATTESTED_BLOCK));
+}
+
+#[test]
+fn forced_finalized_never_reads_the_attested_files() {
+    let mut fx = fixture_attested();
+    let (a, f) = (attested_hash(&fx), finalized_hash(&fx));
+    snapshot_at(&mut fx, a);
+    snapshot_at(&mut fx, f);
+    let (head, _, _) = open_with(&fx, TierChoice::Finalized);
+    assert_eq!(head, Some((Tier::Finalized, FINALIZED_BLOCK)));
+    let rounds = fx.files.rounds();
+    assert_eq!(rounds[0], head_round(&fx));
+    assert!(rounds
+        .iter()
+        .flatten()
+        .all(|f| f != paths::OPTIMISTIC && f != paths::FCR));
+    assert_eq!(rounds[2], set(&[manifest_path(&f)]));
+}
+
+#[test]
+fn before_any_finality_update_the_attested_head_opens_alone() {
+    // A producer's first minutes: optimistic published, finality not yet.
+    let mut fx = fixture_attested();
+    let a = attested_hash(&fx);
+    snapshot_at(&mut fx, a);
+    fx.files.files.remove(paths::FINALITY);
+    let (head, _, _) = open_with(&fx, TierChoice::Best);
+    assert_eq!(head, Some((Tier::Attested, ATTESTED_BLOCK)));
+    // And when the attested head fails too, its error, not "no finality".
+    let mut fx = fixture_attested();
+    fx.files.files.remove(paths::FINALITY);
+    fx.now = period_start(1903) + Duration::from_secs(60);
+    let r = open_at_head(&fx.files, fx.checkpoint, fx.now);
+    assert_eq!(
+        r.err(),
+        Some(HeadOpenError::Head(HeadError::Stale {
+            signed: 1901,
+            current: 1903
+        }))
+    );
+}
+
+fn fcr_note(fx: &Fixture, hash: B256, number: u64) -> Vec<u8> {
+    let _ = fx;
+    FcrReport {
+        block_hash: hash,
+        block_number: number,
+        confirmed_after_secs: 13,
+        trail_blocks: 2,
+        classification: FcrClass::of_trail(2),
+        source: "rpc.example".into(),
+        checked_at: 1_793_712_520,
+    }
+    .to_json()
+}
+
+#[test]
+fn the_fcr_note_rides_only_on_the_attested_head_it_names() {
+    let mut fx = fixture_attested();
+    let (a, f) = (attested_hash(&fx), finalized_hash(&fx));
+    snapshot_at(&mut fx, a);
+    snapshot_at(&mut fx, f);
+    let note = fcr_note(&fx, a, ATTESTED_BLOCK);
+    fx.files.files.insert(paths::FCR.to_string(), note);
+    let (_, fcr, _) = open_with(&fx, TierChoice::Best);
+    let fcr = fcr.expect("attached");
+    assert_eq!(fcr.classification, FcrClass::FcrLike);
+    assert_eq!(fcr.source, "rpc.example");
+    // About another block (an older snapshot's report): ignored.
+    for (hash, number) in [(f, FINALIZED_BLOCK), (a, ATTESTED_BLOCK + 1)] {
+        let note = fcr_note(&fx, hash, number);
+        fx.files.files.insert(paths::FCR.to_string(), note);
+        let (head, fcr, _) = open_with(&fx, TierChoice::Best);
+        assert_eq!(head, Some((Tier::Attested, ATTESTED_BLOCK)));
+        assert_eq!(fcr, None, "{hash} {number}");
+    }
+    // Not a report: ignored, and the head opens as before.
+    fx.files
+        .files
+        .insert(paths::FCR.to_string(), b"{\"block_hash\":1}".to_vec());
+    let (head, fcr, _) = open_with(&fx, TierChoice::Best);
+    assert_eq!((head, fcr), (Some((Tier::Attested, ATTESTED_BLOCK)), None));
+    // A finalized head never carries it, even at the named block.
+    let note = fcr_note(&fx, f, FINALIZED_BLOCK);
+    fx.files.files.insert(paths::FCR.to_string(), note);
+    fx.files.files.remove(&manifest_path(&a));
+    let (head, fcr, _) = open_with(&fx, TierChoice::Best);
+    assert_eq!(
+        (head, fcr),
+        (Some((Tier::Finalized, FINALIZED_BLOCK)), None)
+    );
+}
+
+#[test]
+fn fcr_classification_is_by_trail() {
+    assert_eq!(FcrClass::of_trail(0), FcrClass::FcrLike);
+    assert_eq!(FcrClass::of_trail(4), FcrClass::FcrLike);
+    assert_eq!(FcrClass::of_trail(5), FcrClass::JustifiedLike);
+    assert_eq!(FcrClass::of_trail(40), FcrClass::JustifiedLike);
+    let r = FcrReport::from_json(&fcr_note(&fixture(), B256::repeat_byte(9), 7)).unwrap();
+    assert_eq!(r.block_hash, B256::repeat_byte(9));
+    let v: serde_json::Value = serde_json::from_slice(&r.to_json()).unwrap();
+    assert_eq!(v["classification"], "fcr_like");
 }

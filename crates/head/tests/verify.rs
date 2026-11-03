@@ -5,10 +5,15 @@
 //! `fixtures/p1900/`, the producer's first published head of 2026-11-02, a
 //! bootstrap in 1898 and a finality update signed in 1900, with the period
 //! updates for 1898, 1899 and 1900. `now` is pinned to each fetch time so
-//! the slot arithmetic is stable.
+//! the slot arithmetic is stable. And `fixtures/attested/`, an optimistic
+//! update and a finality update fetched together on 2026-11-03, both signed
+//! in 1901, over p1900's bootstrap and updates: the attested tier.
 
 use alloy_primitives::B256;
-use csl_eth_head::{has_quorum, paths, verify, Chain, HeadError, HeadSource, COMMITTEE_SIZE};
+use csl_eth_head::{
+    has_quorum, paths, update_periods_for, verify, verify_attested, Chain, HeadError, HeadSource,
+    Tier, COMMITTEE_SIZE,
+};
 use std::{
     collections::HashMap,
     time::{Duration, SystemTime},
@@ -97,9 +102,9 @@ fn the_head_verifies_from_the_checkpoint_alone() {
     );
     assert_ne!(h.execution.state_root, B256::ZERO);
     assert!(
-        h.finality_lag_secs > 12 * 60 && h.finality_lag_secs < 40 * 60,
+        h.lag_secs > 12 * 60 && h.lag_secs < 40 * 60,
         "lag {}",
-        h.finality_lag_secs
+        h.lag_secs
     );
 }
 
@@ -201,11 +206,7 @@ fn a_frozen_finality_file_shows_as_lag_not_as_fresh_state() {
     let fx = fixture();
     let later = fx.now + Duration::from_secs(6 * 3600);
     let h = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, later).unwrap();
-    assert!(
-        h.finality_lag_secs > 6 * 3600,
-        "lag {}",
-        h.finality_lag_secs
-    );
+    assert!(h.lag_secs > 6 * 3600, "lag {}", h.lag_secs);
     assert_eq!(h.execution.block_number, 26_310_853);
 }
 
@@ -424,4 +425,215 @@ fn finality_needs_two_thirds_of_the_committee() {
     let fx = fixture();
     let h = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now).unwrap();
     assert!(has_quorum(h.participants));
+}
+
+/// The 2026-11-03 set: p1900's bootstrap and updates, an optimistic update
+/// and a finality update fetched together, both signed in period 1901.
+fn fixture_attested() -> Fixture {
+    let dir = format!("{FIX}/attested");
+    let mut fx = load(&format!("{FIX}/p1900"), &[1898, 1899, 1900]);
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(format!("{dir}/meta.json")).unwrap()).unwrap();
+    assert_eq!(
+        meta["checkpoint"]
+            .as_str()
+            .unwrap()
+            .parse::<B256>()
+            .unwrap(),
+        fx.checkpoint
+    );
+    fx.now = SystemTime::UNIX_EPOCH + Duration::from_secs(meta["now"].as_u64().unwrap());
+    fx.files.0.insert(
+        paths::OPTIMISTIC.to_string(),
+        std::fs::read(format!("{dir}/optimistic.json")).unwrap(),
+    );
+    fx.files.0.insert(
+        paths::FINALITY.to_string(),
+        std::fs::read(format!("{dir}/finality.json")).unwrap(),
+    );
+    fx
+}
+
+fn optimistic(fx: &mut Fixture, f: impl FnOnce(&mut serde_json::Value)) {
+    let b = fx.files.0.get_mut(paths::OPTIMISTIC).unwrap();
+    *b = edit_json(b, f);
+}
+
+fn reads_attested(fx: &Fixture, now: SystemTime) -> Vec<String> {
+    struct Log<'a>(&'a Files, std::cell::RefCell<Vec<String>>);
+    impl HeadSource for Log<'_> {
+        fn read_head(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
+            self.1.borrow_mut().push(rel.to_string());
+            self.0.read_head(rel)
+        }
+    }
+    let log = Log(&fx.files, Default::default());
+    let _ = verify_attested(&log, &Chain::mainnet(), fx.checkpoint, now);
+    log.1.into_inner()
+}
+
+#[test]
+fn the_attested_head_verifies_through_the_same_walk() {
+    let fx = fixture_attested();
+    let h = verify_attested(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now).unwrap();
+    assert_eq!(h.tier, Tier::Attested);
+    assert_eq!(h.slot, 15_574_038);
+    assert_eq!(h.period, 1901);
+    assert_eq!(
+        h.updates_applied, 3,
+        "1898, 1899 and 1900 hand over to 1901's committee"
+    );
+    assert_eq!(h.execution.block_number, 26_334_572);
+    assert!(has_quorum(h.participants), "{}", h.participants);
+    assert!(
+        h.lag_secs < 60,
+        "fetched a slot or two after the block: {}",
+        h.lag_secs
+    );
+    assert_eq!(
+        reads_attested(&fx, fx.now),
+        vec![
+            paths::bootstrap(&fx.checkpoint),
+            paths::OPTIMISTIC.to_string(),
+            paths::update(1898),
+            paths::update(1899),
+            paths::update(1900),
+        ]
+    );
+    // The finality update fetched with it: the same walk, a block about
+    // two epochs older, and the finalized tier.
+    let f = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now).unwrap();
+    assert_eq!(f.tier, Tier::Finalized);
+    assert_eq!(f.execution.block_number, 26_334_487);
+    assert!(
+        h.slot > f.slot && h.lag_secs + 12 * 60 < f.lag_secs,
+        "{} vs {}",
+        h.lag_secs,
+        f.lag_secs
+    );
+    // What each tier reads in its second round, from the bytes of the first.
+    let b = &fx.files.0[&paths::bootstrap(&fx.checkpoint)];
+    let o = &fx.files.0[paths::OPTIMISTIC];
+    assert_eq!(
+        update_periods_for(
+            Tier::Attested,
+            b,
+            o,
+            fx.checkpoint,
+            &Chain::mainnet(),
+            fx.now
+        ),
+        Ok(1898..1901)
+    );
+}
+
+#[test]
+fn a_forged_attested_state_root_fails_the_execution_branch() {
+    for field in ["state_root", "block_hash", "block_number"] {
+        let mut fx = fixture_attested();
+        optimistic(&mut fx, |v| {
+            let x = &mut v["data"]["attested_header"]["execution"][field];
+            *x = if field == "block_number" {
+                "1".into()
+            } else {
+                format!("{}", B256::repeat_byte(0x42)).into()
+            };
+        });
+        let r = verify_attested(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
+        assert!(matches!(r, Err(HeadError::Attested(_))), "{field}: {r:?}");
+    }
+}
+
+#[test]
+fn an_attested_head_needs_two_thirds_of_the_committee() {
+    // A real subquorum signature cannot be made without keys. Helios accepts
+    // any nonzero participation for an optimistic update, so the check is
+    // ours: with the bits cut to 8 the aggregate key no longer matches and
+    // the signature fails first; the rule itself is `has_quorum`, applied
+    // after a good signature.
+    let mut fx = fixture_attested();
+    optimistic(&mut fx, |v| {
+        let bits = v["data"]["sync_aggregate"]["sync_committee_bits"]
+            .as_str()
+            .unwrap();
+        let n = bits.trim_start_matches("0x").len() / 2;
+        v["data"]["sync_aggregate"]["sync_committee_bits"] =
+            format!("0xff{}", "00".repeat(n - 1)).into();
+    });
+    let r = verify_attested(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
+    assert!(matches!(r, Err(HeadError::Attested(_))), "{r:?}");
+    let mut fx = fixture_attested();
+    optimistic(&mut fx, |v| {
+        let bits = v["data"]["sync_aggregate"]["sync_committee_bits"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut raw = hex::decode(bits.trim_start_matches("0x")).unwrap();
+        raw[5] ^= 0x10;
+        v["data"]["sync_aggregate"]["sync_committee_bits"] =
+            format!("0x{}", hex::encode(raw)).into();
+    });
+    let r = verify_attested(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
+    assert!(matches!(r, Err(HeadError::Attested(_))), "{r:?}");
+}
+
+#[test]
+fn an_attested_head_without_the_committee_handover_is_refused() {
+    // Signed in 1901: 1900's update carries 1901's committee. Without it, or
+    // with 1899's bytes in its place, the walk stops.
+    let mut fx = fixture_attested();
+    fx.files.0.remove(&paths::update(1900));
+    let r = verify_attested(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
+    assert_eq!(r, Err(HeadError::Missing(paths::update(1900))));
+    let mut fx = fixture_attested();
+    let u = fx.files.0[&paths::update(1899)].clone();
+    fx.files.0.insert(paths::update(1900), u);
+    let r = verify_attested(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
+    assert!(
+        matches!(r, Err(HeadError::Update { period: 1900, .. })),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn a_stale_or_future_attested_head_is_refused() {
+    let fx = fixture_attested();
+    let later = period_start(1903) + Duration::from_secs(60);
+    let r = verify_attested(&fx.files, &Chain::mainnet(), fx.checkpoint, later);
+    assert_eq!(
+        r,
+        Err(HeadError::Stale {
+            signed: 1901,
+            current: 1903
+        })
+    );
+    assert!(
+        reads_attested(&fx, later)
+            .iter()
+            .all(|f| !f.starts_with("head/updates/")),
+        "refused before any update is read"
+    );
+    // Still good in the next period, as lag.
+    let next = period_start(1902) + Duration::from_secs(3600);
+    let h = verify_attested(&fx.files, &Chain::mainnet(), fx.checkpoint, next).unwrap();
+    assert!(h.lag_secs > 3600);
+    let early = fx.now - Duration::from_secs(24 * 3600);
+    let r = verify_attested(&fx.files, &Chain::mainnet(), fx.checkpoint, early);
+    assert!(matches!(r, Err(HeadError::Attested(_))), "{r:?}");
+}
+
+#[test]
+fn an_attested_header_at_slot_zero_or_missing_is_not_a_head() {
+    let mut fx = fixture_attested();
+    optimistic(&mut fx, |v| {
+        v["data"]["attested_header"]["beacon"]["slot"] = "0".into();
+    });
+    let r = verify_attested(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
+    assert!(matches!(r, Err(HeadError::Attested(_))), "{r:?}");
+    let mut fx = fixture_attested();
+    fx.files.0.remove(paths::OPTIMISTIC);
+    let r = verify_attested(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now);
+    assert_eq!(r, Err(HeadError::Missing(paths::OPTIMISTIC.to_string())));
+    // The finalized tier does not read it at all.
+    assert!(verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now).is_ok());
 }
