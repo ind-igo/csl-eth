@@ -7,7 +7,7 @@
 // happened (replays may slow the clock down, and say so).
 
 import { drive, loadWasm, type ClientLike, type DriveHooks, type WasmModule } from "./client.ts";
-import { fcrLine, tierLine, tierParam } from "./head.ts";
+import { fcrLine, tierChoice, tierLine, tierParam } from "./head.ts";
 import type { Head, Need, ReadResult, TableInfo, TamperTarget } from "./protocol.ts";
 import { BucketView, checkedPages, type Focus } from "./viz/bucket.ts";
 import { renderChain } from "./viz/chain.ts";
@@ -127,7 +127,7 @@ function readConfig(): Config {
     checkpoint: el.checkpoint.value.trim(),
     prefetch: Number(el.prefetch.value),
     topLevels: Number(el.toplevels.value),
-    tier: el.tier.value === "finalized" ? "finalized" : "best",
+    tier: tierChoice(el.tier.value),
   };
 }
 

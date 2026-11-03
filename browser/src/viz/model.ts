@@ -5,6 +5,7 @@
 // the scene began, on the clock `performance.now()` keeps.
 
 import type { Head, ReadResult, RequestLog, StepLog, TableInfo, TraceNode } from "../protocol.ts";
+import type { TierChoice } from "../head.ts";
 
 /// What a scene's client was opened with: fixed when it was opened, so a
 /// scene never mixes in settings edited since.
@@ -14,7 +15,7 @@ export interface Config {
   prefetch: number;
   topLevels: number;
   /// "best" (the attested head when newer) or "finalized".
-  tier: "best" | "finalized";
+  tier: TierChoice;
 }
 
 /// A page of a run file: page 0 (the header and top model), a data page

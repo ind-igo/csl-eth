@@ -103,7 +103,7 @@
         <label class="wide">weak-subjectivity checkpoint (beacon block root)<input id="checkpoint" class="mono" /></label>
         <label class="narrow">pages each side<input id="prefetch" type="number" min="0" max="8" value="1" /></label>
         <label class="narrow">top levels<input id="toplevels" type="number" min="0" max="9" value="4" /></label>
-        <label class="narrow" title="The attested head (signed by the sync committee a few minutes ago, not final) when it is newer and its snapshot is there, else the finalized one; or only the finalized one. ?tier=finalized in the URL sets it.">head<select id="tier"><option value="best">attested if newer</option><option value="finalized">finalized only</option></select></label>
+        <label class="narrow" title="The attested head (signed by the sync committee a few minutes ago, not final) when it is newer and its snapshot opens, else the finalized one; or only the finalized one, or only the attested one. ?tier=finalized or ?tier=attested in the URL sets it.">head<select id="tier"><option value="best">attested if newer</option><option value="finalized">finalized only</option><option value="attested">attested only</option></select></label>
         <label class="check" title="Read the content-addressed way instead: every trie node fetched by its hash, one dependent round each. Same files, same proof; this is the baseline the path-keyed read is measured against."><input id="baseline" type="checkbox" /> baseline (by hash, serial)</label>
         <button id="open">Open</button>
       </div>

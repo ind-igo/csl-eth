@@ -22,7 +22,15 @@ export function fcrLine(f: Fcr | null | undefined): string | null {
     : `safe per ${f.source} (justified, not fast confirmation; not verified by this client)`;
 }
 
-/// `?tier=finalized` forces the finalized head; anything else is the default.
-export function tierParam(params: URLSearchParams): "best" | "finalized" {
-  return params.get("tier") === "finalized" ? "finalized" : "best";
+export type TierChoice = "best" | "finalized" | "attested";
+
+/// `?tier=finalized` or `?tier=attested` forces that head (the open is
+/// refused when it cannot be opened); anything else is the default.
+export function tierParam(params: URLSearchParams): TierChoice {
+  return tierChoice(params.get("tier"));
+}
+
+/// A select's or a query's value as a tier choice, "best" when it is neither forced tier.
+export function tierChoice(v: string | null): TierChoice {
+  return v === "finalized" || v === "attested" ? v : "best";
 }
