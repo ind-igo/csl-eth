@@ -76,7 +76,7 @@ use alloy_primitives::{keccak256, B256};
 use clap::Args as ClapArgs;
 use csl_eth_client::{open_at_head_with, DirDriver, Read, TierChoice};
 use csl_eth_head::{
-    fetch::{Beacon, UpdateWatch},
+    fetch::{Beacon, Seen, UpdateWatch},
     paths, verify_tier, Chain, DirSource, Tier,
 };
 use csl_eth_store::{produce_with, ProduceOptions, LATEST_FILE, MANIFEST_FILE};
@@ -701,10 +701,53 @@ impl Work {
 /// and its upgrades, and the FCR probes of published snapshots.
 struct Side {
     finality: UpdateWatch,
-    /// Snapshots a finality upgrade failed for, and when to try again.
-    failed: HashMap<B256, Instant>,
+    upgrades: Upgrades,
     fcr: Option<fcr::Source>,
     probes: Vec<fcr::Probe>,
+}
+
+/// What a cycle watches from its start: the optimistic watch, and the FCR
+/// probe when there is a source. They are started at the cycle's start by
+/// a thread of their own, not by the loop, which may be inside side work
+/// then (a finality upgrade or an FCR note, each a publisher call or more
+/// with a deadline of minutes): the optimistic update attesting the
+/// boundary's block is served for about a slot, and a watch started late
+/// would miss it. The cycle itself may start late; the fetch's pivot is
+/// the boundary's block whenever it starts.
+struct Lookouts(std::thread::JoinHandle<(UpdateWatch, Option<fcr::Probe>)>);
+
+impl Lookouts {
+    fn start_at(args: &Args, fcr: Option<fcr::Source>, target: u64, start: u64) -> Lookouts {
+        let beacon = args.beacon.clone();
+        let every = Duration::from_secs(args.optimistic_poll_secs);
+        let fcr_every = Duration::from_secs(args.fcr_poll_secs);
+        let fcr_until_ms = (target + args.fcr_wait_secs) * 1000;
+        Lookouts(std::thread::spawn(move || {
+            while now_ms() < start * 1000 {
+                let left = (start * 1000).saturating_sub(now_ms());
+                std::thread::sleep(Duration::from_millis(left.min(1000)));
+            }
+            let watch = UpdateWatch::start_tier(&beacon, Tier::Attested, every);
+            let probe = fcr.map(|src| {
+                let host = src.host().to_string();
+                fcr::Probe::start(
+                    fcr::Http::new(src, Duration::from_secs(10)),
+                    &host,
+                    fcr_every,
+                    fcr_until_ms,
+                )
+            });
+            (watch, probe)
+        }))
+    }
+
+    /// The two, once started (at once, past the start).
+    fn take(self) -> Result<(UpdateWatch, Option<fcr::Probe>), Failed> {
+        self.0.join().map_err(|_| Failed {
+            step: "attested",
+            error: "the thread starting the optimistic watch panicked".into(),
+        })
+    }
 }
 
 /// Run the loop (or one cycle with `--once`).
@@ -728,7 +771,7 @@ pub fn run(args: Args) -> Result<(), String> {
     );
     let mut side = Side {
         finality: UpdateWatch::start(&args.beacon, Duration::from_secs(args.poll_secs)),
-        failed: HashMap::new(),
+        upgrades: Upgrades::default(),
         fcr,
         probes: Vec::new(),
     };
@@ -747,6 +790,7 @@ pub fn run(args: Args) -> Result<(), String> {
             wait_secs = start.saturating_sub(now_secs()),
             "next cycle at the epoch boundary"
         );
+        let lookouts = Lookouts::start_at(&args, side.fcr.clone(), target, start);
         while now_secs() < start {
             tend(&args, &work, &mut state, &publisher, &mut side);
             let left = start.saturating_sub(now_secs());
@@ -755,7 +799,7 @@ pub fn run(args: Args) -> Result<(), String> {
         let mut line = Map::new();
         line.insert("event".into(), json!("cycle"));
         let r = cycle(
-            &args, &work, &mut state, &publisher, &mut side, target, &mut line,
+            &args, &work, &mut state, &publisher, &mut side, lookouts, target, &mut line,
         );
         // Garbage is collected after every cycle: a failed one leaves a
         // built snapshot and a slice behind, and may have published part
@@ -823,9 +867,110 @@ fn tend(args: &Args, work: &Work, state: &mut State, p: &dyn Publish, side: &mut
     }
 }
 
-/// The finality update the watch holds for the newest published snapshot
-/// past the one `head/finality` names, made that snapshot's finalized
-/// head: laid out, verified to its block and state root, published.
+/// The finality upgrades' memory between attempts.
+#[derive(Default)]
+struct Upgrades {
+    /// Snapshots an upgrade failed for, and when to try again (from when
+    /// the attempt ended).
+    failed: HashMap<B256, Instant>,
+    /// The newest unresolved `head/finality` write whose retry found the
+    /// mirror's finalized head no longer reaching it: while it is the
+    /// newest, the bound on unresolved ones is lifted.
+    unreachable: Option<B256>,
+}
+
+/// What a finality upgrade attempts.
+enum Upgrade {
+    /// A snapshot finality has named, with the watch's update for it.
+    New(SnapRec, Seen),
+    /// The newest unresolved one, written again; how many are unresolved.
+    Retry(SnapRec, usize),
+}
+
+impl Upgrades {
+    /// The newest complete snapshot past the one `head/finality` names
+    /// that `seen` (the watch) holds a finality update for.
+    ///
+    /// Each attempt that verifies journals its snapshot in `pending_final`
+    /// before the write, and a write that fails may still land, so the
+    /// entry stays until a confirmed write begun past its grace releases
+    /// it. While `head/finality` writes keep failing, finality naming newer
+    /// snapshots would journal one more each time, all kept. So past
+    /// [`MAX_UNRESOLVED`] unresolved entries no new one is journaled: the
+    /// newest of them is written again, with the update the mirror holds
+    /// for it (its last attempt laid it out, and no other attempt has
+    /// verified since). When the mirror's finalized head no longer reaches
+    /// it (gone stale, a day or two on), it can never be written, and one
+    /// newer snapshot is let in, as the cycle does for its pointers: under
+    /// a failure that persists, the entries grow by one per head lifetime,
+    /// not one per upgrade.
+    fn next(
+        &self,
+        state: &State,
+        now: Instant,
+        seen: impl Fn(&B256) -> Option<Seen>,
+    ) -> Option<Upgrade> {
+        let due = |h: &B256| self.failed.get(h).is_none_or(|t| now >= *t);
+        let stuck = unresolved_final(state);
+        if stuck.len() > MAX_UNRESOLVED && self.unreachable != Some(stuck[0]) {
+            if !due(&stuck[0]) {
+                return None;
+            }
+            // Collection keeps every journaled snapshot; one missing is let
+            // past like one the head no longer reaches.
+            if let Some(rec) = state.snapshots.iter().find(|s| s.block_hash == stuck[0]) {
+                return Some(Upgrade::Retry(rec.clone(), stuck.len()));
+            }
+        }
+        let confirmed = state
+            .finality
+            .and_then(|h| state.snapshots.iter().find(|s| s.block_hash == h))
+            .map(|s| s.block_number);
+        state
+            .snapshots
+            .iter()
+            .filter(|s| s.complete && confirmed.is_none_or(|c| s.block_number > c))
+            .filter(|s| due(&s.block_hash))
+            .filter_map(|s| seen(&s.block_hash).map(|f| (s.clone(), f)))
+            .max_by_key(|(s, _)| s.block_number)
+            .map(|(s, f)| Upgrade::New(s, f))
+    }
+
+    /// An attempt for `rec` ended with `r`, at `now`.
+    fn ended(
+        &mut self,
+        state: &State,
+        rec: &SnapRec,
+        retry: bool,
+        r: Result<(), &Failed>,
+        now: Instant,
+    ) {
+        match r {
+            Ok(()) => {
+                // A failure of this snapshot or an older one is moot now.
+                let n = rec.block_number;
+                self.failed.retain(|h, _| {
+                    state
+                        .snapshots
+                        .iter()
+                        .any(|s| s.block_hash == *h && s.block_number > n)
+                });
+                self.unreachable = None;
+            }
+            Err(f) => {
+                if retry && f.step == "verify" {
+                    self.unreachable = Some(rec.block_hash);
+                }
+                // From its end, not its start: an attempt can take minutes.
+                self.failed.insert(rec.block_hash, now + UPGRADE_RETRY);
+            }
+        }
+    }
+}
+
+/// The next finality upgrade ([`Upgrades::next`]) made that snapshot's
+/// finalized head: laid out, verified to its block and state root,
+/// published.
 fn upgrade_finality(
     args: &Args,
     work: &Work,
@@ -833,42 +978,50 @@ fn upgrade_finality(
     p: &dyn Publish,
     side: &mut Side,
 ) -> Option<Value> {
-    let confirmed = state
-        .finality
-        .and_then(|h| state.snapshots.iter().find(|s| s.block_hash == h))
-        .map(|s| s.block_number);
-    let now = Instant::now();
-    let (rec, seen) = state
-        .snapshots
-        .iter()
-        .filter(|s| s.complete && confirmed.is_none_or(|c| s.block_number > c))
-        .filter(|s| side.failed.get(&s.block_hash).is_none_or(|t| now >= *t))
-        .filter_map(|s| side.finality.get(&s.block_hash).map(|f| (s.clone(), f)))
-        .max_by_key(|(s, _)| s.block_number)?;
+    let next = side
+        .upgrades
+        .next(state, Instant::now(), |h| side.finality.get(h))?;
     let t = Instant::now();
     let mut line = Map::new();
     line.insert("event".into(), json!("finality"));
+    let (rec, update, retry) = match next {
+        Upgrade::New(rec, seen) => {
+            line.insert("finalized_slot".into(), json!(seen.named.head.slot));
+            line.insert("participants".into(), json!(seen.named.participants));
+            let seen_ms = unix_ms_of(seen.first_seen);
+            if rec.timestamp > 0 {
+                line.insert(
+                    "named_after_block_secs".into(),
+                    json!(secs(Duration::from_millis(
+                        seen_ms.saturating_sub(rec.timestamp * 1000)
+                    ))),
+                );
+            }
+            (rec, seen.bytes, false)
+        }
+        Upgrade::Retry(rec, n) => {
+            line.insert(
+                "pending_error".into(),
+                json!(format!(
+                    "{n} snapshots wait on head/finality writes (bound {MAX_UNRESOLVED}): the newest is written again"
+                )),
+            );
+            // Empty if it is gone, which verification then refuses.
+            let update = fs::read(work.bucket.join(paths::FINALITY)).unwrap_or_default();
+            (rec, update, true)
+        }
+    };
     line.insert("block_number".into(), json!(rec.block_number));
     line.insert("block_hash".into(), json!(rec.block_hash));
     line.insert("boundary".into(), json!(utc(rec.boundary)));
-    line.insert("finalized_slot".into(), json!(seen.named.head.slot));
-    line.insert("participants".into(), json!(seen.named.participants));
-    let seen_ms = unix_ms_of(seen.first_seen);
-    if rec.timestamp > 0 {
-        line.insert(
-            "named_after_block_secs".into(),
-            json!(secs(Duration::from_millis(
-                seen_ms.saturating_sub(rec.timestamp * 1000)
-            ))),
-        );
-    }
     let mut sent = Sent { files: 0, bytes: 0 };
-    let r = finalize(args, work, state, p, &rec, &seen.bytes, &mut sent);
+    let r = finalize(args, work, state, p, &rec, &update, &mut sent);
     line.insert("upgrade_secs".into(), json!(secs(t.elapsed())));
     line.insert("published_files".into(), json!(sent.files));
+    side.upgrades
+        .ended(state, &rec, retry, r.as_ref().map(|_| ()), Instant::now());
     match r {
         Ok(()) => {
-            side.failed.remove(&rec.block_hash);
             line.insert("ok".into(), json!(true));
             if rec.timestamp > 0 {
                 line.insert(
@@ -880,7 +1033,9 @@ fn upgrade_finality(
             }
         }
         Err(f) => {
-            side.failed.insert(rec.block_hash, now + UPGRADE_RETRY);
+            if retry && f.step == "verify" {
+                line.insert("retry_skipped".into(), json!(true));
+            }
             line.insert("ok".into(), json!(false));
             line.insert("step".into(), json!(f.step));
             line.insert("error".into(), json!(f.error));
@@ -1076,12 +1231,14 @@ fn utc(t: u64) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cycle(
     args: &Args,
     work: &Work,
     state: &mut State,
     publisher: &dyn Publish,
     side: &mut Side,
+    lookouts: Lookouts,
     target: u64,
     line: &mut Map<String, Value>,
 ) -> Result<(), Failed> {
@@ -1089,6 +1246,26 @@ fn cycle(
     let boundary_slot = (target - chain.genesis_time) / 12;
     line.insert("boundary".into(), json!(utc(target)));
     line.insert("boundary_slot".into(), json!(boundary_slot));
+    // The optimistic update attesting our block is served for about one
+    // slot, a slot after it; the watch runs from before the boundary so
+    // the fetch cannot make us miss it. The FCR probe started then too,
+    // before we know the block, so its first sighting is not late.
+    let (watch, probe) = lookouts.take()?;
+    let mut watch = Some(watch);
+    if let Some(p) = &probe {
+        line.insert("fcr_source".into(), json!(p.host()));
+    }
+    let unresolved_final = unresolved_final(state).len();
+    if unresolved_final > MAX_UNRESOLVED {
+        // Bounded by the upgrade itself, which retries the newest of them
+        // instead of journaling more; said here so every cycle line shows it.
+        line.insert(
+            "pending_final_error".into(),
+            json!(format!(
+                "{unresolved_final} snapshots wait on head/finality writes (bound {MAX_UNRESOLVED})"
+            )),
+        );
+    }
 
     // 0. Pointer writes that keep failing would leave one more protected
     // snapshot every cycle. Past a bound, no new one is fetched while the
@@ -1128,26 +1305,6 @@ fn cycle(
             }
         }
     }
-
-    // The optimistic update attesting our block is served for about one
-    // slot, a slot after it; watch from before the boundary so the fetch
-    // cannot make us miss it. The FCR probe starts now too, before we know
-    // the block, so its first sighting is not late.
-    let mut watch = Some(UpdateWatch::start_tier(
-        &args.beacon,
-        Tier::Attested,
-        Duration::from_secs(args.optimistic_poll_secs),
-    ));
-    let probe = side.fcr.clone().map(|src| {
-        let host = src.host().to_string();
-        line.insert("fcr_source".into(), json!(host));
-        fcr::Probe::start(
-            fcr::Http::new(src, Duration::from_secs(10)),
-            &host,
-            Duration::from_secs(args.fcr_poll_secs),
-            (target + args.fcr_wait_secs) * 1000,
-        )
-    });
 
     // 1. Fetch at the boundary, tending the finality upgrade meanwhile. The
     // optimistic watch is frozen (it keeps what it saw) a few slots after
@@ -1761,24 +1918,39 @@ fn publish_final(
     state.save(&work.root)
 }
 
-/// Snapshots waiting on pointer writes beyond which a cycle fetches none.
+/// Snapshots waiting on pointer writes beyond which a cycle fetches none,
+/// and on `head/finality` writes beyond which the upgrade journals none.
 const MAX_UNRESOLVED: usize = 3;
 
-/// Pending snapshots newer than the one `head/optimistic` is confirmed to
-/// name (`head/finality`, for a state from before the attested tier),
-/// newest first: their pointer writes failed and no confirmed pair has
-/// gone past them. (Pending ones older than it only wait out their grace;
-/// the next confirmed pair releases them, and no more are added.)
+/// Pending snapshots newer than the last one both pointers are confirmed
+/// to name, newest first: their pointer writes failed and no confirmed
+/// pair has gone past them. That is the one `latest` names, which is
+/// written only once `head/optimistic` was confirmed for the same snapshot
+/// in the same call (`head/finality`, for a state from before the attested
+/// tier, if it has none). Not `head/optimistic` alone: it is recorded
+/// before `latest` is tried, so a cycle failing at `latest` would move it
+/// past its own entry, and a `latest` that failed every time would never
+/// count. (Pending ones older than it only wait out their grace; the next
+/// confirmed pair releases them, and no more are added.)
 pub fn unresolved_pending(state: &State) -> Vec<B256> {
-    let confirmed = state
-        .optimistic
-        .or(state.finality)
+    unresolved(state, &state.pending, state.latest.or(state.finality))
+}
+
+/// [`unresolved_pending`] for `head/finality`: snapshots journaled in
+/// `pending_final` newer than the one `head/finality` is confirmed to
+/// name, newest first.
+pub fn unresolved_final(state: &State) -> Vec<B256> {
+    unresolved(state, &state.pending_final, state.finality)
+}
+
+fn unresolved(state: &State, journal: &BTreeMap<B256, u64>, confirmed: Option<B256>) -> Vec<B256> {
+    let confirmed = confirmed
         .and_then(|h| state.snapshots.iter().find(|s| s.block_hash == h))
         .map(|s| s.block_number);
     let mut out: Vec<(u64, B256)> = state
         .snapshots
         .iter()
-        .filter(|s| state.pending.contains_key(&s.block_hash))
+        .filter(|s| journal.contains_key(&s.block_hash))
         .filter(|s| confirmed.is_none_or(|c| s.block_number > c))
         .map(|s| (s.block_number, s.block_hash))
         .collect();
@@ -2364,6 +2536,114 @@ mod tests {
         assert_eq!(unresolved_pending(&s), vec![h(7), h(6), h(5), h(4)]);
         s.finality = None;
         assert_eq!(unresolved_pending(&s).len(), 6);
+    }
+
+    #[test]
+    fn repeated_latest_failures_stop_new_fetches_past_the_bound() {
+        let root = tmp("latest-fails");
+        let w = Work::new(&root).unwrap();
+        touch(&w.bucket, paths::OPTIMISTIC, b"o");
+        touch(&w.bucket, LATEST_FILE, b"l");
+        let h = |n: u8| B256::with_last_byte(n);
+        let mut s = State {
+            checkpoint: B256::repeat_byte(9),
+            format: STATE_FORMAT,
+            snapshots: (1..=6).map(|n| rec(n, false)).collect(),
+            ..Default::default()
+        };
+        let mut sent = Sent { files: 0, bytes: 0 };
+        publish_pointers(&w, &mut s, &Rec(Default::default()), h(1), 3600, &mut sent).unwrap();
+        assert!(unresolved_pending(&s).is_empty());
+        // `head/optimistic` goes up every time and `latest` never: each
+        // cycle's snapshot stays unresolved, though head/optimistic names
+        // it.
+        let fail = FailOn(LATEST_FILE, Rec(Default::default()));
+        for n in 2..=5u8 {
+            assert!(publish_pointers(&w, &mut s, &fail, h(n), 3600, &mut sent).is_err());
+            assert_eq!((s.optimistic, s.latest), (Some(h(n)), Some(h(1))));
+            assert_eq!(unresolved_pending(&s).len(), n as usize - 1);
+        }
+        // The cycle's gate: past the bound it fetches nothing and writes
+        // the newest one's pointers again.
+        let stuck = unresolved_pending(&s);
+        assert!(stuck.len() > MAX_UNRESOLVED);
+        assert_eq!(stuck[0], h(5));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failing_finality_writes_retry_the_newest_instead_of_journaling_more() {
+        use csl_eth_head::fetch::{Finalized, Named};
+        let h = |n: u8| B256::with_last_byte(n);
+        let seen = |hash: &B256| {
+            Some(Seen {
+                named: Named {
+                    head: Finalized {
+                        slot: 1,
+                        block_number: 1,
+                        block_hash: *hash,
+                    },
+                    signature_slot: 2,
+                    participants: 500,
+                },
+                bytes: b"finality".to_vec(),
+                first_seen: UNIX_EPOCH,
+            })
+        };
+        let picked = |u: Option<Upgrade>| match u {
+            Some(Upgrade::New(r, _)) => Some(("new", r.block_number)),
+            Some(Upgrade::Retry(r, _)) => Some(("retry", r.block_number)),
+            None => None,
+        };
+        let fail = |step| Failed {
+            step,
+            error: "x".into(),
+        };
+        // Finality confirmed at 1; 2 to 5 journaled, their writes failed;
+        // finality now names 7.
+        let mut s = State {
+            snapshots: (1..=8).map(|n| rec(n, true)).collect(),
+            finality: Some(h(1)),
+            ..Default::default()
+        };
+        let mut u = Upgrades::default();
+        let t0 = Instant::now();
+        for n in 2..=4 {
+            s.pending_final.insert(h(n), 0);
+        }
+        // At the bound, a new one is still journaled.
+        assert_eq!(picked(u.next(&s, t0, seen)), Some(("new", 8)));
+        s.pending_final.insert(h(5), 0);
+        // Past it, the newest journaled is written again, not 8.
+        assert_eq!(picked(u.next(&s, t0, seen)), Some(("retry", 5)));
+        // A failed retry waits its delay, from when it ended; meanwhile
+        // nothing new is journaled.
+        let t1 = t0 + Duration::from_secs(250);
+        u.ended(&s, &rec(5, true), true, Err(&fail("publish")), t1);
+        assert_eq!(picked(u.next(&s, t1 + UPGRADE_RETRY / 2, seen)), None);
+        assert_eq!(picked(u.next(&s, t0 + UPGRADE_RETRY, seen)), None);
+        assert_eq!(
+            picked(u.next(&s, t1 + UPGRADE_RETRY, seen)),
+            Some(("retry", 5))
+        );
+        // The mirror's head no longer reaches 5: one newer is let in, which
+        // is then the one retried.
+        let t2 = t1 + UPGRADE_RETRY;
+        u.ended(&s, &rec(5, true), true, Err(&fail("verify")), t2);
+        assert_eq!(u.unreachable, Some(h(5)));
+        assert_eq!(picked(u.next(&s, t2, seen)), Some(("new", 8)));
+        s.pending_final.insert(h(8), 0);
+        u.ended(&s, &rec(8, true), false, Err(&fail("publish")), t2);
+        let t3 = t2 + UPGRADE_RETRY;
+        assert_eq!(picked(u.next(&s, t3, seen)), Some(("retry", 8)));
+        // It goes through: older failures are pruned, and the journal is
+        // released only by publish_final's grace rule, not here.
+        u.failed.insert(h(9), t0);
+        s.snapshots.push(rec(9, true));
+        u.ended(&s, &rec(8, true), true, Ok(()), t3);
+        assert_eq!(u.failed.keys().collect::<Vec<_>>(), vec![&h(9)]);
+        assert_eq!(u.unreachable, None);
+        assert_eq!(s.pending_final.len(), 5);
     }
 
     /// The head crate's p1900 set: the producer's first published head.
