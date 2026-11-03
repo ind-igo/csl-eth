@@ -15,8 +15,19 @@
 //! and nothing in the cycle waits on it: an outcome is collected when it
 //! is there.
 //!
+//! What the probe establishes is two answers from the source, not a chain:
+//! a `safe` block at or past our height, and our hash when asked for the
+//! block at our height, in separate requests. A load-balanced source with
+//! backends on different forks, or a reorg between the two, could give
+//! both without our block ever being an ancestor of that `safe` block;
+//! nothing here walks parents. It is a report, shown as one.
+//!
 //! The RPC URL may carry an API key (Ankr's does). Only its host is ever
-//! logged, stored or published; error texts are scrubbed of the URL.
+//! logged, stored or published. An error is kept as its kind only (the
+//! transport error's, the HTTP status, the JSON-RPC error code, a parse
+//! failure), never as text the source or the HTTP client wrote, which
+//! could quote the key; and the binary never lets the HTTP client's own
+//! logs through, since they print the request's URI.
 
 use alloy_primitives::B256;
 use csl_eth_head::{FcrClass, FcrReport};
@@ -102,18 +113,31 @@ impl Source {
     pub fn host(&self) -> &str {
         &self.host
     }
+}
 
-    /// `e` with the URL, and its path and query (where a key would sit),
-    /// replaced by the host.
-    fn scrub(&self, e: &str) -> String {
-        let mut s = e.replace(&self.url, &self.host);
-        if let Some(i) = self.url.to_ascii_lowercase().find(&self.host) {
-            let tail = &self.url[i + self.host.len()..];
-            if tail.len() > 1 {
-                s = s.replace(tail, "");
-            }
-        }
-        s
+/// A request's failure as its kind, never its text: ureq's messages can
+/// carry the URI (`BadUri`), and a TLS or I/O error's text is not ours to
+/// vouch for.
+fn transport(e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::StatusCode(c) => format!("http {c}"),
+        ureq::Error::Timeout(t) => format!("timeout ({t})"),
+        ureq::Error::Io(e) => format!("io {:?}", e.kind()),
+        ureq::Error::HostNotFound => "host not found".into(),
+        ureq::Error::ConnectionFailed => "connection failed".into(),
+        ureq::Error::Tls(_) => "tls".into(),
+        ureq::Error::BodyExceedsLimit(_) => "response too large".into(),
+        ureq::Error::Protocol(_) | ureq::Error::Http(_) => "http protocol".into(),
+        _ => "transport".into(),
+    }
+}
+
+/// A JSON-RPC error object as its code: its `message` and `data` are the
+/// source's text, which may quote the URL or the key.
+fn rpc_error(e: &Value) -> String {
+    match e.get("code").and_then(Value::as_i64) {
+        Some(c) => format!("rpc error {c}"),
+        None => "rpc error".into(),
     }
 }
 
@@ -128,7 +152,8 @@ pub struct Tip {
 /// tests.
 pub trait Rpc: Send + 'static {
     /// `eth_getBlockByNumber(tag, false)` for `safe`, `latest`, or a hex
-    /// number.
+    /// number. An error says what kind of failure it was, in words of our
+    /// own (it is logged and published as is).
     fn block(&self, tag: &str) -> Result<Tip, String>;
 }
 
@@ -165,17 +190,11 @@ impl Rpc for Http {
             .header("Content-Type", "application/json")
             .send(body.to_string().as_bytes())
             .and_then(|mut r| r.body_mut().read_to_string())
-            .map_err(|e| format!("{host}: {}", self.source.scrub(&e.to_string())))?;
-        let v: Value = serde_json::from_str(&text).map_err(|e| format!("{host}: {tag}: {e}"))?;
+            .map_err(|e| format!("{host}: {tag}: {}", transport(&e)))?;
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|_| format!("{host}: {tag}: the response is not JSON"))?;
         if let Some(e) = v.get("error") {
-            return Err(format!(
-                "{host}: {}",
-                self.source
-                    .scrub(&e.to_string())
-                    .chars()
-                    .take(200)
-                    .collect::<String>()
-            ));
+            return Err(format!("{host}: {tag}: {}", rpc_error(e)));
         }
         let r = &v["result"];
         let number = r["number"]
@@ -209,7 +228,9 @@ struct Obs {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
-    /// `safe` reached our block on our chain.
+    /// `safe` reached our height, and the source returned our hash when
+    /// asked for the block at that height (two answers, not a proof that
+    /// our block is an ancestor of that `safe` block).
     Confirmed(FcrReport),
     /// `safe` reached our height, and the source's block there is not ours.
     Conflict { theirs: B256, after_secs: u64 },
@@ -421,7 +442,9 @@ fn run(
 }
 
 /// The first poll with `safe` at or past our block, and the source's hash
-/// at our height: a confirmation, or a conflict.
+/// at our height: a confirmation, or a conflict. When `safe` is past our
+/// height the hash comes from a request of its own, so the two answers
+/// may not be from one view of one chain.
 fn decide(t: Target, first: Obs, theirs: B256, host: &str) -> Outcome {
     let after_secs = (first.at_ms / 1000).saturating_sub(t.timestamp);
     if theirs != t.hash {
@@ -439,6 +462,78 @@ fn decide(t: Target, first: Obs, theirs: B256, host: &str) -> Outcome {
     })
 }
 
+/// A local JSON-RPC server for tests that quotes a fake key back in every
+/// way a real source might: in a JSON-RPC error's message and data, in an
+/// HTTP error's body, in a body that is not JSON.
+#[cfg(test)]
+pub(crate) mod leaky {
+    use std::io::{Read, Write};
+
+    /// Obviously not a key.
+    pub const KEY: &str = "FAKEKEYdeadbeef0123";
+
+    /// What the server answers to every request.
+    #[derive(Clone, Copy)]
+    pub enum Answer {
+        RpcError,
+        Unauthorized,
+        NotJson,
+    }
+
+    /// A server answering `answer` forever; the URL to reach it, with
+    /// [`KEY`] in its path and its query.
+    pub fn serve(answer: Answer) -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { continue };
+                // The request: headers, then as much body as it declares.
+                let mut buf = Vec::new();
+                let mut b = [0u8; 4096];
+                while let Ok(n) = c.read(&mut b) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&b[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(i) = text.find("\r\n\r\n") {
+                        let len = text[..i]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= i + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let (status, body) = match answer {
+                    Answer::RpcError => (
+                        "200 OK",
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":1,"error":{{"code":-32000,"message":"invalid API key {KEY} for /eth/{KEY}","data":"{KEY}"}}}}"#
+                        ),
+                    ),
+                    Answer::Unauthorized => {
+                        ("401 Unauthorized", format!("bad key {KEY} at /eth/{KEY}"))
+                    }
+                    Answer::NotJson => ("200 OK", format!("<html>key {KEY} is not valid</html>")),
+                };
+                let _ = write!(
+                    c,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}/eth/{KEY}?apikey={KEY}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,10 +543,6 @@ mod tests {
         let s = Source::new("https://rpc.ankr.com/eth/0123456789abcdef?x=1").unwrap();
         assert_eq!(s.host(), "rpc.ankr.com");
         assert_eq!(format!("{s:?}"), "Source(rpc.ankr.com)");
-        let e = s.scrub(
-            "GET https://rpc.ankr.com/eth/0123456789abcdef?x=1: 401, /eth/0123456789abcdef?x=1",
-        );
-        assert!(!e.contains("0123456789abcdef"), "{e}");
         assert_eq!(
             Source::new("https://user:key@Host.example:8545/")
                 .unwrap()
@@ -460,10 +551,6 @@ mod tests {
         );
         assert!(Source::new("wss://x").is_err());
         assert!(Source::new("https:///path").is_err());
-        let s = Source::new("https://RPC.Ankr.com/eth/0123456789abcdef").unwrap();
-        assert!(!s
-            .scrub("GET /eth/0123456789abcdef")
-            .contains("0123456789abcdef"));
         let e =
             Source::from_arg_or_env(Some("wss://rpc.ankr.com/eth/0123456789abcdef")).unwrap_err();
         assert!(
@@ -663,5 +750,48 @@ mod tests {
         );
         p.cancel();
         assert_eq!(wait(p).outcome, Outcome::Cancelled);
+    }
+
+    #[test]
+    fn a_key_in_the_url_or_quoted_back_never_reaches_a_report() {
+        use leaky::{serve, Answer, KEY};
+        // Nothing listens on the port of a dropped listener: a connection
+        // refused, whose error text would name the address.
+        let refused = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            format!("http://127.0.0.1:{port}/eth/{KEY}?apikey={KEY}")
+        };
+        for (url, want) in [
+            (serve(Answer::RpcError), "127.0.0.1: safe: rpc error -32000"),
+            (serve(Answer::Unauthorized), "127.0.0.1: safe: http 401"),
+            (
+                serve(Answer::NotJson),
+                "127.0.0.1: safe: the response is not JSON",
+            ),
+            (refused, "127.0.0.1: safe: "),
+        ] {
+            let src = Source::new(&url).unwrap();
+            assert!(!format!("{src:?}").contains(KEY));
+            let http = Http::new(src.clone(), Duration::from_secs(5));
+            let e = http.block("safe").unwrap_err();
+            assert!(e.starts_with(want) && !e.contains(KEY), "{e}");
+            // Through a probe: its report, as Debug and as the cycle's
+            // JSON, says the kind and the host, never the key.
+            let p = Probe::start(
+                Http::new(src, Duration::from_secs(5)),
+                "127.0.0.1",
+                Duration::from_millis(50),
+                unix_ms() + 300,
+            );
+            p.aim(target(B256::ZERO));
+            let r = wait(p);
+            assert!(r.errors >= 1, "{r:?}");
+            for out in [format!("{r:?}"), r.json("127.0.0.1").to_string()] {
+                assert!(!out.contains(KEY), "{out}");
+                assert!(!out.contains("/eth/"), "{out}");
+            }
+            assert!(r.last_error.as_deref().is_some_and(|e| e.starts_with(want)));
+        }
     }
 }

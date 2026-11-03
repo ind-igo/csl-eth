@@ -593,7 +593,9 @@ pub struct FcrReport {
     pub block_hash: B256,
     pub block_number: u64,
     /// Seconds from the block's timestamp to the first poll that saw the
-    /// source's `safe` at or past it, on the same chain.
+    /// source's `safe` at or past its height; the source also returned
+    /// this hash for this height, in a request of its own, which is not a
+    /// proof that this block is an ancestor of that `safe` block.
     pub confirmed_after_secs: u64,
     /// How many blocks the source's `safe` trailed its `latest` then.
     pub trail_blocks: u64,

@@ -2677,6 +2677,41 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn the_fcr_event_never_carries_the_key() {
+        use fcr::leaky::{serve, Answer, KEY};
+        let root = tmp("fcr-key");
+        let w = Work::new(&root).unwrap();
+        let mut s = State::default();
+        for answer in [Answer::RpcError, Answer::Unauthorized, Answer::NotJson] {
+            let src = fcr::Source::new(&serve(answer)).unwrap();
+            let host = src.host().to_string();
+            let mut p = fcr::Probe::start(
+                fcr::Http::new(src, Duration::from_secs(5)),
+                &host,
+                Duration::from_millis(50),
+                now_ms() + 300,
+            );
+            p.aim(fcr::Target {
+                number: 7,
+                hash: B256::with_last_byte(7),
+                timestamp: 0,
+            });
+            let r = loop {
+                if let Some(r) = p.try_take() {
+                    break r;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let v = fcr_event(&w, &mut s, &Rec(Default::default()), &p, &r);
+            assert!(v["errors"].as_u64().unwrap() >= 1, "{v}");
+            for out in [v.to_string(), format!("{r:?}")] {
+                assert!(!out.contains(KEY), "{out}");
+            }
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Fails `put` for one key.
     struct FailOn(&'static str, Rec);
 

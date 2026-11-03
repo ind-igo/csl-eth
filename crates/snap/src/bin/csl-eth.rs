@@ -250,16 +250,52 @@ fn parse_prefix(s: &str) -> Result<Nibbles, String> {
     Ok(Nibbles::from_nibbles(out))
 }
 
+/// Log targets that never get through, whatever `RUST_LOG` says: the HTTP
+/// client ureq prints each request's URI, path and query included, at
+/// trace level (and its protocol crate the request line), and the URL of
+/// the producer's FCR RPC, or of the workload's oracle, may carry a key in
+/// either. Their other logs are not worth that risk.
+const SILENCED: &[&str] = &["ureq", "ureq_proto"];
+
+fn silenced(target: &str) -> bool {
+    SILENCED.iter().any(|s| {
+        target
+            .strip_prefix(s)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    })
+}
+
+/// `RUST_LOG` (or our default) over `writer`, with [`SILENCED`] dropped by
+/// a filter of its own, so no directive, however specific, enables them.
+fn subscriber<W>(
+    filter: tracing_subscriber::EnvFilter,
+    writer: W,
+) -> impl tracing::Subscriber + Send + Sync + 'static
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    use tracing_subscriber::{filter::filter_fn, layer::SubscriberExt, Layer};
+    tracing_subscriber::registry().with(filter).with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_filter(filter_fn(|m| !silenced(m.target()))),
+    )
+}
+
+fn log_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,discv4=warn,reth_dns_discovery=warn,hickory=warn".into())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use tracing_subscriber::util::SubscriberInitExt;
     let cli = Cli::parse();
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info,discv4=warn,reth_dns_discovery=warn,hickory=warn".into());
     if matches!(cli.cmd, Cmd::Produce(_)) {
         // stdout carries the cycle lines only.
-        tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+        subscriber(log_filter(), std::io::stderr).init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        subscriber(log_filter(), std::io::stdout).init();
     }
     match cli.cmd {
         Cmd::Produce(args) => {
@@ -685,4 +721,53 @@ fn check<D: csl_eth_client::Driver>(
         "absent_inside": absent.summary(),
         "outside_prefix": outside.summary(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_http_clients_logs_never_get_through() {
+        assert!(silenced("ureq") && silenced("ureq::run") && silenced("ureq_proto::client"));
+        assert!(!silenced("ureqx") && !silenced("csl_eth_snap::produce"));
+        // Even with everything at trace, and ureq's own targets asked for
+        // by name: what ureq logs (through the `log` bridge, as these
+        // targets) is dropped, the rest is not.
+        for directives in [
+            "trace",
+            "ureq=trace,ureq::run=trace,ureq_proto::client=trace",
+        ] {
+            let buf = Buf::default();
+            let sink = buf.clone();
+            let s = subscriber(
+                tracing_subscriber::EnvFilter::new(format!("{directives},csl=info")),
+                move || sink.clone(),
+            );
+            tracing::subscriber::with_default(s, || {
+                tracing::trace!(target: "ureq::run", "POST http://h/eth/FAKEKEY?apikey=FAKEKEY");
+                tracing::debug!(target: "ureq_proto::client", "POST /eth/FAKEKEY HTTP/1.1");
+                tracing::info!(target: "csl", "kept");
+            });
+            let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                out.contains("kept") && !out.contains("FAKEKEY"),
+                "{directives}: {out}"
+            );
+        }
+    }
 }
