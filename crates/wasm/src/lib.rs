@@ -11,8 +11,8 @@ use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use csl_eth_client::{
     trie::{decode_word, Account, Nibbles, Shape},
-    Cost, HeadOpener, Hint, NoDriver, Origin, Pending, Read, Reason, Snapshot, Trace, TraceNode,
-    Trie, VerifiedHead, WalkTrace, Want,
+    Cost, FcrReport, HeadOpener, Hint, NoDriver, Origin, Pending, Read, Reason, Snapshot,
+    TierChoice, Trace, TraceNode, Trie, VerifiedHead, WalkTrace, Want,
 };
 use js_sys::Uint8Array;
 use std::time::{Duration, SystemTime};
@@ -248,7 +248,25 @@ fn error_json(e: impl std::fmt::Display) -> String {
     serde_json::json!({ "error": e.to_string() }).to_string()
 }
 
-fn head_json(h: &VerifiedHead, snap: &Snapshot<NoDriver>) -> serde_json::Value {
+/// The producer's `head/fcr` note, as the page shows it: never verified.
+fn fcr_json(f: &FcrReport) -> serde_json::Value {
+    serde_json::json!({
+        "verified": false,
+        "source": f.source,
+        "classification": f.classification.name(),
+        "confirmed_after_secs": f.confirmed_after_secs,
+        "trail_blocks": f.trail_blocks,
+        "block_number": f.block_number,
+        "block_hash": format!("{}", f.block_hash),
+        "checked_at": f.checked_at,
+    })
+}
+
+fn head_json(
+    h: &VerifiedHead,
+    snap: &Snapshot<NoDriver>,
+    fcr: Option<&FcrReport>,
+) -> serde_json::Value {
     let m = snap.manifest();
     serde_json::json!({
         "checkpoint": format!("{}", h.checkpoint),
@@ -269,6 +287,7 @@ fn head_json(h: &VerifiedHead, snap: &Snapshot<NoDriver>) -> serde_json::Value {
             "state_root": format!("{}", m.state_root),
             "prefix": m.prefix,
         },
+        "fcr": fcr.map(fcr_json),
     })
 }
 
@@ -297,6 +316,8 @@ pub struct Client {
     opener: Option<HeadOpener<NoDriver>>,
     snap: Option<Snapshot<NoDriver>>,
     head: Option<VerifiedHead>,
+    /// The producer's unverified note, when it is about the head.
+    fcr: Option<FcrReport>,
     hint: Hint,
     top_levels: usize,
     op: Op,
@@ -360,6 +381,15 @@ impl Client {
         if let Some(s) = &self.snap {
             v["trace"] = trace_json(s.trace(), &r);
         }
+        // What the answer is verified against.
+        if let Some(h) = &self.head {
+            v["head"] = serde_json::json!({
+                "tier": h.tier.name(),
+                "block_number": h.execution.block_number,
+                "block_hash": format!("{}", h.execution.block_hash),
+                "timestamp": h.execution.timestamp,
+            });
+        }
         self.done(v)
     }
 }
@@ -367,24 +397,32 @@ impl Client {
 #[wasm_bindgen]
 impl Client {
     /// A client that will verify `head/` from `checkpoint` (a beacon block
-    /// root, hex) as of `now_ms` and open the snapshot at the finalized
-    /// block. `prefetch` pages each side of every predicted page;
-    /// `top_levels` account-trie depths kept across reads of the snapshot
-    /// (0: off). `open()` starts the rounds.
+    /// root, hex) as of `now_ms` and open the snapshot at the head: the
+    /// attested one when it is newer and its snapshot is there, else the
+    /// finalized one (`tier` "best", the default), or only `"finalized"`
+    /// or only `"attested"`. `prefetch` pages each side of every predicted
+    /// page; `top_levels` account-trie depths kept across reads of the
+    /// snapshot (0: off). `open()` starts the rounds.
     #[wasm_bindgen(constructor)]
     pub fn new(
         checkpoint: &str,
         now_ms: f64,
         prefetch: u32,
         top_levels: u32,
+        tier: Option<String>,
     ) -> Result<Client, JsValue> {
         panic_hook();
         let checkpoint = parse_b256(checkpoint, "checkpoint").map_err(|e| JsValue::from_str(&e))?;
         let now = SystemTime::UNIX_EPOCH + Duration::from_millis(now_ms.max(0.0) as u64);
+        let tier = tier.unwrap_or_default();
+        let choice = TierChoice::parse(&tier).ok_or_else(|| {
+            JsValue::from_str(&format!("tier: {tier:?} is not best, finalized or attested"))
+        })?;
         Ok(Client {
-            opener: Some(HeadOpener::new(NoDriver, checkpoint, now)),
+            opener: Some(HeadOpener::with_tier(NoDriver, checkpoint, now, choice)),
             snap: None,
             head: None,
+            fcr: None,
             hint: Hint::symmetric(prefetch as u64),
             top_levels: top_levels as usize,
             op: Op::Idle,
@@ -392,8 +430,9 @@ impl Client {
         })
     }
 
-    /// Begin opening: the first `need` is the head bootstrap and the finality
-    /// update, the second (when there is one) the period updates between.
+    /// Begin opening: the first `need` is the head bootstrap, the head
+    /// updates (and `head/fcr`), the second (when there is one) the period
+    /// updates between, the third the manifests of the heads that verified.
     pub fn open(&mut self) -> String {
         if self.opener.is_none() {
             return self.fail("already open");
@@ -484,11 +523,13 @@ impl Client {
                         snap.top_levels = self.top_levels;
                         snap.tracing = true;
                         let (requests, bytes, rounds) = snap.store().cost();
-                        let mut v = head_json(&head, &snap);
+                        let fcr = o.fcr().cloned();
+                        let mut v = head_json(&head, &snap, fcr.as_ref());
                         v["open"] = serde_json::json!({ "requests": requests, "bytes": bytes, "rounds": rounds });
                         self.opener = None;
                         self.snap = Some(snap);
                         self.head = Some(head);
+                        self.fcr = fcr;
                         self.done(v)
                     }
                 }
@@ -645,7 +686,7 @@ impl Client {
     /// The verified head and the snapshot it named, once open.
     pub fn head(&self) -> String {
         match (&self.head, &self.snap) {
-            (Some(h), Some(s)) => head_json(h, s).to_string(),
+            (Some(h), Some(s)) => head_json(h, s, self.fcr.as_ref()).to_string(),
             _ => error_json("not open"),
         }
     }

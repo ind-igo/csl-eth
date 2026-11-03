@@ -55,13 +55,39 @@ export interface Head {
   beacon_root: string;
   participants: number;
   updates_applied: number;
-  finality_lag_secs: number;
+  /// Which head: "attested" (head/optimistic, signed by the sync committee,
+  /// not final) or "finalized" (head/finality).
+  tier: "attested" | "finalized";
+  /// Seconds from the head block to when it was verified.
+  lag_secs: number;
   block_number: number;
   block_hash: string;
   state_root: string;
   timestamp: number;
   snapshot: { block_number: number; block_hash: string; state_root: string; prefix: string };
   open: { requests: number; bytes: number; rounds: number };
+  /// The producer's report of a named RPC's `safe` tag for this block;
+  /// never verified, present only when it names this head's block.
+  fcr: Fcr | null;
+}
+
+export interface Fcr {
+  verified: false;
+  source: string;
+  classification: "fcr_like" | "justified_like";
+  confirmed_after_secs: number;
+  trail_blocks: number;
+  block_number: number;
+  block_hash: string;
+  checked_at: number;
+}
+
+/// The head a read was verified against.
+export interface ReadHead {
+  tier: "attested" | "finalized";
+  block_number: number;
+  block_hash: string;
+  timestamp: number;
 }
 
 export interface Cost {
@@ -94,6 +120,8 @@ export interface ReadResult {
   size?: number;
   prefix?: string;
   cost: Cost;
+  /// The head the answer is verified against.
+  head?: ReadHead;
   /// The final walk(s), node by node (see `ReadTrace`).
   trace?: ReadTrace;
 }

@@ -7,6 +7,7 @@
 // happened (replays may slow the clock down, and say so).
 
 import { drive, loadWasm, type ClientLike, type DriveHooks, type WasmModule } from "./client.ts";
+import { fcrLine, tierLine, tierParam } from "./head.ts";
 import type { Head, Need, ReadResult, TableInfo, TamperTarget } from "./protocol.ts";
 import { BucketView, checkedPages, type Focus } from "./viz/bucket.ts";
 import { renderChain } from "./viz/chain.ts";
@@ -69,6 +70,7 @@ const el = {
   checkpoint: $<HTMLInputElement>("checkpoint"),
   prefetch: $<HTMLInputElement>("prefetch"),
   toplevels: $<HTMLInputElement>("toplevels"),
+  tier: $<HTMLSelectElement>("tier"),
   reopen: $<HTMLButtonElement>("reopen"),
   status: $<HTMLSpanElement>("status"),
 };
@@ -76,6 +78,7 @@ const el = {
 const params = new URLSearchParams(location.search);
 el.base.value = params.get("bucket") ?? DEFAULT_BASE;
 el.checkpoint.value = params.get("checkpoint") ?? DEFAULT_CHECKPOINT;
+el.tier.value = tierParam(params);
 
 // --- state --------------------------------------------------------------------
 
@@ -124,6 +127,7 @@ function readConfig(): Config {
     checkpoint: el.checkpoint.value.trim(),
     prefetch: Number(el.prefetch.value),
     topLevels: Number(el.toplevels.value),
+    tier: el.tier.value === "finalized" ? "finalized" : "best",
   };
 }
 
@@ -218,7 +222,7 @@ function setBusy(b: boolean) {
 /// A fresh client opened the way `cfg` says. Throws on a malformed
 /// checkpoint.
 function newClient(cfg: Config): ClientLike {
-  return new wasm!.Client(cfg.checkpoint, Date.now(), cfg.prefetch, cfg.topLevels);
+  return new wasm!.Client(cfg.checkpoint, Date.now(), cfg.prefetch, cfg.topLevels, cfg.tier);
 }
 
 /// The client's layout, with each recorded request placed in it.
@@ -271,10 +275,9 @@ async function open() {
     bucket.setTables(tables);
     bucket.resize();
     bucket.addHeat(s);
-    const lag = h.finality_lag_secs;
-    const ago = lag < 7200 ? `${Math.round(lag / 60)} min` : `${(lag / 3600).toFixed(1)} h`;
     const bad = tables.filter((t) => t.error).map((t) => `${t.name} (${t.error})`);
-    status(`head verified: block ${h.block_number.toLocaleString()}, finalized ${ago} ago, signed by ${h.participants} of 512. ${bad.length ? `Unusable: ${bad.join(", ")}.` : "Pick a key."}`, bad.length > 0);
+    const fcr = fcrLine(h.fcr);
+    status(`head verified: block ${h.block_number.toLocaleString()}, ${tierLine(h)}.${fcr ? ` ${fcr[0]!.toUpperCase()}${fcr.slice(1)}.` : ""} ${bad.length ? `Unusable: ${bad.join(", ")}.` : "Pick a key."}`, bad.length > 0);
   } catch (e) {
     if (c && client !== c) c.free();
     status(`not verified: ${e instanceof Error ? e.message : e}`, true);

@@ -183,6 +183,7 @@
             <label for="checkpoint">checkpoint</label><input id="checkpoint" class="mono" />
             <label for="prefetch">pages each side</label><input id="prefetch" type="number" min="0" max="8" value="1" />
             <label for="toplevels">top levels kept</label><input id="toplevels" type="number" min="0" max="9" value="4" />
+            <label for="tier">head</label><select id="tier"><option value="best">attested if newer</option><option value="finalized">finalized only</option></select>
             <span></span><button id="reopen">Reopen with these</button>
             <span class="note">Reopening proves the head again from the checkpoint and starts a fresh client (empty store, empty top-level cache).</span>
           </div>

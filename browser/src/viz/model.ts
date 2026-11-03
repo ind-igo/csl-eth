@@ -13,6 +13,8 @@ export interface Config {
   checkpoint: string;
   prefetch: number;
   topLevels: number;
+  /// "best" (the attested head when newer) or "finalized".
+  tier: "best" | "finalized";
 }
 
 /// A page of a run file: page 0 (the header and top model), a data page

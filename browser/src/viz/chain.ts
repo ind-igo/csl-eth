@@ -1,7 +1,9 @@
 // The chain of trust, as the opening drive walked it: from the one trusted
 // input (a beacon block root) through the sync committee's signatures to
-// the finalized execution header, its state root, the snapshot's manifest
-// and each table's page 0. A link is drawn from the client's verdict, not
+// the head's execution header (attested by head/optimistic, or finalized
+// by head/finality: the client fetches both and uses the attested one when
+// it is newer and its snapshot is there), its state root, the snapshot's
+// manifest and each table's page 0. A link is drawn from the client's verdict, not
 // from timing: it turns green only once the client has accepted it, and
 // red at the step where the client refused it. The head comes in at most
 // two rounds: the bootstrap with the finality update, then the period
@@ -39,7 +41,7 @@ function stepEndOf(l: Lane, round: number): number | undefined {
 function rankOf(file: string, offset: number | null, manifest: string | null): number | null {
   if (file.startsWith("head/bootstrap/")) return 0;
   if (file.startsWith("head/updates/")) return 1 + Math.min(0.999, Number(file.slice(13)) / 1e9);
-  if (file === "head/finality") return 2;
+  if (file === "head/finality" || file === "head/optimistic") return 2;
   if (file === manifest) return 3;
   if (!file.startsWith("head/") && !file.includes("manifest") && file !== "latest" && offset === 0) return 4;
   return null;
@@ -92,8 +94,14 @@ export function renderChain(scene: Scene | null, cur: Cursor, focusReqs: Set<str
   const answered = l.done && cur.t >= endT - 1e-6;
   const head: Head | undefined = answered ? l.head : undefined;
   const refused = answered && !!l.error;
-  // The snapshot's manifest is the first manifest the open fetched.
-  const manifest = l.reqs.find((r) => r.file.includes("manifest"))?.file ?? l.sent.find((q) => q.file.includes("manifest"))?.file ?? null;
+  // The snapshot's manifest: the head's, once answered; until then the
+  // first the open fetched (both heads' manifests go out in one round).
+  const snapDir = head ? head.snapshot.block_hash.replace(/^0x/, "") : null;
+  const manifest =
+    (snapDir ? l.reqs.find((r) => r.file.includes("manifest") && r.file.includes(snapDir))?.file : undefined) ??
+    l.reqs.find((r) => r.file.includes("manifest"))?.file ??
+    l.sent.find((q) => q.file.includes("manifest"))?.file ??
+    null;
   // Links below the highest rank the client went on to request were
   // accepted (the requests are recorded; a request exists from the end of
   // the step that accepted what came before it). All are, once it answered
@@ -126,8 +134,8 @@ export function renderChain(scene: Scene | null, cur: Cursor, focusReqs: Set<str
   const upSent = l.sent.filter((q) => q.file.startsWith("head/updates/"));
   const upFiles = [...new Set([...ups.map((r) => r.file), ...upSent.map((q) => q.file)])].sort((a, b) => Number(a.slice(13)) - Number(b.slice(13)));
   if (!upFiles.length) {
-    if (head || (refused && at.headOk) || (refused && at.rank !== null && at.rank >= 3)) items.push({ title: "period updates (none)", sub: "the finality update is signed in the bootstrap's period, by the committee it proves", state: "ok", reqs: [] });
-    else if (refused && at.rank !== null) items.push({ title: "period updates", sub: at.rank >= 2 ? "not asked for: the finality update was refused first" : "not asked for", state: "wait", reqs: [] });
+    if (head || (refused && at.headOk) || (refused && at.rank !== null && at.rank >= 3)) items.push({ title: "period updates (none)", sub: "the head update is signed in the bootstrap's period, by the committee it proves", state: "ok", reqs: [] });
+    else if (refused && at.rank !== null) items.push({ title: "period updates", sub: at.rank >= 2 ? "not asked for: the head update was refused first" : "not asked for", state: "wait", reqs: [] });
     else items.push({ title: "period updates", sub: "", state: "wait", reqs: [] });
   }
   for (const f of upFiles) {
@@ -145,13 +153,33 @@ export function renderChain(scene: Scene | null, cur: Cursor, focusReqs: Set<str
     }
     items.push({ title, sub, state: s.state, reqs: s.reqs });
   }
-  const fin = stateOf(l, li, cur, v, 2, (f) => f === "head/finality");
-  const signers = fin.state === "bad" ? (at.stale ? `stale: ${l.error}` : `refused: ${l.error}`) : fin.unchecked ? "not checked; the client refused an earlier link" : head ? `signed by ${head.participants} of 512 committee members · ${kb(fin.bytes)}` : fin.state === "ok" ? `signed by the committee in hand · ${kb(fin.bytes)}` : "head/finality";
-  items.push({ title: "finality update", sub: signers, state: fin.state, reqs: fin.reqs });
-  // The execution header rides in the finality update, under a Merkle
-  // branch to the beacon block; the client checks it in the same step.
-  const exec: State = fin.state === "ok" ? "ok" : fin.state === "bad" || fin.state === "wait" ? "wait" : "check";
-  items.push({ title: "execution header", sub: head ? `finalized block ${head.block_number.toLocaleString()}` : "inside the finality update", state: exec, reqs: fin.reqs });
+  // The head update: the optimistic update when the attested head is the
+  // one used, the finality update otherwise. The other, when fetched, is
+  // shown as what it was: fetched with it, not the head used.
+  const attested = head?.tier === "attested";
+  const askedOpt = [...l.reqs.map((r) => r.file), ...l.sent.map((q) => q.file)].includes("head/optimistic");
+  const headItem = (file: string, title: string) => {
+    const s = stateOf(l, li, cur, v, 2, (f) => f === file);
+    const sub = s.state === "bad" ? (at.stale ? `stale: ${l.error}` : `refused: ${l.error}`) : s.unchecked ? "not checked; the client refused an earlier link" : head ? `signed by ${head.participants} of 512 committee members${attested ? ", not final" : ""} · ${kb(s.bytes)}` : s.state === "ok" ? `signed by the committee in hand · ${kb(s.bytes)}` : file;
+    items.push({ title, sub, state: s.state, reqs: s.reqs });
+    return s;
+  };
+  let used: { state: State; reqs: string[] };
+  if (attested) {
+    used = headItem("head/optimistic", "optimistic update");
+    const fin = stateOf(l, li, cur, v, 2, (f) => f === "head/finality");
+    items.push({ title: "finality update", sub: "fetched with it; the attested head is newer, so not the head used", state: "wait", reqs: fin.reqs });
+  } else {
+    used = headItem("head/finality", "finality update");
+    if (askedOpt && head) {
+      const opt = stateOf(l, li, cur, v, 2, (f) => f === "head/optimistic");
+      items.push({ title: "optimistic update", sub: opt.status.every((x) => x === 404) ? "not published: the finalized head is used" : "fetched with it; not newer, invalid, or its snapshot gone: not the head used", state: "wait", reqs: opt.reqs });
+    }
+  }
+  // The execution header rides in the head update, under a Merkle branch
+  // to the beacon block; the client checks it in the same step.
+  const exec: State = used.state === "ok" ? "ok" : used.state === "bad" || used.state === "wait" ? "wait" : "check";
+  items.push({ title: "execution header", sub: head ? `${head.tier} block ${head.block_number.toLocaleString()}` : "inside the head update", state: exec, reqs: used.reqs });
   items.push({ title: "state root", sub: head ? `${short(head.state_root, 6)} · every answer is checked against this` : "", state: exec, reqs: [] });
   const man = stateOf(l, li, cur, v, 3, (f) => f === manifest);
   items.push({ title: "manifest", sub: man.state === "ok" ? `the snapshot at this block and state root · ${kb(man.bytes)}` : man.state === "bad" ? `refused: ${l.error}` : "names the snapshot's run files", state: man.state, reqs: man.reqs });
@@ -187,8 +215,8 @@ function refusalAt(err: string | undefined): { rank: number | null; stale?: bool
   const m = err.match(/update for period (\d+) rejected/) ?? err.match(/head\/updates\/(\d+)/);
   if (m) return { rank: rankOf(`head/updates/${m[1]}`, null, null) };
   if (/stale head:/.test(err)) return { rank: 2, stale: true };
-  if (/finality update rejected|head\/finality|no execution payload/.test(err)) return { rank: 2 };
-  if (/no snapshot at finalized/.test(err)) return { rank: 3 };
+  if (/(finality|attested) update rejected|head\/finality|head\/optimistic|no execution payload/.test(err)) return { rank: 2 };
+  if (/no snapshot at (finalized|attested)/.test(err)) return { rank: 3 };
   if (/snapshot:/.test(err)) return { rank: null, headOk: true };
   return { rank: null };
 }

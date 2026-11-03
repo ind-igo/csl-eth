@@ -43,7 +43,9 @@ export interface DriveHooks {
 
 export interface WasmModule {
   default: (input?: unknown) => Promise<unknown>;
-  Client: new (checkpoint: string, now_ms: number, prefetch: number, top_levels: number) => ClientLike;
+  /// `tier`: "best" (the attested head when newer, else the finalized
+  /// one; the default), "finalized" or "attested".
+  Client: new (checkpoint: string, now_ms: number, prefetch: number, top_levels: number, tier?: string) => ClientLike;
   version: () => string;
 }
 

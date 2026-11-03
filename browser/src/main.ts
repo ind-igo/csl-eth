@@ -4,6 +4,7 @@
 // read cost in rounds, requests, bytes, and milliseconds.
 
 import { drive, loadWasm, type ClientLike, type WasmModule } from "./client.ts";
+import { fcrLine, tierLine, tierParam } from "./head.ts";
 import type { Head, ReadResult, RequestLog, Trip } from "./protocol.ts";
 
 const DEFAULT_BASE = "https://pub-a977a488180546bfb335de69b6f2e207.r2.dev";
@@ -15,6 +16,7 @@ const checkpoint = $<HTMLInputElement>("checkpoint");
 const prefetch = $<HTMLInputElement>("prefetch");
 const toplevels = $<HTMLInputElement>("toplevels");
 const baseline = $<HTMLInputElement>("baseline");
+const tier = $<HTMLSelectElement>("tier");
 const openBtn = $<HTMLButtonElement>("open");
 const openStatus = $<HTMLParagraphElement>("openstatus");
 const headEl = $<HTMLDivElement>("head");
@@ -31,6 +33,7 @@ const versionEl = $<HTMLSpanElement>("version");
 const params = new URLSearchParams(location.search);
 base.value = params.get("bucket") ?? DEFAULT_BASE;
 checkpoint.value = params.get("checkpoint") ?? DEFAULT_CHECKPOINT;
+tier.value = tierParam(params);
 
 let wasm: WasmModule | null = null;
 let client: ClientLike | null = null;
@@ -40,7 +43,6 @@ let bucket = "";
 
 const esc = (s: unknown) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c] ?? c);
 const kb = (b: number) => (b < 1024 ? `${b} B` : `${(b / 1024).toFixed(1)} KB`);
-const ago = (secs: number) => (secs < 120 ? `${secs} s` : secs < 7200 ? `${Math.round(secs / 60)} min` : `${(secs / 3600).toFixed(1)} h`);
 const utc = (ts: number) => new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 19) + " UTC";
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
 
@@ -57,18 +59,21 @@ function logTable(log: RequestLog[]): string {
 }
 
 function renderHead(h: Head, trip: Trip) {
-  const stale = h.finality_lag_secs > 3600;
+  const stale = h.lag_secs > 3600;
+  const fcr = fcrLine(h.fcr);
   headEl.innerHTML = `
     <span class="badge ${stale ? "warn" : "ok"}">${stale ? "verified, but stale" : "verified"}</span>
-    <span class="status"> finalized block <b>${h.block_number.toLocaleString()}</b>, finalized ${ago(h.finality_lag_secs)} ago (${utc(h.timestamp)})</span>
+    <span class="status" id="tierline"> block <b>${h.block_number.toLocaleString()}</b>, ${esc(tierLine(h))} (${utc(h.timestamp)})</span>
+    ${h.tier === "attested" ? `<p class="status">The sync committee signed this block; it is not finalized and could still be reorged out. <code>?tier=finalized</code> opens the finalized head instead.</p>` : ""}
+    ${fcr ? `<p class="status" id="fcrline">${esc(fcr)}</p>` : ""}
     <dl>
       <dt>block hash</dt><dd>${esc(h.block_hash)}</dd>
       <dt>state root</dt><dd>${esc(h.state_root)}</dd>
       <dt>beacon root</dt><dd>${esc(h.beacon_root)} <span class="status">slot ${h.slot}, period ${h.period}</span></dd>
-      <dt>signed by</dt><dd class="plain">${h.participants} of 512 sync-committee members; ${plural(h.updates_applied, "period update")} applied from the checkpoint</dd>
+      <dt>signed by</dt><dd class="plain">${h.participants} of 512 sync-committee members (${h.tier === "attested" ? "head/optimistic" : "head/finality"}); ${plural(h.updates_applied, "period update")} applied from the checkpoint</dd>
       <dt>snapshot</dt><dd class="plain">block ${h.snapshot.block_number.toLocaleString()}, keys under prefix <code>${esc(h.snapshot.prefix)}</code> (${(100 / 16 ** h.snapshot.prefix.length).toFixed(3)}% of the state)</dd>
     </dl>
-    <p class="cost">opening cost <b>${plural(h.open.requests, "request")}</b> in <b>${plural(trip.rounds, "round")}</b>, <b>${kb(h.open.bytes)}</b>, <b>${trip.ms.toFixed(0)} ms</b>: the head proof file by file (each depends on the last), then the manifest, then every table's model at once.</p>
+    <p class="cost">opening cost <b>${plural(h.open.requests, "request")}</b> in <b>${plural(trip.rounds, "round")}</b>, <b>${kb(h.open.bytes)}</b>, <b>${trip.ms.toFixed(0)} ms</b>: the bootstrap and the head pointers, then the period updates they need, then the manifest of each head's snapshot, then every table's model at once.</p>
     ${logTable(trip.log)}`;
 }
 
@@ -101,8 +106,9 @@ function renderResult(r: ReadResult, what: string, trip: Trip) {
   const c = r.cost;
   const how = r.baseline ? `<b>baseline</b> (by hash, serial) · ${plural(c.repairs, "node")} fetched one round each` : plural(c.repairs, "repair");
   const cost = `<p class="cost"><b>${plural(c.requests, "request")}</b> in <b>${plural(c.rounds, "round")}</b>, <b>${kb(c.bytes)}</b>, <b>${trip.ms.toFixed(0)} ms</b> · ${how}, ${c.nodes} trie nodes checked${c.model_pages ? `, ${plural(c.model_pages, "model page")} fetched` : ""}</p>`;
+  const against = r.head ? `<p class="status">against the ${r.head.tier} head, block ${r.head.block_number.toLocaleString()}</p>` : "";
   const more = what === "account" && r.status === "verified" && r.has_code ? `<div class="chips"><button class="ghost" id="readcode">read its code</button></div>` : "";
-  resultEl.innerHTML = `${badge}<dl>${dl}</dl>${cost}${more}${logTable(trip.log)}`;
+  resultEl.innerHTML = `${badge}<dl>${dl}</dl>${against}${cost}${more}${logTable(trip.log)}`;
   const rc = document.getElementById("readcode");
   if (rc && r.code_hash) {
     const hash = r.code_hash;
@@ -146,13 +152,13 @@ async function open() {
   if (busy || !wasm) return;
   setBusy(true);
   opened = false;
-  headEl.innerHTML = `<span class="badge idle">verifying…</span> <span class="status">reading head/bootstrap, head/updates, head/finality and checking sync-committee signatures</span>`;
+  headEl.innerHTML = `<span class="badge idle">verifying…</span> <span class="status">reading head/bootstrap, head/updates, head/optimistic and head/finality and checking sync-committee signatures</span>`;
   openStatus.textContent = "";
   try {
     client?.free();
     client = null;
     bucket = base.value.trim().replace(/\/+$/, "");
-    const c = new wasm.Client(checkpoint.value.trim(), Date.now(), Number(prefetch.value), Number(toplevels.value));
+    const c = new wasm.Client(checkpoint.value.trim(), Date.now(), Number(prefetch.value), Number(toplevels.value), tier.value);
     client = c;
     const { result, trip } = await drive<Head>(c, bucket, () => c.open());
     renderHead(result, trip);
