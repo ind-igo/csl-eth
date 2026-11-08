@@ -280,3 +280,14 @@ publicnode's `safe` is the justified checkpoint, so the note only ever said "jus
 ## 2026-11-03: the format crates vendored
 
 `pgm` and `csl-run` were used by path from `../cinder/crates/`, so one implementation served both PoCs. To publish this repo on its own, they are copied in as `crates/pgm` and `crates/csl-run` from cinder at `ba2b9d8` (the paged model), unchanged except that their workspace is now this one. The two copies may drift from here; this one is the one the Ethereum profile is measured with.
+
+## 2026-11-08: freshness in production, and the README rewritten
+
+The README said a reader sees state 1 to 11 minutes behind. That came from five cycles on the Mac publishing to a local directory (2026-11-03, above). Production says otherwise. Over 258 cycles on fafo-0 publishing to R2, from the 2026-11-06 11:34 UTC boundary to 11-08 12:51 UTC, taken from the producer's cycle lines:
+
+- 200 cycles published. 53 failed at the fetch, `gave up after 1260s` with no snap peer connected after 1,701 to 2,185 dials; 5 at the attested capture (2 under quorum, 3 where the optimistic update named another block). Failures are spread across every hour of the day; the longest run without one was 18 cycles.
+- Publish lag of the cycles that published: 23 s minimum, 103 s median, 452 s p90, 1,172 s maximum. Pivot latency is 24 s median and 266 s p90, transfer 24 s and 205 s; build is 1 s, publishing 6 s, head files under 2 s. The optimistic update was seen 13.6 to 27.4 s after its block, 15.5 s median, signed by 398 to 512.
+- 131 of 199 gaps between published snapshots were one epoch. A failed fetch holds its 21 minutes and costs about four boundaries, so gaps of five epochs (28 of them) are the commonest after one.
+- The age of the newest snapshot, sampled every 5 s from the first publish to the last: median about 14 minutes, p90 39, p99 73, maximum 91, mean about 18.
+
+So the attested tier's freshness here is set by peer acquisition, not by anything the layer does: the build and publish are seconds. Levers, none taken yet: give up on a fetch sooner than 1,260 s so a failure costs one boundary, not four; keep peers between cycles; or read state from a node of our own, which is the full-state plan anyway. The README now states the production numbers, calls the laptop run unrepresentative, and was cut from a build log to a description; the build log is this file.
