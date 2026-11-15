@@ -7,7 +7,12 @@ import { drive, loadWasm, type ClientLike, type WasmModule } from "./client.ts";
 import { fcrLine, tierLine, tierParam } from "./head.ts";
 import type { Head, ReadResult, RequestLog, Trip } from "./protocol.ts";
 
-const DEFAULT_BASE = "https://pub-a977a488180546bfb335de69b6f2e207.r2.dev";
+// Served from a Cloud Storage bucket (deploy/gcp/site.sh), the page reads the
+// bucket it came from; anywhere else, the R2 bucket.
+const DEFAULT_BASE =
+  location.hostname === "storage.googleapis.com"
+    ? new URL(".", location.href).href.replace(/\/+$/, "")
+    : "https://pub-a977a488180546bfb335de69b6f2e207.r2.dev";
 const DEFAULT_CHECKPOINT = "0x431b33af8452e2d644377405e69d4f382182ab906f31461190ca24cb3401d70b";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;

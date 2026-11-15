@@ -1,0 +1,20 @@
+{
+  "name": "csl-eth-infra",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "plan": "CLOUDSDK_CORE_PROJECT=csl-eth GOOGLE_PROJECT_ID=csl-eth alchemy plan --stage demo",
+    "deploy": "CLOUDSDK_CORE_PROJECT=csl-eth GOOGLE_PROJECT_ID=csl-eth alchemy deploy --stage demo"
+  },
+  "dependencies": {
+    "@alchemy.run/gcp": "2.0.0-beta.85",
+    "@effect/platform-bun": "^4.1.3",
+    "@effect/platform-node": "^4.1.3",
+    "alchemy": "2.0.0-beta.85",
+    "effect": "^4.1.4"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}

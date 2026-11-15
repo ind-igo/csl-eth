@@ -38,7 +38,12 @@ import { C, LANE, roundColor } from "./viz/palette.ts";
 import { explainEnd, renderTrie } from "./viz/trie.ts";
 import { reqLabel, renderWaterfall, sceneEnd } from "./viz/waterfall.ts";
 
-const DEFAULT_BASE = "https://pub-a977a488180546bfb335de69b6f2e207.r2.dev";
+// Served from a Cloud Storage bucket (deploy/gcp/site.sh), the page reads the
+// bucket it came from; anywhere else, the R2 bucket.
+const DEFAULT_BASE =
+  location.hostname === "storage.googleapis.com"
+    ? new URL(".", location.href).href.replace(/\/+$/, "")
+    : "https://pub-a977a488180546bfb335de69b6f2e207.r2.dev";
 const DEFAULT_CHECKPOINT = "0x431b33af8452e2d644377405e69d4f382182ab906f31461190ca24cb3401d70b";
 /// Display time each node check takes in a replay or after a live read.
 const CHECK_MS = 160;

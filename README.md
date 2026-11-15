@@ -6,10 +6,14 @@ byte range, and proves every value and every absence from the state root the
 beacon chain signed. No RPC and no node at read time. This is PoC 2 of the
 cold state layer; PoC 1 (cinder) built the same layer on a chain of its own.
 
-- **Client:** https://csl-eth.indigo-db8.workers.dev/?open
-- **Visualizer:** https://csl-eth.indigo-db8.workers.dev/viz shows each read's
-  proof node by node, lets you flip a byte to watch the client refuse, and
-  races the read against a by-hash baseline. Nothing on it is simulated.
+- **Client:** https://storage.googleapis.com/csl-eth-demo/index.html?open
+- **Visualizer:** https://storage.googleapis.com/csl-eth-demo/viz.html shows
+  each read's proof node by node, lets you flip a byte to watch the client
+  refuse, and races the read against a by-hash baseline. Nothing on it is
+  simulated.
+
+The page is served from the same Cloud Storage bucket it reads, so the whole
+demo is one bucket and one small VM that publishes to it.
 
 **Scope:** the bucket holds 1/4096 of mainnet state (account-trie prefix
 `1a7`, about 105,000 accounts), refreshed every epoch. A key outside the
@@ -42,7 +46,7 @@ report as a named source's claim, which the client does not verify.
 ## Numbers
 
 Read cost against Cloudflare R2, from Taipei through a VPN
-(2026-10-31 to 11-01, `results/m1.md`):
+(2026-10-31 to 11-01, `results/m1.md`; not yet re-measured on Cloud Storage):
 
 - **Account:** 2.7 requests, 37 KB, one round (two when its index pages are
   cold), 135 ms p50.
@@ -81,8 +85,8 @@ above. Details in `docs/decisions.md`.
   are the next tables: append-only, verified against each header's
   `transactionsRoot` and `receiptsRoot`, so a light client and a basic
   indexer read them the same way. Not built.
-- **The producer needs care.** It restarts under k3s, but nothing alerts when
-  cycles fail, and each failed fetch costs about four epochs.
+- **The producer needs care.** It restarts under systemd, but nothing alerts
+  when cycles fail, and each failed fetch costs about four epochs.
 - **The checkpoint.** The default root (slot 15,661,216, 2026-11-15) must be
   replaced before it leaves the weak-subjectivity period, around the end of
   November.
@@ -119,8 +123,14 @@ cargo build --release -p csl-eth-snap
 # the browser page
 mise install && ./scripts/build-wasm.sh
 cd browser && bun install && bun run serve                     # http://127.0.0.1:8791/
-bun run site && (cd deploy && cf deploy)
+
+# the demo on Google Cloud (project csl-eth): bucket, VM, network, in one Alchemy stack
+cd infra && bun install && bun run plan && bun run deploy --yes
+deploy/gcp/apply.sh        # build the producer on the VM, run it under systemd
+deploy/gcp/site.sh         # build the page, upload it into the bucket
 ```
 
-Production runs as a k3s Deployment (`deploy/k8s`). The reasoning behind each
-choice is in `docs/decisions.md`, in the order it was made.
+The producer publishes with `scripts/gcs-publish.sh`, as the VM's service
+account; pointers are served `no-cache` and hash-named files `immutable`.
+The reasoning behind each choice is in `docs/decisions.md`, in the order it
+was made.
