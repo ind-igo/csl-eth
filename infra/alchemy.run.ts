@@ -65,7 +65,7 @@ mkdir -p /data/produce /opt/csl-eth /etc/csl-eth
 chown csl:csl /data/produce
 if ! command -v cc >/dev/null || ! command -v rsync >/dev/null; then
   apt-get update -q
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential clang pkg-config curl rsync git
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential clang libclang-dev pkg-config curl rsync git zstd
 fi
 `;
 
@@ -161,12 +161,26 @@ export default Alchemy.Stack(
       shieldedInstanceConfig: { enableSecureBoot: true, enableVtpm: true, enableIntegrityMonitoring: true },
     });
 
+    // The full-state node is not in this stack: it is a burst VM with
+    // local NVMe SSDs (which Alchemy cannot attach, and which no quota here
+    // limits), created and deleted by deploy/gcp/full-export.sh on this
+    // network, with the producer's service account and the "node" tag.
+    yield* GCP.Compute.Firewall("devp2p", {
+      firewallName: "csl-eth-devp2p",
+      network: netUrl,
+      allowed: [{ protocol: "tcp", ports: ["30303"] }, { protocol: "udp", ports: ["30303"] }],
+      sourceRanges: ["0.0.0.0/0"],
+      targetTags: ["node"],
+    });
     return {
       bucket: bucket.bucketName,
       page: Output.interpolate`https://storage.googleapis.com/${bucket.bucketName}/index.html?open`,
       vm: vm.instanceName,
       zone: vm.zone,
       publicIp: vm.natIP,
+      network: net.networkName,
+      subnet: subnet.subnetworkName,
+      serviceAccount: producerSa.email,
     };
   }),
 );

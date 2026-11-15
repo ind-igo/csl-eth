@@ -1,0 +1,36 @@
+[package]
+name = "export-reth"
+description = "Export a synced reth node's state at one block into the csl-eth bucket layout (crates/store's streaming exporter over reth's hashed tables)"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace: reth's crates (edition 2024, their own alloy pins) stay
+# out of the main workspace, whose snap crate pins older reth wire crates.
+[workspace]
+
+[dependencies]
+csl-eth-store = { path = "../../crates/store" }
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.11.0", features = ["node", "provider"] }
+alloy-primitives = "1"
+clap = { version = "4", features = ["derive"] }
+eyre = "0.6"
+serde_json = "1"
+
+[profile.release]
+debug = "line-tables-only"
+
+# reth v2.11.0's own patches (its Cargo.toml), which do not reach dependents:
+# without them reth-primitives-traits comes from crates.io and does not build.
+[patch."https://github.com/alloy-rs/evm2"]
+evm2 = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+evm2-inspectors = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+evm2-jit = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+[patch.crates-io]
+reth-codecs = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-codecs-derive = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-rpc-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-zstd-compressors = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
