@@ -90,12 +90,13 @@ impl NodeKey {
     /// hashed address rather than its storage root keeps keys stable across
     /// snapshots.
     pub fn storage_table_key(&self, owner: &B256) -> Result<[u8; 32], TooDeep> {
+        const D: usize = STORAGE_NODE_DOMAIN.len();
         let tail = self.table_key()?;
-        let mut pre = Vec::with_capacity(STORAGE_NODE_DOMAIN.len() + 64);
-        pre.extend_from_slice(STORAGE_NODE_DOMAIN);
-        pre.extend_from_slice(owner.as_slice());
-        pre.extend_from_slice(&tail);
-        Ok(keccak256(&pre).0)
+        let mut pre = [0u8; D + 64];
+        pre[..D].copy_from_slice(STORAGE_NODE_DOMAIN);
+        pre[D..D + 32].copy_from_slice(owner.as_slice());
+        pre[D + 32..].copy_from_slice(&tail);
+        Ok(keccak256(pre).0)
     }
 }
 
@@ -167,6 +168,11 @@ mod tests {
             .unwrap();
         assert_ne!(a, b);
         assert_ne!(a, c);
+        // The preimage is exactly domain ‖ owner ‖ packed_path[31] ‖ depth.
+        let mut pre = STORAGE_NODE_DOMAIN.to_vec();
+        pre.extend_from_slice(&[1u8; 32]);
+        pre.extend_from_slice(&NodeKey::prefix(&full, 2).table_key().unwrap());
+        assert_eq!(a, keccak256(&pre).0);
     }
 
     #[test]

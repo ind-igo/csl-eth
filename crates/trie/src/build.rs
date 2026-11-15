@@ -37,6 +37,14 @@ use core::fmt;
 /// Receives every emitted node.
 pub trait Sink {
     fn node(&mut self, key: NodeKey, rlp: &[u8]);
+
+    /// The same node with `keccak(rlp)` when the builder already has it
+    /// (every hashed node; `None` for a root shorter than 32 bytes). A sink
+    /// that keys nodes by hash overrides this to skip hashing them again.
+    fn node_hashed(&mut self, key: NodeKey, rlp: &[u8], hash: Option<B256>) {
+        let _ = hash;
+        self.node(key, rlp)
+    }
 }
 
 impl<F: FnMut(NodeKey, &[u8])> Sink for F {
@@ -254,7 +262,7 @@ impl<S: Sink> Builder<S> {
     fn emit(&mut self, key: NodeKey, force: bool) -> RlpNode {
         let node = RlpNode::from_rlp(&self.buf);
         if force || node.is_hash() {
-            self.sink.node(key, &self.buf);
+            self.sink.node_hashed(key, &self.buf, node.as_hash());
             self.nodes += 1;
         } else {
             self.embedded += 1;
