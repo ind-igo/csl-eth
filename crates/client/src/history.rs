@@ -36,11 +36,17 @@
 //! over ranges of periods (two for a fresh full history), every one probed
 //! in the same round.
 //!
-//! Old headers come by the `parentHash` route only: a header a day back is
-//! a day of headers. The accumulator route (`historical_summaries`) is not
-//! built.
+//! Old headers come by one of two routes. Near the anchor, the
+//! `parentHash` walk: every header between, 819 B each on mainnet. Far
+//! from it, the accumulator ([`crate::beacon`]): the one header's row, its
+//! `keccak` proven to be the execution payload of the beacon block at the
+//! slot its timestamp names, through the verified beacon head's
+//! `block_roots` or `historical_summaries`, about 1.5 KB of proof and one
+//! round more. Headers proven that way are held apart from the walked
+//! chain, which stays contiguous from the anchor. [`HeaderRoute`] picks.
 
 use crate::{
+    beacon::{slot_of_timestamp, Accumulator, BeaconAnchor},
     head::{verify_head, HeadError},
     is_pending, Driver, Hint, Pending, RunView, Store, VerifiedHead,
 };
@@ -104,6 +110,9 @@ pub enum Insufficient {
     Block { block: u64, what: String },
     /// A verified leaf that does not decode as the profile says.
     Value { block: u64, what: &'static str },
+    /// The accumulator route refused block `block`'s header (with
+    /// [`HeaderRoute::Accumulator`]; `Auto` walks instead).
+    Accumulator { block: u64, what: String },
     /// More rounds than a read may take.
     Budget,
 }
@@ -126,6 +135,7 @@ impl fmt::Display for Insufficient {
             Insufficient::Header { block, what } => write!(f, "header {block}: {what}"),
             Insufficient::Block { block, what } => write!(f, "block {block}: {what}"),
             Insufficient::Value { block, what } => write!(f, "block {block}: {what}"),
+            Insufficient::Accumulator { block, what } => write!(f, "header {block}: {what}"),
             Insufficient::Budget => write!(f, "round budget exhausted"),
         }
     }
@@ -145,6 +155,11 @@ pub struct HistoryCost {
     pub table_bytes: BTreeMap<&'static str, u64>,
     /// Headers this read verified (not those the session already held).
     pub headers_verified: u64,
+    /// Of those, headers proven by the accumulator route.
+    pub headers_by_accumulator: u64,
+    /// Accumulator proofs that failed in this read (the read then walked,
+    /// under [`HeaderRoute::Auto`]).
+    pub accumulator_failures: u64,
     /// Blocks whose transactions or receipts this read rebuilt.
     pub blocks_verified: u64,
 }
@@ -208,6 +223,25 @@ pub struct Logs {
     /// the bloom's false positives.
     pub blocks_without_match: u64,
 }
+
+/// How a header far from the anchor is verified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderRoute {
+    /// The accumulator when the history has a beacon head and the header
+    /// is at least `accum_min_depth` blocks below what the walk already
+    /// holds; the walk otherwise, and whenever the accumulator fails.
+    Auto,
+    /// Always the `parentHash` walk.
+    Walk,
+    /// Always the accumulator, a failure ending the read `Insufficient`
+    /// (fault tables, measurement).
+    Accumulator,
+}
+
+/// Below this many blocks from the walked chain a header is walked to:
+/// measured on mainnet, a 64-block walk costs about what the accumulator's
+/// row and proof do, in one round fewer.
+pub const ACCUM_MIN_DEPTH: u64 = 64;
 
 /// The manifest's checks: the anchor's block, this format, contiguous
 /// periods covering the span, `tx_lookup` pieces covering the periods.
@@ -342,6 +376,13 @@ impl<D: Driver> HistoryOpener<D> {
             readers,
             rels,
             headers: BTreeMap::new(),
+            pinned: BTreeMap::new(),
+            accumulator: None,
+            route: HeaderRoute::Auto,
+            accum_min_depth: ACCUM_MIN_DEPTH,
+            pinned_this_read: 0,
+            accum_failures: 0,
+            accum_refused: BTreeSet::new(),
             keep_headers: true,
             hint: Hint::none(),
             max_rounds: 64,
@@ -366,6 +407,18 @@ pub struct History<D> {
     rels: HashMap<String, u16>,
     /// Verified headers, always one contiguous range ending at the anchor.
     headers: BTreeMap<u64, HeaderFields>,
+    /// Headers the accumulator proved, outside that range.
+    pinned: BTreeMap<u64, HeaderFields>,
+    accumulator: Option<Accumulator>,
+    /// How a header far from the walked chain is verified.
+    pub route: HeaderRoute,
+    /// Under [`HeaderRoute::Auto`], the fewest blocks a walk must cover
+    /// before the accumulator is used instead.
+    pub accum_min_depth: u64,
+    pinned_this_read: u64,
+    accum_failures: u64,
+    /// Blocks the accumulator failed for this session: walked to after.
+    accum_refused: BTreeSet<u64>,
     /// Keep verified headers across reads (an indexer's or a wallet's
     /// session). Off, every read walks from the anchor again.
     pub keep_headers: bool,
@@ -406,11 +459,24 @@ impl<D: Driver> History<D> {
 
     /// Verified headers the session holds.
     pub fn verified_headers(&self) -> usize {
-        self.headers.len()
+        self.headers.len() + self.pinned.len()
     }
 
     pub fn forget_headers(&mut self) {
         self.headers.clear();
+        self.pinned.clear();
+    }
+
+    /// Prove old headers to this verified beacon head through the
+    /// accumulator files (`beacon/`), when the route allows. The head must
+    /// be one the client verified: [`open_history_at_head`] passes the
+    /// head the anchor came from.
+    pub fn set_beacon(&mut self, anchor: BeaconAnchor) {
+        self.accumulator = Some(Accumulator::new(anchor));
+    }
+
+    pub fn beacon(&self) -> Option<BeaconAnchor> {
+        self.accumulator.as_ref().map(|a| a.anchor)
     }
 
     /// Forget the session: verified headers and fetched blobs. The next
@@ -418,7 +484,12 @@ impl<D: Driver> History<D> {
     /// the run models already loaded, which an open span keeps.
     pub fn forget(&mut self) {
         self.headers.clear();
+        self.pinned.clear();
+        self.accum_refused.clear();
         self.store.forget_files("blobs/");
+        if let Some(a) = &mut self.accumulator {
+            *a = Accumulator::new(a.anchor);
+        }
     }
 
     /// A read is starting.
@@ -427,8 +498,11 @@ impl<D: Driver> History<D> {
         self.tally.clear();
         if !self.keep_headers {
             self.headers.clear();
+            self.pinned.clear();
         }
         self.headers_at_begin = self.headers.len();
+        self.pinned_this_read = 0;
+        self.accum_failures = 0;
         self.blocks_verified = 0;
     }
 
@@ -445,6 +519,7 @@ impl<D: Driver> History<D> {
                     Some(t) => history_table_name(*t),
                     None if w.rel().starts_with("blobs/") => "blobs",
                     None if w.rel().starts_with("history/packs/") => "packs",
+                    None if w.rel().starts_with("beacon/") => "beacon",
                     None => "files",
                 };
                 *self.tally.entry(name).or_default() += v.len() as u64;
@@ -461,7 +536,10 @@ impl<D: Driver> History<D> {
             bytes,
             rounds,
             table_bytes: self.tally.clone(),
-            headers_verified: self.headers.len().saturating_sub(self.headers_at_begin) as u64,
+            headers_verified: self.headers.len().saturating_sub(self.headers_at_begin) as u64
+                + self.pinned_this_read,
+            headers_by_accumulator: self.pinned_this_read,
+            accumulator_failures: self.accum_failures,
             blocks_verified: self.blocks_verified,
         }
     }
@@ -489,8 +567,8 @@ impl<D: Driver> History<D> {
         self.run(|s| s.try_tx(&h))
     }
 
-    /// The header of block `number`, by the `parentHash` route from the
-    /// anchor.
+    /// The header of block `number`, by the walk from the anchor or the
+    /// accumulator, as [`HeaderRoute`] picks.
     pub fn header(&mut self, number: u64) -> (HRead<HeaderFields>, HistoryCost) {
         self.run(|s| s.try_header(number))
     }
@@ -508,10 +586,104 @@ impl<D: Driver> History<D> {
     }
 
     pub fn try_header(&mut self, number: u64) -> Result<HRead<HeaderFields>, Pending> {
-        if let Err(e) = self.try_headers(number)? {
+        if let Err(e) = self.try_header_routed(number)? {
             return Ok(Err(e));
         }
-        Ok(Ok(self.headers[&number].clone()))
+        Ok(Ok(self.held(number).expect("verified").clone()))
+    }
+
+    /// A verified header the session holds, by either route.
+    fn held(&self, number: u64) -> Option<&HeaderFields> {
+        self.headers
+            .get(&number)
+            .or_else(|| self.pinned.get(&number))
+    }
+
+    /// Whether the accumulator is the route for `number` now.
+    fn use_accumulator(&self, number: u64) -> bool {
+        let Some(a) = &self.accumulator else {
+            return false;
+        };
+        match self.route {
+            HeaderRoute::Walk => false,
+            HeaderRoute::Accumulator => true,
+            HeaderRoute::Auto if self.accum_refused.contains(&number) => false,
+            HeaderRoute::Auto => {
+                let top = match self.headers.keys().next() {
+                    Some(&low) => low,
+                    None => self.anchor.number + 1,
+                };
+                a.available() && top.saturating_sub(number) >= self.accum_min_depth
+            }
+        }
+    }
+
+    /// One header verified into the session by the route that fits.
+    fn try_header_routed(&mut self, number: u64) -> Result<HRead<()>, Pending> {
+        if self.held(number).is_some() {
+            return Ok(Ok(()));
+        }
+        if !self.in_span(number) {
+            return Ok(Err(Insufficient::OutOfSpan { block: number }));
+        }
+        if !self.use_accumulator(number) {
+            return self.try_headers(number);
+        }
+        match self.try_header_by_accumulator(number)? {
+            Ok(()) => Ok(Ok(())),
+            Err(e) if self.route == HeaderRoute::Accumulator => Ok(Err(e)),
+            Err(_) => {
+                self.accum_failures += 1;
+                self.accum_refused.insert(number);
+                self.try_headers(number)
+            }
+        }
+    }
+
+    /// The header row of `number` (unverified), then its hash proven at
+    /// the slot its timestamp names. The row and the head's preamble come
+    /// in one round, the proof's records in the next.
+    fn try_header_by_accumulator(&mut self, number: u64) -> Result<HRead<()>, Pending> {
+        let Some(pi) = self.manifest.period_of(number) else {
+            return Ok(Err(Insufficient::OutOfSpan { block: number }));
+        };
+        let k = block_key(number, 0);
+        let es = match self.scan(pi, H_HEADERS, &k, &k)? {
+            Ok(es) => es,
+            Err(e) => return Ok(Err(e)),
+        };
+        let values = match self.resolve(&es)? {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
+        let refuse = |what: String| {
+            Ok(Err(Insufficient::Accumulator {
+                block: number,
+                what,
+            }))
+        };
+        let [rlp] = values.as_slice() else {
+            return refuse(format!("{} header rows", values.len()));
+        };
+        let h = match decode_header(rlp) {
+            Ok(h) => h,
+            Err(w) => return refuse(w.into()),
+        };
+        if h.number != number {
+            return refuse(format!("the row carries number {}", h.number));
+        }
+        let Some(slot) = slot_of_timestamp(h.timestamp) else {
+            return refuse(format!("timestamp {} is off the slot clock", h.timestamp));
+        };
+        let acc = self.accumulator.as_mut().expect("route chosen with one");
+        match acc.try_prove(&self.store, slot, &h.hash)? {
+            Ok(()) => {
+                self.pinned.insert(number, h);
+                self.pinned_this_read += 1;
+                Ok(Ok(()))
+            }
+            Err(e) => refuse(e.to_string()),
+        }
     }
 
     pub fn try_tx(&mut self, hash: &B256) -> Result<HRead<TxReceipt>, Pending> {
@@ -559,9 +731,9 @@ impl<D: Driver> History<D> {
             ))));
         }
 
-        // The block: headers down to it, its transactions and receipts, in
-        // one round.
-        let hs = self.try_headers(block);
+        // The block: its header (walked to, or its row and the head's
+        // preamble), its transactions and receipts, in one round.
+        let hs = self.try_header_routed(block);
         let txs = self.try_leaves(block, H_TRANSACTIONS);
         let rs = self.try_leaves(block, H_RECEIPTS);
         let (hs, txs, rs) = (hs?, txs?, rs?);
@@ -572,7 +744,7 @@ impl<D: Driver> History<D> {
             (Ok(t), Ok(r)) => (t, r),
             (Err(e), _) | (_, Err(e)) => return Ok(Err(e)),
         };
-        let h = self.headers[&block].clone();
+        let h = self.held(block).expect("verified").clone();
         if let Err(e) = verify_leaves(&h, &txs, &rs) {
             return Ok(Err(e));
         }
@@ -1075,6 +1247,7 @@ pub fn open_history_at_head<D: Driver>(
     now: SystemTime,
 ) -> Result<(History<D>, VerifiedHead), HistoryOpenError> {
     let head = verify_head(&driver, checkpoint, now).map_err(HistoryOpenError::Head)?;
-    let h = History::open(driver, Anchor::from(&head)).map_err(HistoryOpenError::Open)?;
+    let mut h = History::open(driver, Anchor::from(&head)).map_err(HistoryOpenError::Open)?;
+    h.set_beacon(BeaconAnchor::from(&head));
     Ok((h, head))
 }

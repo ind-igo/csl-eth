@@ -13,6 +13,7 @@ alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-trie = { workspace = true, features = ["ethereum"] }
 alloy-rlp.workspace = true
 blake3.workspace = true
+sha2 = "0.10"
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

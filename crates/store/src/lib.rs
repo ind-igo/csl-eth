@@ -19,6 +19,7 @@
 
 pub mod export;
 pub mod extsort;
+pub mod beacon;
 pub mod history;
 pub mod producer;
 

@@ -57,6 +57,7 @@ pub mod http;
 pub use http::HttpDriver;
 
 pub mod head;
+pub mod beacon;
 pub mod history;
 pub use head::{
     open_at_head, open_at_head_with, FcrReport, HeadOpenError, HeadOpener, TierChoice, VerifiedHead,
