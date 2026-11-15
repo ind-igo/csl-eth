@@ -2290,6 +2290,7 @@ name = "csl-eth-store"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-rlp",
  "alloy-trie",
  "blake3",
  "csl-eth-trie",
@@ -3075,10 +3076,15 @@ dependencies = [
 name = "export-reth"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
  "alloy-primitives",
+ "alloy-rlp",
+ "blake3",
  "clap",
  "csl-eth-store",
  "eyre",
+ "reth-era",
  "reth-ethereum",
  "serde_json",
 ]

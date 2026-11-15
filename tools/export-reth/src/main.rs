@@ -25,6 +25,11 @@
 //!
 //! Progress goes to stderr as one JSON line per tick; the final stats go to
 //! stdout.
+//!
+//! `export-reth history …` is the other job, the history tables from
+//! reth's static files: see [`history`].
+
+mod history;
 
 use alloy_primitives::{B256, U256};
 use clap::Parser;
@@ -278,6 +283,9 @@ fn line(s: &ExportStats) -> serde_json::Value {
 }
 
 fn main() -> eyre::Result<()> {
+    if std::env::args_os().nth(1).is_some_and(|a| a == "history") {
+        return history::main(std::env::args_os().skip(1));
+    }
     let args = Args::parse();
     let spec = ChainSpecBuilder::mainnet().build();
     let runtime = reth_ethereum::tasks::Runtime::test();
