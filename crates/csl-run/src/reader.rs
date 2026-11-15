@@ -97,8 +97,8 @@ pub struct Stats {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lookup {
-    /// A tag 0 value, or for a tag 2 entry the 32-byte blob hash
-    /// ([`Reader::get_entry`] tells them apart).
+    /// A tag 0 value, for a tag 2 entry the 32-byte blob hash, for a tag 3
+    /// entry its pack location ([`Reader::get_entry`] tells them apart).
     Found(Vec<u8>),
     Tombstone,
     /// The fence page that would hold the key does not. Verified absent

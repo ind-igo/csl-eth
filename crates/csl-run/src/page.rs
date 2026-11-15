@@ -7,6 +7,8 @@
 //!          variable: body = len: u16 ‖ value[len]
 //!   tag 1  body empty
 //!   tag 2  variable only: body = blake3(value)[32], bytes at blobs/<hash>
+//!   tag 3  variable only: body = off: u64 ‖ len: u32 ‖ blake3(value)[32],
+//!          the bytes at [off, off + len) of a pack file the profile names
 //! ```
 //!
 //! Packing is maximal and canonical. Fixed: every page except the last
@@ -28,11 +30,25 @@ pub const MAX_INLINE_VALUE: usize = PAGE - PAGE_HEADER - 2 - KEY - 1 - 2;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub key: [u8; KEY],
-    /// 0 value, 1 tombstone, 2 blob (variable layout only).
+    /// 0 value, 1 tombstone, 2 blob, 3 packed (2 and 3 in the variable
+    /// layout only).
     pub tag: u8,
     /// Tag 0: the value (`value_size` bytes in the fixed layout). Tag 1:
-    /// empty. Tag 2: the 32-byte `blake3` of the value.
+    /// empty. Tag 2: the 32-byte `blake3` of the value. Tag 3: where the
+    /// value sits in a pack file and its `blake3` ([`PACKED_BODY`] bytes,
+    /// [`Entry::packed_ref`]).
     pub value: Vec<u8>,
+}
+
+/// A tag 3 body: `off: u64 ‖ len: u32 ‖ blake3[32]`, little-endian.
+pub const PACKED_BODY: usize = 8 + 4 + 32;
+
+/// Where a packed value is: its byte range in the pack, and its `blake3`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackedRef {
+    pub off: u64,
+    pub len: u32,
+    pub hash: [u8; 32],
 }
 
 impl Entry {
@@ -44,6 +60,26 @@ impl Entry {
     }
     pub fn blob(key: [u8; KEY], hash: [u8; 32]) -> Entry {
         Entry { key, tag: 2, value: hash.to_vec() }
+    }
+    pub fn packed(key: [u8; KEY], r: PackedRef) -> Entry {
+        let mut value = Vec::with_capacity(PACKED_BODY);
+        value.extend_from_slice(&r.off.to_le_bytes());
+        value.extend_from_slice(&r.len.to_le_bytes());
+        value.extend_from_slice(&r.hash);
+        Entry { key, tag: 3, value }
+    }
+
+    /// A tag 3 entry's location, `None` for any other entry.
+    pub fn packed_ref(&self) -> Option<PackedRef> {
+        if self.tag != 3 || self.value.len() != PACKED_BODY {
+            return None;
+        }
+        let v = &self.value;
+        Some(PackedRef {
+            off: u64::from_le_bytes(v[0..8].try_into().unwrap()),
+            len: u32::from_le_bytes(v[8..12].try_into().unwrap()),
+            hash: v[12..44].try_into().unwrap(),
+        })
     }
 
     /// Validity in the fixed layout: tag 0 of `value_size` bytes or tag 1.
@@ -66,6 +102,7 @@ impl Entry {
             (EntryLayout::Variable, 0) => Err(Error::BadValueLen { expected: MAX_INLINE_VALUE, got: len }),
             (_, 1) => want(0),
             (EntryLayout::Variable, 2) => want(32),
+            (EntryLayout::Variable, 3) => want(PACKED_BODY),
             (_, t) => Err(Error::BadTag(t)),
         }
     }
@@ -203,6 +240,7 @@ impl Page {
                 }
                 (_, 1) => 0,
                 (EntryLayout::Variable, 2) => 32,
+                (EntryLayout::Variable, 3) => PACKED_BODY,
                 _ => return Err(bad("tag")),
             };
             if o + body_len > PAGE {

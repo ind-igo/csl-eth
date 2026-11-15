@@ -29,7 +29,7 @@ pub mod writer;
 
 pub use manifest::{ColdRoot, Manifest, RunRef};
 pub use model::{ModelPage, Top, MODEL_PAGE_SEGMENTS, TOP_MAX_SEGMENTS};
-pub use page::{Entry, Page, MAX_INLINE_VALUE};
+pub use page::{Entry, PackedRef, Page, MAX_INLINE_VALUE, PACKED_BODY};
 pub use reader::{Lookup, Path, Reader, Source, Stats};
 pub use writer::{write_all, write_all_with, Built, Writer};
 
@@ -72,7 +72,7 @@ pub enum EntryLayout {
     Fixed { value_size: u32 },
     /// An offset table, then entries packed greedily in key order while
     /// `66 + 2n + Σ bytes ≤ 4096`; tag 0 bodies are `len: u16 ‖ value`,
-    /// tag 2 bodies a 32-byte blob hash.
+    /// tag 2 bodies a 32-byte blob hash, tag 3 bodies a pack location.
     Variable,
 }
 

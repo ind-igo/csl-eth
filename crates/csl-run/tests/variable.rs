@@ -23,6 +23,8 @@ fn dataset(n: usize, seed: u64, max: usize) -> Vec<Entry> {
             Entry::tombstone(k)
         } else if i % 13 == 5 {
             Entry::blob(k, rng.random())
+        } else if i % 17 == 7 {
+            Entry::packed(k, csl_run::PackedRef { off: rng.random(), len: rng.random(), hash: rng.random() })
         } else {
             let len = rng.random_range(1..=max);
             Entry::value(k, (0..len).map(|_| rng.random()).collect())
@@ -131,9 +133,12 @@ fn writer_rejects_bad_input_and_proofs() {
     let mut hash = es.clone();
     hash[1] = Entry { key: hash[1].key, tag: 2, value: vec![0; 31] };
     assert!(matches!(write_all_with(cfg(1), v, &hash), Err(Error::BadValueLen { expected: 32, got: 31 })));
+    let mut packed = es.clone();
+    packed[1] = Entry { key: packed[1].key, tag: 3, value: vec![0; 32] };
+    assert!(matches!(write_all_with(cfg(1), v, &packed), Err(Error::BadValueLen { expected: 44, got: 32 })));
     let mut tag = es.clone();
-    tag[2].tag = 3;
-    assert!(matches!(write_all_with(cfg(1), v, &tag), Err(Error::BadTag(3))));
+    tag[2].tag = 4;
+    assert!(matches!(write_all_with(cfg(1), v, &tag), Err(Error::BadTag(4))));
     // Variable with proofs is not a format the writer streams.
     let with_proofs = Format { layout: EntryLayout::Variable, inline_proofs: true, paged_model: false };
     assert!(matches!(write_all_with(cfg(1), with_proofs, &es), Err(Error::Layout(_))));
@@ -141,6 +146,8 @@ fn writer_rejects_bad_input_and_proofs() {
     let (bytes, _) = write_all_with(cfg(1), v, &es).unwrap();
     assert!(bytes.len() > PAGE);
     assert!(matches!(csl_run::write_all(Config { value_size: 24, ..cfg(1) }, &[Entry::blob([1; 32], [0; 32])]), Err(Error::BadTag(2))));
+    let p = csl_run::PackedRef { off: 1, len: 2, hash: [3; 32] };
+    assert!(matches!(csl_run::write_all(Config { value_size: 44, ..cfg(1) }, &[Entry::packed([1; 32], p)]), Err(Error::BadTag(3))));
 }
 
 #[test]
