@@ -30,9 +30,9 @@ use csl_eth_client::{
 use csl_eth_head::{Chain, DirSource};
 use csl_eth_store::{
     beacon::{
-        chunk_file, chunk_path, chunk_record_range, chunk_root, head_path, period_path, route,
-        route_ranges, state_depth, summaries_file, summaries_path, top_records, vector_root,
-        verify_block_hash, BeaconHeader, BodyProof, HeadPreamble, CAPELLA_PERIOD,
+        chunk_blocks, chunk_file, chunk_path, chunk_record_range, chunk_root, head_path,
+        period_path, route, route_ranges, state_depth, summaries_file, summaries_path, top_records,
+        vector_root, verify_block_hash, BeaconHeader, BodyProof, HeadPreamble, CAPELLA_PERIOD,
         CHUNKS_PER_PERIOD, CHUNK_SLOTS, HEAD_PREAMBLE, SLOTS_PER_HISTORICAL_ROOT,
         STATE_BLOCK_ROOTS, STATE_HISTORICAL_SUMMARIES,
     },
@@ -710,10 +710,14 @@ fn build(a: &BuildArgs) -> Result<Value, String> {
         plan.insert(c, rs);
     }
     chunks.retain(|c| plan.contains_key(c));
+    // One body per block: a root repeated at an empty slot has no block of
+    // its own, and the root a chunk opens on may be an earlier block's (a
+    // predecessor, before Capella at Capella's first chunk), which
+    // `chunk_file` verifies and gives no proof to.
     let need: BTreeSet<B256> = plan
         .iter()
         .filter(|(c, _)| !a.bucket.join(chunk_path(**c)).exists())
-        .flat_map(|(_, rs)| rs.iter().copied())
+        .flat_map(|(_, rs)| chunk_blocks(rs))
         .collect();
     let (bodies, fetched, fetched_bytes) = bodies(&a.work, &a.block_beacon, &need, a.threads)?;
     for (&c, rs) in &plan {
@@ -743,6 +747,9 @@ fn build(a: &BuildArgs) -> Result<Value, String> {
     for (&c, rs) in &plan {
         for (k, r) in rs.iter().enumerate() {
             let s = c * CHUNK_SLOTS + k as u64;
+            if k > 0 && rs[k - 1] == *r {
+                continue; // an empty slot
+            }
             let b = &bodies.get(r).cloned().or_else(|| {
                 std::fs::read(body_cache(&a.work, r))
                     .ok()
@@ -753,7 +760,7 @@ fn build(a: &BuildArgs) -> Result<Value, String> {
                 return Err(format!("no body proof for {r}"));
             };
             if b.slot != s {
-                continue; // an empty slot: the root is an earlier block's
+                continue; // a predecessor: the root is an earlier block's
             }
             let Ok(rt) = route(head.slot, s) else {
                 unreachable += 1;
@@ -1250,5 +1257,103 @@ mod tests {
             assert!(verify_multiproof(&gis, &vals[1..], &root).is_err());
         }
         assert_eq!(sha(&node(2), &node(3)), root);
+    }
+
+    const CAPELLA_CHUNK: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/beacon/testdata/capella-first-chunk"
+    );
+
+    /// Capella's first chunk (97,024, slots 6,209,536 to 599) on mainnet:
+    /// 6,209,536 and 537 were missed, so the chunk opens on the root of the
+    /// last Bellatrix block (6,209,535), and 11 more slots were missed
+    /// inside it. The roots and body proofs are from publicnode (roots by
+    /// `/eth/v1/beacon/headers`, not proven to a state here: this tests
+    /// the producer's handling of the chunk, not the chain). The Bellatrix
+    /// block itself is kept whole, to test its decoding.
+    #[test]
+    fn capella_first_chunk_opens_on_a_bellatrix_root() {
+        let v: Value =
+            serde_json::from_slice(&std::fs::read(format!("{CAPELLA_CHUNK}/chunk.json")).unwrap())
+                .unwrap();
+        let roots: Vec<B256> = v["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| b256(r).unwrap())
+            .collect();
+        let bodies: HashMap<B256, BodyProof> = v["bodies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                let b = decode_body(b).unwrap();
+                (b.block_root, b)
+            })
+            .collect();
+        let chunk = csl_eth_store::beacon::CAPELLA_SLOT / CHUNK_SLOTS;
+        assert_eq!(chunk, 97_024);
+        // One body per block: 51 Capella blocks and the predecessor.
+        let need = chunk_blocks(&roots);
+        assert_eq!(need.len(), 52);
+        assert!(need.iter().all(|r| bodies.contains_key(r)));
+        assert_eq!(roots[0], roots[1]);
+        let pred = &bodies[&roots[0]];
+        assert_eq!(pred.slot, 6_209_535);
+
+        // The predecessor's proof comes from the whole Bellatrix block,
+        // and hashes to the root the chunk opens on.
+        let raw = std::fs::read(format!("{CAPELLA_CHUNK}/bellatrix-6209535.json")).unwrap();
+        let b = ssz::body_proof_any(&raw).unwrap();
+        assert_eq!(b, *pred);
+        assert_eq!(b.root(), roots[0]);
+
+        let file = chunk_file(chunk, &roots, &bodies).unwrap();
+        let s0 = chunk * CHUNK_SLOTS;
+        let mut proven = 0;
+        for k in 0..64usize {
+            let s = s0 + k as u64;
+            let tail = &file[k * 576 + 192..(k + 1) * 576];
+            let own = bodies.get(&roots[k]).filter(|b| b.slot == s);
+            assert_eq!(own.is_some(), tail.iter().any(|x| *x != 0), "slot {s}");
+            if let Some(b) = own {
+                let r = csl_eth_store::beacon::block_root_from(s, &b.block_hash, tail);
+                assert_eq!(r, roots[k]);
+                proven += 1;
+            }
+        }
+        assert_eq!(proven, 51);
+        // The client still refuses the Bellatrix slot.
+        assert!(route(s0 + 64, 6_209_535).is_err());
+    }
+
+    /// Writes `chunk.json` from a directory of the chunk's blocks as the
+    /// beacon API's JSON (`blocks/<root>.json`) and `roots.txt`.
+    #[test]
+    #[ignore = "regenerates a fixture from fetched blocks"]
+    fn export_capella_chunk() {
+        let dir = std::env::var("CSL_CAPELLA_CHUNK_DIR").unwrap();
+        let roots: Vec<B256> = std::fs::read_to_string(format!("{dir}/roots.txt"))
+            .unwrap()
+            .lines()
+            .map(|l| l.split_whitespace().nth(1).unwrap().parse().unwrap())
+            .collect();
+        let bodies: Vec<Value> = chunk_blocks(&roots)
+            .iter()
+            .map(|r| {
+                let b =
+                    ssz::body_proof_any(&std::fs::read(format!("{dir}/blocks/{r}.json")).unwrap())
+                        .unwrap();
+                assert_eq!(b.block_root, *r);
+                encode_body(&b)
+            })
+            .collect();
+        let v = json!({"roots": roots.iter().map(|r| r.to_string()).collect::<Vec<_>>(), "bodies": bodies});
+        std::fs::create_dir_all(CAPELLA_CHUNK).unwrap();
+        std::fs::write(
+            format!("{CAPELLA_CHUNK}/chunk.json"),
+            serde_json::to_vec_pretty(&v).unwrap(),
+        )
+        .unwrap();
     }
 }

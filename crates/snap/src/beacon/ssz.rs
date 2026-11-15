@@ -1,9 +1,11 @@
-//! Signed beacon blocks, Capella to Fulu, decoded only to hash: the
+//! Signed beacon blocks, Bellatrix to Fulu, decoded only to hash: the
 //! producer computes each body field's root and the payload's, and from
 //! them a block's proof of its execution `block_hash`. A block comes as
 //! SSZ or as the beacon API's JSON (public nodes serve archived blocks in
 //! JSON only); either way it is untrusted, and its proof must hash to the
-//! block root the vector holds.
+//! block root the vector holds. Bellatrix blocks are decoded only to
+//! verify the root a chunk opens on when Capella's first slots were
+//! missed; no Bellatrix slot is ever given a record that proves it.
 
 use alloy_primitives::{Address, FixedBytes, B256, U256 as Uint256};
 use csl_eth_store::beacon::{
@@ -164,6 +166,34 @@ struct Withdrawal {
 
 type Transactions = VariableList<VariableList<u8, U1073741824>, U1048576>;
 
+/// Bellatrix's 14 fields: Capella's without withdrawals. Decoded only to
+/// verify a predecessor root (the last block before a chunk), never routed.
+#[derive(Decode, Deserialize)]
+struct PayloadBellatrix {
+    parent_hash: Bytes32,
+    fee_recipient: Bytes20,
+    state_root: Bytes32,
+    receipts_root: Bytes32,
+    #[serde(with = "hex_fixed_vec")]
+    logs_bloom: FixedVector<u8, U256>,
+    prev_randao: Bytes32,
+    #[serde(with = "serde_utils::quoted_u64")]
+    block_number: u64,
+    #[serde(with = "serde_utils::quoted_u64")]
+    gas_limit: u64,
+    #[serde(with = "serde_utils::quoted_u64")]
+    gas_used: u64,
+    #[serde(with = "serde_utils::quoted_u64")]
+    timestamp: u64,
+    #[serde(with = "hex_var_list")]
+    extra_data: VariableList<u8, U32>,
+    #[serde(with = "serde_utils::quoted_u256")]
+    base_fee_per_gas: Uint256,
+    block_hash: Bytes32,
+    #[serde(with = "list_of_hex_var_list")]
+    transactions: Transactions,
+}
+
 /// Capella's 15 fields, then Deneb's two blob-gas fields.
 #[derive(Decode, Deserialize)]
 struct Payload {
@@ -240,20 +270,28 @@ macro_rules! payload_fields {
             $p.base_fee_per_gas.tree_hash_root(),
             $p.block_hash.tree_hash_root(),
             $p.transactions.tree_hash_root(),
-            $p.withdrawals.tree_hash_root(),
         ]
     };
 }
 
-impl Payload {
+impl PayloadBellatrix {
     fn fields(&self) -> Vec<B256> {
         payload_fields!(self)
+    }
+}
+
+impl Payload {
+    fn fields(&self) -> Vec<B256> {
+        let mut f = payload_fields!(self);
+        f.push(self.withdrawals.tree_hash_root());
+        f
     }
 }
 
 impl PayloadDeneb {
     fn fields(&self) -> Vec<B256> {
         let mut f = payload_fields!(self);
+        f.push(self.withdrawals.tree_hash_root());
         f.push(self.blob_gas_used.tree_hash_root());
         f.push(self.excess_blob_gas.tree_hash_root());
         f
@@ -305,6 +343,20 @@ struct ExecutionRequests {
     deposits: VariableList<DepositRequest, U8192>,
     withdrawals: VariableList<WithdrawalRequest, U16>,
     consolidations: VariableList<ConsolidationRequest, U2>,
+}
+
+#[derive(Decode, Deserialize)]
+struct BodyBellatrix {
+    randao_reveal: Bytes96,
+    eth1_data: Eth1Data,
+    graffiti: Bytes32,
+    proposer_slashings: VariableList<ProposerSlashing, U16>,
+    attester_slashings: VariableList<AttesterSlashing, U2>,
+    attestations: VariableList<Attestation, U128>,
+    deposits: VariableList<Deposit, U16>,
+    voluntary_exits: VariableList<SignedVoluntaryExit, U16>,
+    sync_aggregate: SyncAggregate,
+    execution_payload: PayloadBellatrix,
 }
 
 #[derive(Decode, Deserialize)]
@@ -381,6 +433,19 @@ struct Fields {
 
 trait Body: Decode + DeserializeOwned {
     fn fields(&self) -> Fields;
+}
+
+impl Body for BodyBellatrix {
+    fn fields(&self) -> Fields {
+        let payload = self.execution_payload.fields();
+        let mut body = body_head!(self);
+        body.push(B256::ZERO);
+        Fields {
+            body,
+            payload,
+            block_hash: self.execution_payload.block_hash,
+        }
+    }
 }
 
 impl Body for BodyCapella {
@@ -488,11 +553,21 @@ pub fn slot_of(bytes: &[u8]) -> Option<u64> {
     ))
 }
 
+/// Bellatrix's first slot (epoch 144,896): the first blocks with an
+/// execution payload.
+pub const BELLATRIX_SLOT: u64 = 144_896 * 32;
+
 /// The fork a slot's block has (from its slot alone: a block that claims
-/// another fork's shape will not hash to its root).
+/// another fork's shape will not hash to its root). Bellatrix blocks are
+/// decoded only as predecessors (the root an early chunk opens on); the
+/// route itself starts at Capella.
 fn fork(slot: u64) -> Result<&'static str, String> {
-    if slot < csl_eth_store::beacon::CAPELLA_SLOT {
-        Err(format!("slot {slot} is before Capella"))
+    if slot < BELLATRIX_SLOT {
+        Err(format!(
+            "slot {slot} is before Bellatrix: no execution payload"
+        ))
+    } else if slot < csl_eth_store::beacon::CAPELLA_SLOT {
+        Ok("bellatrix")
     } else if slot < DENEB_SLOT {
         Ok("capella")
     } else if slot < ELECTRA_SLOT {
@@ -502,7 +577,7 @@ fn fork(slot: u64) -> Result<&'static str, String> {
     }
 }
 
-/// The body proof of an SSZ `SignedBeaconBlock` (Capella to Fulu), its
+/// The body proof of an SSZ `SignedBeaconBlock` (Bellatrix to Fulu), its
 /// root computed from its bytes. The caller compares the root with the one
 /// it trusts.
 pub fn body_proof(bytes: &[u8]) -> Result<BodyProof, String> {
@@ -510,6 +585,7 @@ pub fn body_proof(bytes: &[u8]) -> Result<BodyProof, String> {
         prove(&Signed::<B>::from_ssz_bytes(b).map_err(|e| format!("ssz: {e:?}"))?)
     }
     match fork(slot_of(bytes).ok_or("not a signed block")?)? {
+        "bellatrix" => de::<BodyBellatrix>(bytes),
         "capella" => de::<BodyCapella>(bytes),
         "deneb" => de::<BodyDeneb>(bytes),
         _ => de::<BodyElectra>(bytes),
@@ -528,6 +604,7 @@ pub fn body_proof_json(bytes: &[u8]) -> Result<BodyProof, String> {
         .ok_or("no slot")?;
     let data = v["data"].take();
     match fork(slot)? {
+        "bellatrix" => de::<BodyBellatrix>(data),
         "capella" => de::<BodyCapella>(data),
         "deneb" => de::<BodyDeneb>(data),
         _ => de::<BodyElectra>(data),

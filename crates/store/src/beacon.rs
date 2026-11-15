@@ -263,8 +263,18 @@ impl BodyProof {
 }
 
 /// Chunk `chunk`'s file from its 64 block roots (slot order; an empty slot
-/// repeats the root before it) and a body proof for each distinct root.
-/// Every proof must hash to its root.
+/// repeats the root before it) and body proofs by root.
+///
+/// A slot's record carries a body proof only when its root is the block
+/// of that slot. A root repeated from the slot before is an empty slot
+/// and has no block of its own: its record is the chunk siblings and a
+/// zero tail, and nothing is looked up for it. The chunk's first root may
+/// be a predecessor, the last block before the chunk (from an earlier
+/// chunk, or before Capella at Capella's first chunk): its proof must
+/// hash to the root and name an earlier slot, and its records get a zero
+/// tail too. Any other root is the block at its slot, and its proof must
+/// say so. A zero tail proves nothing, so no block is ever claimed for an
+/// empty slot.
 pub fn chunk_file(
     chunk: u64,
     roots: &[B256],
@@ -274,22 +284,48 @@ pub fn chunk_file(
         return Err(format!("chunk {chunk}: {} roots", roots.len()));
     }
     let tree = levels(roots.to_vec());
+    let zero_tail = vec![0u8; CHUNK_RECORD - CHUNK_DEPTH * R];
     let mut out = Vec::with_capacity(CHUNK_SLOTS as usize * CHUNK_RECORD);
     for (k, root) in roots.iter().enumerate() {
+        let slot = chunk * CHUNK_SLOTS + k as u64;
+        for s in branch_of(&tree, k) {
+            out.extend_from_slice(s.as_slice());
+        }
+        if k > 0 && roots[k - 1] == *root {
+            out.extend_from_slice(&zero_tail);
+            continue;
+        }
         let b = bodies
             .get(root)
-            .ok_or_else(|| format!("chunk {chunk}: no body proof for {root}"))?;
+            .ok_or_else(|| format!("chunk {chunk}: no body proof for {root} (slot {slot})"))?;
         if b.root() != *root {
             return Err(format!(
                 "chunk {chunk}: body proof for {root} does not hash to it"
             ));
         }
-        for s in branch_of(&tree, k) {
-            out.extend_from_slice(s.as_slice());
+        if b.slot == slot {
+            out.extend_from_slice(&b.tail());
+        } else if k == 0 && b.slot < slot {
+            out.extend_from_slice(&zero_tail);
+        } else {
+            return Err(format!(
+                "chunk {chunk}: {root} first appears at slot {slot} but is the block of slot {}",
+                b.slot
+            ));
         }
-        out.extend_from_slice(&b.tail());
     }
     Ok(out)
+}
+
+/// The roots of a chunk whose body proofs [`chunk_file`] needs: each
+/// root's first appearance (a repeat is an empty slot).
+pub fn chunk_blocks(roots: &[B256]) -> Vec<B256> {
+    roots
+        .iter()
+        .enumerate()
+        .filter(|(k, r)| *k == 0 || roots[k - 1] != **r)
+        .map(|(_, r)| *r)
+        .collect()
 }
 
 /// The root of a chunk's 64 block roots.
@@ -610,7 +646,8 @@ pub mod synthetic {
         keccak256(format!("synthetic beacon {tag} {i}"))
     }
 
-    fn body(slot: u64, block_hash: B256) -> BodyProof {
+    /// A made-up block at `slot` whose proof hashes consistently.
+    pub fn body(slot: u64, block_hash: B256) -> BodyProof {
         let mut b = BodyProof {
             slot,
             block_root: B256::ZERO,
@@ -818,5 +855,71 @@ mod tests {
             let wrong = alloy_primitives::keccak256(h);
             assert!(verify_block_hash(&pre, s, &wrong, chunk, &top, sum.as_deref()).is_err());
         }
+    }
+
+    /// Capella's first chunk on mainnet: slots 6,209,536 and 537 were
+    /// missed, so the chunk opens on the root of the last Bellatrix block
+    /// (6,209,535). Its records carry no proof, only that block's root is
+    /// looked up, and no block is ever proven at those slots; pre-Capella
+    /// slots stay unroutable.
+    #[test]
+    fn a_chunk_opening_on_a_predecessor_root() {
+        use alloy_primitives::keccak256;
+        let chunk = CAPELLA_SLOT / CHUNK_SLOTS;
+        let s0 = chunk * CHUNK_SLOTS;
+        let pred = synthetic::body(s0 - 1, keccak256("bellatrix"));
+        let mut bodies = HashMap::new();
+        bodies.insert(pred.block_root, pred.clone());
+        let mut roots = vec![pred.block_root; 2];
+        let mut last = pred.block_root;
+        for s in s0 + 2..s0 + CHUNK_SLOTS {
+            // Slot s0 + 40 missed as well, inside the chunk.
+            if s != s0 + 40 {
+                let b = synthetic::body(s, keccak256(s.to_le_bytes()));
+                last = b.block_root;
+                bodies.insert(last, b);
+            }
+            roots.push(last);
+        }
+        assert_eq!(chunk_blocks(&roots).len(), 62);
+        assert_eq!(chunk_blocks(&roots)[0], pred.block_root);
+        let file = chunk_file(chunk, &roots, &bodies).unwrap();
+        let tail = |k: usize| &file[k * CHUNK_RECORD + CHUNK_DEPTH * R..(k + 1) * CHUNK_RECORD];
+        for k in [0usize, 1, 40] {
+            assert!(tail(k).iter().all(|b| *b == 0), "slot {k} has a tail");
+        }
+        for k in [2usize, 39, 41, 63] {
+            assert!(tail(k).iter().any(|b| *b != 0));
+        }
+        // Every root climbs to the chunk root from its record, and only a
+        // block's own slot proves its hash.
+        let root = chunk_root(&roots);
+        for k in 0..64usize {
+            let rec = &file[k * CHUNK_RECORD..(k + 1) * CHUNK_RECORD];
+            let sibs: Vec<B256> = (0..CHUNK_DEPTH).map(|i| take(rec, i)).collect();
+            assert_eq!(climb(roots[k], k as u64, &sibs), root);
+            let s = s0 + k as u64;
+            let b = &bodies[&roots[k]];
+            let proves = block_root_from(s, &b.block_hash, &rec[CHUNK_DEPTH * R..]) == roots[k];
+            assert_eq!(proves, b.slot == s, "slot {s}");
+        }
+        assert!(route(s0 + 100, s0 - 1).is_err());
+
+        // A new root inside the chunk must be its slot's block.
+        let mut late = bodies.clone();
+        let moved = synthetic::body(s0 + 1, keccak256("moved"));
+        let mut bad = roots.clone();
+        bad[2] = moved.block_root;
+        late.insert(moved.block_root, moved);
+        assert!(chunk_file(chunk, &bad, &late).is_err());
+        // The first root may not name a later block, nor go unproven.
+        let later = synthetic::body(s0 + 5, keccak256("later"));
+        let mut bad = roots.clone();
+        bad[0] = later.block_root;
+        late.insert(later.block_root, later);
+        assert!(chunk_file(chunk, &bad, &late).is_err());
+        let mut gone = bodies.clone();
+        gone.remove(&pred.block_root);
+        assert!(chunk_file(chunk, &roots, &gone).is_err());
     }
 }
