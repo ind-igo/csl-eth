@@ -756,6 +756,9 @@ fn write_history_inner(
     // Pass 1: verify the chain and every block, plan the periods.
     let mut plans: Vec<PeriodPlan> = Vec::new();
     let mut prev: Option<HeaderFields> = None;
+    // Each block's hash as verified here, chained to the anchor: pass 2
+    // writes a block only if it is this one again.
+    let mut verified: Vec<B256> = Vec::with_capacity((last - first + 1) as usize);
     for n in first..=last {
         let mut b = src.block(n).map_err(HistoryError::Source)?;
         if b.number != n {
@@ -765,6 +768,7 @@ fn write_history_inner(
             )));
         }
         let h = b.verify()?;
+        verified.push(h.hash);
         if let Some(t) = tamper {
             (t.block)(&mut b);
         }
@@ -858,12 +862,19 @@ fn write_history_inner(
         let mut w_receipts = RunOut::new(&runs_dir, cfg(H_RECEIPTS), plan.receipts)?;
         for n in plan.first..=plan.last {
             let mut b = src.block(n).map_err(HistoryError::Source)?;
-            // The source served this block once already; a different one now
-            // is a source fault, not something to write.
-            if b.number != n || keccak256(&b.header) != b.hash {
-                return Err(HistoryError::Source(format!(
-                    "block {n} changed between passes"
-                )));
+            // The source served this block once already. The bytes written
+            // are verified again here (header hash, both roots, receipts
+            // decoding) and must be the block pass 1 chained to the anchor:
+            // a source that changed in between is a fault, not something
+            // to write.
+            let was = verified[(n - first) as usize];
+            let changed = || HistoryError::Source(format!("block {n} changed between passes"));
+            if b.number != n || b.hash != was {
+                return Err(changed());
+            }
+            match b.verify() {
+                Ok(h) if h.hash == was => {}
+                _ => return Err(changed()),
             }
             if let Some(t) = tamper {
                 (t.block)(&mut b);
@@ -1308,6 +1319,94 @@ mod tests {
         e.push(0);
         assert_eq!(Block::decode(&e), None);
         assert_eq!(Block::decode(&b.encode()[..10]), None);
+    }
+
+    /// Serves `chain`, but `swap(block)` in place of block `at` from its
+    /// second read on: a cache file replaced between the writer's passes.
+    struct Changing<F: Fn(&Block) -> Block> {
+        chain: BTreeMap<u64, Block>,
+        at: u64,
+        reads: std::cell::Cell<u32>,
+        swap: F,
+    }
+
+    impl<F: Fn(&Block) -> Block> BlockSource for Changing<F> {
+        fn block(&self, n: u64) -> Result<Block, String> {
+            let b = self.chain.block(n)?;
+            if n != self.at {
+                return Ok(b);
+            }
+            self.reads.set(self.reads.get() + 1);
+            Ok(if self.reads.get() > 1 {
+                (self.swap)(&b)
+            } else {
+                b
+            })
+        }
+    }
+
+    fn scratch(what: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("csl-history-changed-{}-{what}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        d
+    }
+
+    type Swap<'a> = Box<dyn Fn(&Block) -> Block + 'a>;
+
+    #[test]
+    fn a_block_changed_between_passes_is_not_written() {
+        let ts = MAINNET_GENESIS_TIME + 12 * 8192 * 5;
+        let chain = synthetic::chain(1, 100, 20, ts);
+        let other = synthetic::chain(2, 100, 20, ts);
+        let anchor = (119, chain[&119].hash);
+        let at = 110;
+        assert!(!chain[&at].txs.is_empty());
+        let swaps: [(&str, Swap); 3] = [
+            // The same header, another body: the roots no longer rebuild.
+            (
+                "body",
+                Box::new(|b: &Block| {
+                    let mut b = b.clone();
+                    b.txs[0].push(0);
+                    b
+                }),
+            ),
+            // The same header, its receipts reordered and altered.
+            (
+                "receipts",
+                Box::new(|b: &Block| {
+                    let mut b = b.clone();
+                    let last = b.receipts.len() - 1;
+                    b.receipts.swap(0, last);
+                    b.receipts[0].push(0);
+                    b
+                }),
+            ),
+            // A whole block that verifies on its own but is not the one
+            // chained to the anchor.
+            ("block", Box::new(|_: &Block| other[&110].clone())),
+        ];
+        for (what, swap) in swaps {
+            let dir = scratch(what);
+            let src = Changing {
+                chain: chain.clone(),
+                at,
+                reads: std::cell::Cell::new(0),
+                swap,
+            };
+            match write_history(&dir, &src, 100, anchor, 4) {
+                Err(HistoryError::Source(e)) => assert!(e.contains("changed"), "{what}: {e}"),
+                Err(e) => panic!("{what}: {e}"),
+                Ok(_) => panic!("{what}: a changed block was written"),
+            }
+            assert_eq!(src.reads.get(), 2, "{what}");
+            assert!(!dir.join(HISTORY_LATEST).exists(), "{what}");
+            let _ = fs::remove_dir_all(&dir);
+        }
+        let dir = scratch("unchanged");
+        write_history(&dir, &chain, 100, anchor, 4).expect("the unchanged chain writes");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
