@@ -19,6 +19,7 @@
 
 pub mod export;
 pub mod extsort;
+pub mod history;
 pub mod producer;
 
 use alloy_primitives::B256;
@@ -159,7 +160,7 @@ impl Manifest {
     }
 }
 
-mod hex32 {
+pub(crate) mod hex32 {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {

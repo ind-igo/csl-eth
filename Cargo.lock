@@ -1849,6 +1849,7 @@ name = "csl-eth-store"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-rlp",
  "alloy-trie",
  "blake3",
  "csl-eth-trie",

@@ -75,15 +75,28 @@ struct Inner {
 #[derive(Default)]
 pub struct Store(Mutex<Inner>);
 
-/// The bytes of `[off, off + len)` from the range that covers them, or the
-/// error of a failed range that does.
+/// The bytes of `[off, off + len)` from any range that covers them, not
+/// only the one starting nearest below (ranges overlap when a read wants a
+/// page, then the window around it), or the error of a failed range that
+/// covers them when no served one does.
 fn covered(ready: &Ranges, off: u64, len: usize) -> Option<Result<Vec<u8>, String>> {
-    let (start, v) = ready.range(..=off).next_back()?;
-    let lo = (off - start) as usize;
-    match v {
-        Ok(v) => v.get(lo..lo + len).map(|b| Ok(b.to_vec())),
-        Err((elen, e)) => (lo + len <= *elen).then(|| Err(e.clone())),
+    let mut failed = None;
+    for (start, v) in ready.range(..=off).rev() {
+        let lo = (off - start) as usize;
+        match v {
+            Ok(v) => {
+                if let Some(b) = v.get(lo..lo + len) {
+                    return Some(Ok(b.to_vec()));
+                }
+            }
+            Err((elen, e)) => {
+                if failed.is_none() && lo + len <= *elen {
+                    failed = Some(Err(e.clone()));
+                }
+            }
+        }
     }
+    failed
 }
 
 impl Store {
@@ -123,6 +136,15 @@ impl Store {
             len,
         });
         Err(Pending)
+    }
+
+    /// Whether a range is held (served or failed), without wanting it.
+    pub fn holds_range(&self, rel: &str, off: u64, len: usize) -> bool {
+        let g = self.0.lock().unwrap();
+        g.ranges
+            .get(rel)
+            .and_then(|m| covered(m, off, len))
+            .is_some()
     }
 
     /// Note a range to fetch with the next round, if not held already.

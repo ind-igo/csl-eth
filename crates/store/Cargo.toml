@@ -11,6 +11,7 @@ csl-run.workspace = true
 csl-eth-trie = { path = "../trie" }
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-trie = { workspace = true, features = ["ethereum"] }
+alloy-rlp.workspace = true
 blake3.workspace = true
 hex.workspace = true
 serde.workspace = true
