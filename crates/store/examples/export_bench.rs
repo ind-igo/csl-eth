@@ -3,8 +3,14 @@
 //!
 //! ```text
 //! cargo run --release -p csl-eth-store --example export_bench -- \
-//!     --accounts 1000000 --slots 4000000 --big 1000000 --mem-mb 256 --out /path/to/dir [--no-by-hash]
+//!     --accounts 1000000 --slots 4000000 --big 1000000 --mem-mb 256 --out /path/to/dir \
+//!     [--workers N] [--ranges N] [--latency-us U] [--no-by-hash]
 //! ```
+//!
+//! `--latency-us` makes the source sleep that long when it opens a
+//! contract's storage and every 64 slots, standing in for reth's page faults
+//! (the first mainnet run read about 60,000 slots/s on one thread at 41% of
+//! a core).
 //!
 //! A first pass builds the state root with nothing kept (the header's
 //! `state_root` the export checks against); the second is the export.
@@ -12,9 +18,14 @@
 
 use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::KECCAK_EMPTY;
-use csl_eth_store::{export, ExportOptions, ExportStats, Head, SourceAccount, StateSource};
+use csl_eth_store::{export, AccountRange, ExportOptions, ExportStats, Head, SourceAccount, StateSource};
 use csl_eth_trie::{encode_word, path_of, Account, Builder, Discard, EMPTY_ROOT};
-use std::{collections::HashMap, convert::Infallible, path::PathBuf, time::Instant};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 fn mix(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -39,6 +50,7 @@ struct Synth {
     big: u64,
     code: HashMap<B256, Vec<u8>>,
     pool: Vec<B256>,
+    latency: Duration,
 }
 
 impl Synth {
@@ -55,7 +67,7 @@ impl Synth {
             code.insert(h, c);
             pool.push(h);
         }
-        Synth { accounts, contract_every, slots_each, big, code, pool }
+        Synth { accounts, contract_every, slots_each, big, code, pool, latency: Duration::ZERO }
     }
 
     fn slot_count(&self, i: u64) -> u64 {
@@ -78,6 +90,16 @@ impl Synth {
         let step = U256::MAX / U256::from(self.accounts);
         (U256::from_be_bytes(hashed.0) / step).to::<u64>()
     }
+
+    /// The first account at or above `k`.
+    fn first_at(&self, k: &B256) -> u64 {
+        let j = self.index_of(k).min(self.accounts);
+        if j < self.accounts && sorted_key(j, self.accounts, 1) < *k {
+            j + 1
+        } else {
+            j
+        }
+    }
 }
 
 type Slots<'a> = Box<dyn Iterator<Item = Result<(B256, U256), Infallible>> + 'a>;
@@ -88,15 +110,26 @@ impl StateSource for Synth {
     type Accounts<'a> = Accounts<'a>;
     type Storage<'a> = Slots<'a>;
 
-    fn accounts(&self) -> Result<Accounts<'_>, Infallible> {
-        Ok(Box::new((0..self.accounts).map(|i| Ok(self.account(i)))))
+    fn accounts(&self, range: &AccountRange) -> Result<Accounts<'_>, Infallible> {
+        let lo = self.first_at(&range.start);
+        let hi = range.end.map_or(self.accounts, |e| self.first_at(&e)).max(lo);
+        Ok(Box::new((lo..hi).map(|i| Ok(self.account(i)))))
     }
 
     fn storage(&self, hashed: &B256) -> Result<Slots<'_>, Infallible> {
         let i = self.index_of(hashed);
         let n = self.slot_count(i);
         let salt = mix(i).wrapping_add(3);
-        Ok(Box::new((0..n).map(move |j| Ok((sorted_key(j, n, salt), U256::from(mix(salt ^ j) | 1))))))
+        let latency = self.latency;
+        if n > 0 && !latency.is_zero() {
+            std::thread::sleep(latency);
+        }
+        Ok(Box::new((0..n).map(move |j| {
+            if j % 64 == 63 && !latency.is_zero() {
+                std::thread::sleep(latency);
+            }
+            Ok((sorted_key(j, n, salt), U256::from(mix(salt ^ j) | 1)))
+        })))
     }
 
     fn code(&self, code_hash: &B256) -> Result<Option<Vec<u8>>, Infallible> {
@@ -123,12 +156,12 @@ fn main() {
     let mem = num("--mem-mb", 256) << 20;
     let out = PathBuf::from(arg(&args, "--out").expect("--out <dir>"));
     let by_hash = !args.iter().any(|a| a == "--no-by-hash");
-    let src = Synth::new(accounts, slots, big);
+    let mut src = Synth::new(accounts, slots, big);
 
     // The state root, nothing kept.
     let t = Instant::now();
     let mut b = Builder::new(Discard);
-    for a in src.accounts().unwrap() {
+    for a in src.accounts(&AccountRange::ALL).unwrap() {
         let a = a.unwrap();
         let mut sb = Builder::new(Discard);
         let mut n = 0;
@@ -144,8 +177,11 @@ fn main() {
     eprintln!("root pass: {state_root} in {:.1} s", t.elapsed().as_secs_f64());
 
     let head = Head { block_hash: B256::repeat_byte(0x42), block_number: 1, timestamp: 1, state_root };
+    src.latency = Duration::from_micros(num("--latency-us", 0));
     let mut opts = ExportOptions::new(out.join("scratch"));
     opts.memory_bytes = mem;
+    opts.workers = num("--workers", opts.workers as u64) as usize;
+    opts.ranges = num("--ranges", opts.ranges as u64) as usize;
     opts.by_hash = by_hash;
     opts.progress_every = std::time::Duration::from_secs(5);
     let mut last = Instant::now();
@@ -178,14 +214,16 @@ fn main() {
     let file_bytes: u64 = s.tables.iter().flatten().map(|t| t.file_bytes).sum();
     println!("accounts {} slots {} storage tries {} largest {}", s.accounts, s.storage_slots, s.storage_tries, s.largest_storage.0);
     println!("nodes {} (account {}, storage {}), embedded {}", nodes, s.account_nodes, s.storage_nodes, s.embedded);
-    println!("budget {} MiB, peak chunk memory {:.1} MiB", mem >> 20, s.peak_sort_bytes as f64 / (1 << 20) as f64);
+    println!("workers {}, budget {} MiB, peak chunk memory {:.1} MiB", s.workers, mem >> 20, s.peak_sort_bytes as f64 / (1 << 20) as f64);
     for (t, st) in s.sort.iter().enumerate() {
         println!("  table {t}: {st:?}");
     }
     println!(
-        "build {:.1} s ({:.0} nodes/s incl. by-hash pushes), sort {:.1} s, code {:.2} s, write {:.1} s, total {:.1} s",
+        "build {:.1} s ({:.0} nodes/s incl. by-hash pushes, {:.0} slots/s; account trie waited {:.1} s), sort {:.1} s, code {:.2} s, write {:.1} s, total {:.1} s",
         secs(s.build),
         nodes as f64 / secs(s.build),
+        s.storage_slots as f64 / secs(s.build),
+        secs(s.build_wait),
         secs(s.sort_time),
         secs(s.check_code),
         write,

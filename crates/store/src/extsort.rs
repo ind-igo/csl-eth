@@ -20,6 +20,11 @@
 //! If nothing was spilled the sorted chunk is read in place.
 //! [`ExtSort::merge`] then feeds one table's records in key order.
 //!
+//! Several sorters can fill in parallel, one per thread, each with its own
+//! chunk ([`ExtSort::with_chunk`]) and spill directory; one of them then
+//! [`absorb`](ExtSort::absorb)s the others, so each table's spills from every
+//! thread merge as one.
+//!
 //! The scratch directory ([`Scratch`]) is removed when dropped, and
 //! [`remove_stale`] clears ones a killed process left behind.
 
@@ -241,6 +246,8 @@ struct Table {
 pub struct ExtSort {
     dir: PathBuf,
     budget: Budget,
+    /// The chunk's size, bytes: `budget.chunk_bytes()` unless set.
+    chunk: u64,
     idx: Vec<Rec>,
     arena: Vec<u8>,
     /// The chunk is sorted and free of duplicates.
@@ -249,6 +256,8 @@ pub struct ExtSort {
     next_spill: u64,
     /// Bytes of the chunk in use at its fullest.
     peak: u64,
+    /// The peaks of absorbed sorters, which held their chunks beside this one.
+    absorbed_peak: u64,
 }
 
 impl ExtSort {
@@ -259,22 +268,34 @@ impl ExtSort {
         ExtSort {
             dir: dir.to_path_buf(),
             budget,
+            chunk: budget.chunk_bytes(),
             idx: Vec::new(),
             arena: Vec::new(),
             settled: true,
             tables: dups.iter().map(|&dups| Table { dups, spills: Vec::new(), stats: SortStats::default(), range: 0..0 }).collect(),
             next_spill: 0,
             peak: 0,
+            absorbed_peak: 0,
         }
+    }
+
+    /// A sorter whose chunk is `chunk` bytes (at least 4 KiB) while merges
+    /// still read with the whole budget: one of several that fill at once
+    /// and share the budget, before it absorbs the others.
+    pub fn with_chunk(dir: &Path, budget: Budget, chunk: u64, dups: &[Dups]) -> ExtSort {
+        let mut s = ExtSort::new(dir, budget, dups);
+        s.chunk = chunk.max(4096);
+        s
     }
 
     pub fn stats(&self, table: usize) -> SortStats {
         self.tables[table].stats
     }
 
-    /// Bytes the chunk occupies at its fullest so far.
+    /// Bytes the chunk occupies at its fullest so far, plus the peaks of
+    /// the sorters absorbed (their chunks were held at the same time).
     pub fn peak_bytes(&self) -> u64 {
-        self.peak
+        self.peak.max(self.used_bytes()) + self.absorbed_peak
     }
 
     fn used_bytes(&self) -> u64 {
@@ -283,9 +304,15 @@ impl ExtSort {
 
     /// Buffer one record, spilling the chunk first when it is full.
     pub fn push(&mut self, table: usize, key: &[u8; KEY], val: &[u8]) -> Result<(), SortError> {
+        self.push_uncounted(table, key, val)?;
+        self.tables[table].stats.records += 1;
+        Ok(())
+    }
+
+    fn push_uncounted(&mut self, table: usize, key: &[u8; KEY], val: &[u8]) -> Result<(), SortError> {
         debug_assert!(table < self.tables.len());
         if self.idx.capacity() == 0 {
-            let chunk = self.budget.chunk_bytes();
+            let chunk = self.chunk;
             let arena = chunk / 3 * ARENA_THIRDS;
             self.idx = Vec::with_capacity(((chunk - arena) / INDEX_BYTES).max(1) as usize);
             self.arena = Vec::with_capacity(arena as usize);
@@ -305,7 +332,35 @@ impl ExtSort {
         self.arena.extend_from_slice(val);
         self.idx.push(Rec { key: *key, tagged: (table as u64) << OFF_BITS | off });
         self.settled = false;
-        self.tables[table].stats.records += 1;
+        Ok(())
+    }
+
+    /// Take over another sorter's records, so that [`prepare`](Self::prepare)
+    /// and [`merge`](Self::merge) read them with this one's. If the other
+    /// spilled, the rest of its chunk is spilled too and its spill files
+    /// become this sorter's (they stay where they are, so give each sorter
+    /// a directory of its own); if not, its records are pushed into this
+    /// chunk. Its counters add to this one's, and its chunk is freed.
+    /// Call before `prepare`, with the same tables.
+    pub fn absorb(&mut self, mut other: ExtSort) -> Result<(), SortError> {
+        assert_eq!(self.tables.len(), other.tables.len(), "the same tables");
+        self.absorbed_peak += other.peak_bytes();
+        if other.spilled() {
+            other.spill()?;
+        } else {
+            for r in std::mem::take(&mut other.idx) {
+                self.push_uncounted(r.table(), &r.key, Self::val(&other.arena, r.off()))?;
+            }
+        }
+        other.arena = Vec::new();
+        for (mine, theirs) in self.tables.iter_mut().zip(&mut other.tables) {
+            mine.spills.append(&mut theirs.spills);
+            let (a, b) = (&mut mine.stats, theirs.stats);
+            a.records += b.records;
+            a.spills += b.spills;
+            a.merge_passes += b.merge_passes;
+            a.spill_bytes += b.spill_bytes;
+        }
         Ok(())
     }
 
@@ -689,6 +744,68 @@ mod tests {
         for budget in [1 << 30, 16 << 10] {
             let r = run(&[(Dups::Error, &records(10, 1, u64::MAX)), (Dups::KeepOne, &recs)], budget);
             assert!(matches!(r, Err(SortError::Conflict { table: 1, .. })), "budget {budget}");
+        }
+    }
+
+    #[test]
+    fn absorbed_sorters_merge_as_one() {
+        // Records dealt round-robin to four sorters, some of which spill and
+        // some not; the KeepOne table repeats keys across sorters.
+        let a = records(12_000, 21, u64::MAX);
+        let b = records(6_000, 23, 900);
+        let scratch = Scratch::new(&std::env::temp_dir()).unwrap();
+        let dups = [Dups::Error, Dups::KeepOne];
+        for (chunks, budget) in [([16 << 20; 4], 1 << 30), ([24 << 10, 1 << 20, 8 << 10, 1 << 20], 64 << 10), ([8 << 10; 4], 16 << 10)] {
+            let dirs: Vec<PathBuf> = (0..4).map(|k| scratch.path().join(format!("w{k}-{budget}"))).collect();
+            let mut sorters: Vec<ExtSort> = dirs
+                .iter()
+                .zip(chunks)
+                .map(|(d, c)| {
+                    std::fs::create_dir_all(d).unwrap();
+                    ExtSort::with_chunk(d, Budget::new(budget), c, &dups)
+                })
+                .collect();
+            for (i, (k, v)) in a.iter().enumerate() {
+                sorters[i % 4].push(0, k, v).unwrap();
+            }
+            for (i, (k, v)) in b.iter().enumerate() {
+                sorters[(i * 7) % 4].push(1, k, v).unwrap();
+            }
+            let mut rest = sorters.split_off(1);
+            let mut main = sorters.pop().unwrap();
+            let peaks: u64 = rest.iter().map(|s| s.peak_bytes()).sum::<u64>() + main.peak_bytes();
+            for s in rest.drain(..) {
+                main.absorb(s).unwrap();
+            }
+            main.prepare().unwrap();
+            assert!(main.peak_bytes() >= peaks && main.peak_bytes() <= chunks.iter().sum::<u64>() + 2 * INDEX_BYTES + 1404, "peaks add up");
+            for (t, want) in [(0, expected(&a)), (1, expected(&b))] {
+                let mut got = Vec::new();
+                let n = main
+                    .merge::<SortError>(t, |k, v| {
+                        got.push((*k, v.to_vec()));
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(got == want, "table {t}, chunks {chunks:?}");
+                assert_eq!(n, main.stats(t).entries);
+                assert_eq!(main.stats(t).records, if t == 0 { a.len() } else { b.len() } as u64);
+            }
+            if budget == 1 << 30 {
+                assert_eq!(main.stats(0).spills + main.stats(1).spills, 0, "in memory throughout");
+            } else {
+                assert!(main.stats(0).spills > 4);
+            }
+            // A repeat across sorters in a unique-key table is still found.
+            let mut x = ExtSort::with_chunk(&dirs[0], Budget::new(budget), chunks[0], &dups);
+            let mut y = ExtSort::with_chunk(&dirs[1], Budget::new(budget), chunks[1], &dups);
+            for (k, v) in &a[..2000] {
+                x.push(0, k, v).unwrap();
+            }
+            y.push(0, &a[1500].0, &a[1500].1).unwrap();
+            x.absorb(y).unwrap();
+            let r = x.prepare().and_then(|_| x.merge::<SortError>(0, |_, _| Ok(())));
+            assert!(matches!(r, Err(SortError::Duplicate { table: 0, key }) if key == a[1500].0), "chunks {chunks:?}");
         }
     }
 
