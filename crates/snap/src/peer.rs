@@ -16,7 +16,8 @@
 //! count), so a snap frame is rebased by `snap_offset` on the way out and
 //! back.
 
-use alloy_consensus::Header;
+use alloy_consensus::{Header, TxReceipt};
+use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Bytes, B256};
 use futures::{SinkExt, StreamExt};
 use reth_chainspec::{ChainSpec, HOODI, MAINNET, SEPOLIA};
@@ -29,7 +30,7 @@ use reth_eth_wire::{
     GetBlockHeaders, HeadersDirection, HelloMessageWithProtocols, P2PStream, PooledTransactions, ProtocolMessage, Receipts, UnauthedP2PStream,
     UnifiedStatus,
 };
-use reth_eth_wire_types::message::RequestPair;
+use reth_eth_wire_types::{message::RequestPair, GetBlockBodies, GetReceipts, GetReceipts70, NetworkPrimitives};
 use reth_eth_wire_types::snap::{
     AccountRangeMessage, BlockAccessListsMessage, ByteCodesMessage, GetAccountRangeMessage, GetBlockAccessListsMessage, GetByteCodesMessage,
     GetStorageRangesMessage, RangeBound, SnapMessageId, SnapProtocolMessage, StorageRangesMessage,
@@ -44,6 +45,11 @@ use std::{
 use tokio::{net::TcpStream, time::timeout};
 
 pub const CLIENT_VERSION: &str = "csl-eth/0.1.0";
+
+/// A block body as `eth` carries it.
+pub type EthBlockBody = <EthNetworkPrimitives as NetworkPrimitives>::BlockBody;
+/// A receipt as `eth` carries it (without its bloom from `eth/69`).
+pub type EthReceipt = <EthNetworkPrimitives as NetworkPrimitives>::Receipt;
 
 /// A block height every mainnet block-number fork is below, so the fork id
 /// we announce depends only on the wall clock (timestamp forks).
@@ -215,12 +221,43 @@ impl Peer {
         timeout_each: Duration,
         require_snap: bool,
     ) -> Result<Peer, PeerError> {
+        Peer::connect_with(net, record, key, status, fork_filter, timeout_each, require_snap, false).await
+    }
+
+    /// A mainnet connection for history: `eth/68`, `eth/69` and `eth/70`
+    /// offered (the newest shared is taken), `snap` too but not required.
+    /// Bodies and receipts come over [`Peer::bodies`] and
+    /// [`Peer::receipts`], which handle each version's encoding.
+    pub async fn connect_history(
+        record: NodeRecord,
+        key: &SecretKey,
+        status: UnifiedStatus,
+        fork_filter: ForkFilter,
+        timeout_each: Duration,
+    ) -> Result<Peer, PeerError> {
+        Peer::connect_with(Net::Mainnet, record, key, status, fork_filter, timeout_each, false, true).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_with(
+        net: Net,
+        record: NodeRecord,
+        key: &SecretKey,
+        status: UnifiedStatus,
+        fork_filter: ForkFilter,
+        timeout_each: Duration,
+        require_snap: bool,
+        eth70: bool,
+    ) -> Result<Peer, PeerError> {
         let addr = SocketAddr::new(record.address, record.tcp_port);
         let tcp = timeout(timeout_each, TcpStream::connect(addr)).await.map_err(|_| PeerError::Timeout)??;
         tcp.set_nodelay(true)?;
         let ecies = ECIESStream::connect_with_timeout(tcp, *key, record.id, timeout_each).await?;
         let our_id = pk2id(&key.public_key(SECP256K1));
         let mut hello = HelloMessageWithProtocols::builder(our_id).protocol(Protocol::eth_68()).protocol(Protocol::eth(EthVersion::Eth69));
+        if eth70 {
+            hello = hello.protocol(Protocol::eth(EthVersion::Eth70));
+        }
         if net.offers_eth71() {
             hello = hello.protocol(Protocol::eth(EthVersion::Eth71));
         }
@@ -432,6 +469,93 @@ impl Peer {
         match self.snap_request(req, SnapMessageId::BlockAccessLists, request_id).await? {
             SnapProtocolMessage::BlockAccessLists(m) => Ok(m.block_access_lists.0),
             _ => Err(PeerError::Protocol("wrong snap response")),
+        }
+    }
+
+    /// `GetBlockBodies` for `hashes`: the bodies of a prefix of them, in
+    /// order (a peer answers fewer when its response fills, or none when it
+    /// lacks the first). Unchecked: the caller holds the headers.
+    pub async fn bodies(&mut self, hashes: Vec<B256>) -> Result<Vec<EthBlockBody>, PeerError> {
+        let request_id = self.request_id();
+        let msg = EthMessage::<EthNetworkPrimitives>::GetBlockBodies(RequestPair { request_id, message: GetBlockBodies(hashes) });
+        self.send_eth(msg).await?;
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            match self.next_before(deadline).await? {
+                Inbound::Eth(EthMessage::BlockBodies(rp)) if rp.request_id == request_id => return Ok(rp.message.0),
+                Inbound::Eth(m) => self.service_eth(m).await?,
+                Inbound::Snap(m) => self.service_snap(m).await?,
+                Inbound::Ignored => {}
+            }
+        }
+    }
+
+    /// `GetReceipts` for `hashes`: for a prefix of them, each block's
+    /// receipt-trie leaves (EIP-2718 receipts with their bloom), in order.
+    /// `eth/68` sends the bloom, which the leaf keeps as sent; `eth/69` and
+    /// `eth/70` omit it and it is recomputed from the logs. On `eth/70` a
+    /// peer may cut the last block short (`lastBlockIncomplete`); that
+    /// block is continued from its next index until it is whole, and it is
+    /// dropped if the peer stops serving it. Unchecked: the caller rebuilds
+    /// each block's `receiptsRoot`.
+    pub async fn receipts(&mut self, hashes: Vec<B256>) -> Result<Vec<Vec<Vec<u8>>>, PeerError> {
+        if self.eth_version < EthVersion::Eth70 {
+            let (blocks, _) = self.receipts_once(hashes, 0).await?;
+            return Ok(blocks);
+        }
+        let (mut blocks, mut incomplete) = self.receipts_once(hashes.clone(), 0).await?;
+        let mut rounds = 0;
+        while incomplete && !blocks.is_empty() {
+            rounds += 1;
+            let i = blocks.len() - 1;
+            let have = blocks[i].len() as u64;
+            if rounds > 256 {
+                return Err(PeerError::Protocol("receipts never completed"));
+            }
+            let (more, inc) = self.receipts_once(vec![hashes[i]], have).await?;
+            match more.into_iter().next() {
+                Some(rest) if !rest.is_empty() => {
+                    blocks[i].extend(rest);
+                    incomplete = inc;
+                }
+                _ => {
+                    blocks.pop();
+                    incomplete = false;
+                }
+            }
+        }
+        Ok(blocks)
+    }
+
+    async fn receipts_once(&mut self, hashes: Vec<B256>, first_index: u64) -> Result<(Vec<Vec<Vec<u8>>>, bool), PeerError> {
+        let request_id = self.request_id();
+        let msg = if self.eth_version >= EthVersion::Eth70 {
+            EthMessage::<EthNetworkPrimitives>::GetReceipts70(RequestPair {
+                request_id,
+                message: GetReceipts70 { first_block_receipt_index: first_index, block_hashes: hashes },
+            })
+        } else {
+            EthMessage::<EthNetworkPrimitives>::GetReceipts(RequestPair { request_id, message: GetReceipts(hashes) })
+        };
+        self.send_eth(msg).await?;
+        let deadline = Instant::now() + self.timeout;
+        let with_bloom = |blocks: Vec<Vec<EthReceipt>>| -> Vec<Vec<Vec<u8>>> {
+            blocks.into_iter().map(|b| b.iter().map(|r| r.with_bloom_ref().encoded_2718()).collect()).collect()
+        };
+        loop {
+            match self.next_before(deadline).await? {
+                Inbound::Eth(EthMessage::Receipts(rp)) if rp.request_id == request_id => {
+                    let blocks = rp.message.0.into_iter().map(|b| b.into_iter().map(|r| r.encoded_2718()).collect()).collect();
+                    return Ok((blocks, false));
+                }
+                Inbound::Eth(EthMessage::Receipts69(rp)) if rp.request_id == request_id => return Ok((with_bloom(rp.message.0), false)),
+                Inbound::Eth(EthMessage::Receipts70(rp)) if rp.request_id == request_id => {
+                    return Ok((with_bloom(rp.message.receipts), rp.message.last_block_incomplete));
+                }
+                Inbound::Eth(m) => self.service_eth(m).await?,
+                Inbound::Snap(m) => self.service_snap(m).await?,
+                Inbound::Ignored => {}
+            }
         }
     }
 

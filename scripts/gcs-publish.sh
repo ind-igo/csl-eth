@@ -61,7 +61,11 @@ case "${1:-}" in
     case "$rel" in
       head/bootstrap/* | snapshots/0x*/* | snapshots/[0-9a-f]*/* | blobs/*)
         cc='public, max-age=31536000, immutable' ;;
-      *) cc='no-cache' ;; # head/optimistic, finality, fcr, updates/<period>, snapshots/latest
+      # History: runs are named by their blake3, a manifest by the block
+      # its span ends at; neither is ever rewritten.
+      history/runs/* | history/[0-9a-f]*/manifest.json)
+        cc='public, max-age=31536000, immutable' ;;
+      *) cc='no-cache' ;; # head/optimistic, finality, fcr, updates/<period>, snapshots/latest, history/latest
     esac
     code=$(gcs -X PUT -H "Content-Type: $ct" -H "Cache-Control: $cc" --upload-file "$file" "$base/$key")
     ;;

@@ -255,6 +255,17 @@ impl Store {
         g.bytes = 0;
     }
 
+    /// Drop the whole files kept so far whose path starts with `prefix`
+    /// (`blobs/`, say), so the next read fetches them again: a measurement
+    /// of cold reads.
+    pub fn forget_files(&self, prefix: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .files
+            .retain(|rel, _| !rel.starts_with(prefix));
+    }
+
     /// Requests, bytes and rounds since `begin_read`.
     pub fn cost(&self) -> (u64, u64, u32) {
         let g = self.0.lock().unwrap();

@@ -145,6 +145,12 @@ enum Cmd {
         #[arg(long, default_value_t = 30399)]
         udp_port: u16,
     },
+    /// History (Milestone H): build the §3c tables from mainnet peers below
+    /// the verified finalized head, read them, measure, run the fault table.
+    History {
+        #[command(subcommand)]
+        cmd: csl_eth_snap::history::cli::HistoryCmd,
+    },
     /// Ask testnet peers for EIP-7928 block access lists (eth/71, snap/2)
     /// and verify each against its header. One JSON line per peer, then a
     /// summary.
@@ -291,8 +297,8 @@ fn log_filter() -> tracing_subscriber::EnvFilter {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use tracing_subscriber::util::SubscriberInitExt;
     let cli = Cli::parse();
-    if matches!(cli.cmd, Cmd::Produce(_)) {
-        // stdout carries the cycle lines only.
+    if matches!(cli.cmd, Cmd::Produce(_) | Cmd::History { .. }) {
+        // stdout carries the cycle lines (the JSON document) only.
         subscriber(log_filter(), std::io::stderr).init();
     } else {
         subscriber(log_filter(), std::io::stdout).init();
@@ -303,6 +309,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Workload(args) => {
             let out = csl_eth_snap::workload::run(args)?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Cmd::History { cmd } => {
+            let out = csl_eth_snap::history::cli::run(cmd).await?;
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
         Cmd::Faults(args) => {

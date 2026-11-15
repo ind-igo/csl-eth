@@ -392,6 +392,14 @@ impl<D: Driver> History<D> {
         self.headers.clear();
     }
 
+    /// Forget the session: verified headers and fetched blobs. The next
+    /// read costs what a fresh client's would, but for the manifest and
+    /// the run models, which an open span holds.
+    pub fn forget(&mut self) {
+        self.headers.clear();
+        self.store.forget_files("blobs/");
+    }
+
     /// A read is starting.
     pub fn begin_read(&mut self) {
         self.store.begin_read();

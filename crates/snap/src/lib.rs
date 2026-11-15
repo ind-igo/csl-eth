@@ -13,12 +13,15 @@
 //! `bal-probe` to ask testnet peers for block access lists ([`bal`]), and the
 //! milestone 1 exit tests: [`workload`] and [`faults`]; `produce` is the
 //! loop that keeps a bucket at the finalized head ([`produce`]).
+//! `history` acquires blocks, receipts and headers below the verified head
+//! and writes and reads the §3c history tables ([`history`]).
 
 pub mod bal;
 pub mod discovery;
 pub mod faults;
 pub mod fcr;
 pub mod fetch;
+pub mod history;
 pub mod peer;
 pub mod produce;
 pub mod slice;
