@@ -331,3 +331,25 @@ Nodes go to one external sort (`extsort.rs`) for all four tables (account nodes,
 For the same state the export writes byte-identical files and manifest to `produce_with` (tested on random states, at budgets from 32 KiB with multi-pass merges to 1 GiB in memory). `ExportOptions::by_hash = false` omits `nodes_by_hash`, about half the output at full state: the manifest lacks table 3, the client opens it, path-keyed reads are unaffected and the baseline's reads answer `Insufficient(NoTable(3))` (`crates/client/tests/no_by_hash.rs`).
 
 Measured on the Mac with `examples/export_bench.rs`, a synthetic state generated on the fly, one thread: 16 M slots in 3 M accounts (one contract of 4 M) is 26.3 M nodes, built at 2.0 M nodes/s with nodes-by-hash and 2.5 M without, 5.9 GB spilled, 6.2 GB of tables written at 640 MB/s, 24 s in all, 558 MB resident under a 512 MiB budget. At that rate mainnet's roughly 2.5 × 10^9 nodes take about 20 minutes to build on one core, before whatever reading reth costs; storage tries are independent, so building them on several threads over account ranges is the next speedup, and `build_storage` is the unit for it.
+
+## 2026-11-16: the export builds storage tries on many threads
+
+The first mainnet export (an n2-highmem-8, 4 local NVMe in RAID0, reth's 266 GB database, a 40 GiB sort budget) read about 10 M slots a minute for nine minutes and 3.6 M after, at 41% of one core, with `/proc/pressure/io` at 36% full: one page fault of reth's memory map in flight at a time while the disks idled, and the sorter's 42 GB squeezing the page cache to 21 GB. At that rate the build alone is seven hours. The fix is more reads in flight, which means more threads.
+
+`export` now takes `Sources`, which opens one reader per thread (for reth, a read transaction each from one `ProviderFactory`; MDBX's belong to the thread that opened them, and the node is stopped, so every one sees the same block). A `StateSource` that is `Sync` is its own `Sources`. `accounts` takes an `AccountRange`. The key space is cut into 16,384 equal ranges, which `workers` threads take in ascending order. Each builds its ranges' storage tries into a sorter of its own and hands back the accounts with their storage roots. The calling thread takes the ranges in order into the account trie. Because a worker's ranges ascend, reth's single forward-walking storage cursor still works, one per thread. After the build the main sorter absorbs the workers' (their spill files, or their in-memory records), so each table's spills merge as one, and everything after is unchanged. The output does not depend on the worker or range count: the tests compare 1 to 16 workers and 1 to 16,384 ranges byte for byte, with each other and with `produce_with`, at budgets in memory and spilling.
+
+One budget covers it all. A sixteenth holds finished ranges the account trie has not reached yet. Workers stop taking ranges past it, except the one it waits for, so a contract with tens of millions of slots holds up the account trie but not the other workers until that much has piled up. The rest is split evenly into chunks for the workers and the main thread; a budget too small for 16 KiB each runs fewer workers. A chunk only has to keep each table's spill count within one merge's fan-in (1,024), so the budget can be far below the machine's memory: the burst now runs 16 workers in 16 GiB and leaves the rest of the 64 GB to the page cache.
+
+Measured on the Mac (18 cores) with `examples/export_bench.rs`, 3 M accounts, 16 M slots, 512 MiB:
+
+| | build | slots/s | total |
+|---|---|---|---|
+| 1 worker | 10.9 s | 1.46 M | 21.7 s |
+| 16 workers | 1.5 s | 10.4 M | 13.3 s |
+| 1 worker, one contract of 4 M slots | 11.8 s | 1.35 M | 23.2 s |
+| 4 workers, the same | 4.7 s | 3.40 M | 16.5 s |
+| 16 workers, the same | 4.1 s | 3.94 M | 16.7 s |
+
+The single contract bounds the build: one thread builds it. Mainnet's largest are tens of millions of slots, a minute or two each, overlapped with everything else as long as the queue holds. With `--latency-us 100` standing in for page faults (a sleep per contract and every 64 slots; 1 M accounts, 4 M slots), the build scales with the threads in flight: 18.5 s on 1 worker, 2.4 s on 8, 0.6 s on 32, and 0.8 s on 64, where it stops gaining. Resident memory with 16 workers was 662 MB under the 512 MiB budget: each worker adds a spill write buffer, a thread stack and an allocator arena.
+
+What is serial now is the account trie (about 2 M accounts a second on the main thread, roughly 2.5 minutes at mainnet) and the write phase: one merge and one run writer per table at about 600 MB/s. Splitting one large contract's trie across threads (by the first nibbles of the slot hash, then joining the subtrie roots) is possible if the giants still show up as a tail.

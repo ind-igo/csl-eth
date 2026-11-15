@@ -1,11 +1,12 @@
 //! The streaming export against the in-memory producer: for the same state
 //! every file and the manifest are byte for byte the same, whatever the
-//! memory budget; every failure aborts before a manifest or `latest`.
+//! memory budget, worker count and range count; every failure aborts before
+//! a manifest or `latest`.
 
 use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{HashBuilder, KECCAK_EMPTY};
 use csl_eth_store::{
-    export, extsort, manifest_path, produce_with, AccountLeaf, CodeIter, ExportError, ExportOptions, ExportPhase, ExportStats, Head, ProduceOptions, SourceAccount, StateSource, VecSource,
+    export, extsort, manifest_path, produce_with, AccountLeaf, AccountRange, CodeIter, ExportError, ExportOptions, ExportPhase, ExportStats, Head, ProduceOptions, SourceAccount, StateSource, VecSource,
     CODE_BLOB_THRESHOLD, LATEST_FILE, TABLE_ACCOUNT_NODES, TABLE_CODE, TABLE_FILES, TABLE_NODES_BY_HASH, TABLE_STORAGE_NODES,
 };
 use csl_eth_trie::{encode_word, path_of, Account};
@@ -178,12 +179,18 @@ fn no_scratch_left(parent: &Path) {
 }
 
 /// Export `w` from `src` and produce it the in-memory way; compare.
-fn compare<S: StateSource>(w: &World, src: &S, memory: u64, by_hash: bool, name: &str) -> ExportStats {
+fn compare<S: StateSource + Sync>(w: &World, src: &S, memory: u64, by_hash: bool, name: &str) -> ExportStats {
+    compare_with(w, src, memory, by_hash, name, |_| {}).0
+}
+
+/// [`compare`], with the options adjusted; also returns the exported files.
+fn compare_with<S: StateSource + Sync>(w: &World, src: &S, memory: u64, by_hash: bool, name: &str, adjust: impl Fn(&mut ExportOptions)) -> (ExportStats, BTreeMap<String, Vec<u8>>) {
     let base = scratch(name);
     let (a, b, tmp) = (base.join("produce"), base.join("export"), base.join("tmp"));
     let produced = produce_with(&a, &w.head, "", w.accounts.iter().cloned(), &w.code, ProduceOptions::default()).unwrap();
     let mut o = opts(&tmp, memory);
     o.by_hash = by_hash;
+    adjust(&mut o);
     let mut phases = Vec::new();
     let exported = export(&b, &w.head, src, &o, &mut |s: &ExportStats| {
         if phases.last() != Some(&s.phase) {
@@ -224,7 +231,9 @@ fn compare<S: StateSource>(w: &World, src: &S, memory: u64, by_hash: bool, name:
         assert_same_files(&strip(&fa), &strip(&fb));
     }
     std::fs::remove_dir_all(&base).unwrap();
-    exported.stats
+    assert_eq!(st.largest_storage.0, w.accounts.iter().map(|a| a.storage.len() as u64).max().unwrap_or(0));
+    assert_eq!(st.code_refs, w.accounts.iter().filter(|a| a.account.code_hash != KECCAK_EMPTY).count() as u64);
+    (exported.stats, fb)
 }
 
 #[test]
@@ -322,8 +331,10 @@ impl std::error::Error for Boom {}
 /// A source that fails where it is told to.
 struct Faulty<'a> {
     inner: VecSource<'a>,
-    /// Fail at this account index instead of yielding it.
-    account_at: Option<usize>,
+    /// Fail at this account instead of yielding it.
+    account_at: Option<B256>,
+    /// Yield every account whatever the range asked for.
+    ignore_range: bool,
     /// Fail at this slot index of this account.
     slot_at: Option<(B256, usize)>,
     /// Fail opening this account's storage.
@@ -334,7 +345,7 @@ struct Faulty<'a> {
 
 impl<'a> Faulty<'a> {
     fn new(inner: VecSource<'a>) -> Faulty<'a> {
-        Faulty { inner, account_at: None, slot_at: None, storage_open: None, code: None }
+        Faulty { inner, account_at: None, ignore_range: false, slot_at: None, storage_open: None, code: None }
     }
 }
 
@@ -349,9 +360,17 @@ impl StateSource for Faulty<'_> {
     where
         Self: 'b;
 
-    fn accounts(&self) -> Result<Self::Accounts<'_>, Boom> {
+    fn accounts(&self, range: &AccountRange) -> Result<Self::Accounts<'_>, Boom> {
         let at = self.account_at;
-        Ok(Box::new(self.inner.accounts().unwrap().enumerate().map(move |(i, a)| if Some(i) == at { Err(Boom("accounts")) } else { Ok(a.unwrap()) })))
+        let range = if self.ignore_range { AccountRange::ALL } else { *range };
+        Ok(Box::new(self.inner.accounts(&range).unwrap().map(move |a| {
+            let a = a.unwrap();
+            if Some(a.hashed) == at {
+                Err(Boom("accounts"))
+            } else {
+                Ok(a)
+            }
+        })))
     }
 
     fn storage(&self, hashed: &B256) -> Result<Self::Storage<'_>, Boom> {
@@ -377,7 +396,15 @@ impl StateSource for Faulty<'_> {
 /// Export into a root that already holds a good snapshot; the failure must
 /// leave it untouched: no manifest for the new block, `latest` unchanged,
 /// no files of the new snapshot, no scratch.
-fn assert_aborts<S: StateSource>(name: &str, head: &Head, src: &S, memory: u64, check: impl Fn(&ExportError) -> bool) {
+/// How an abort case is run: budget, workers, ranges.
+#[derive(Clone, Copy, Debug)]
+struct Run {
+    memory: u64,
+    workers: usize,
+    ranges: usize,
+}
+
+fn assert_aborts<S: StateSource + Sync>(name: &str, head: &Head, src: &S, run: Run, check: impl Fn(&ExportError) -> bool) {
     let base = scratch(name);
     let (root, tmp) = (base.join("root"), base.join("tmp"));
     let good = world(20, 10, 99);
@@ -387,9 +414,11 @@ fn assert_aborts<S: StateSource>(name: &str, head: &Head, src: &S, memory: u64, 
     assert!(before.contains_key(LATEST_FILE));
     assert_ne!(head.block_hash, good_head.block_hash);
 
-    let r = export(&root, head, src, &opts(&tmp, memory), &mut |_| {});
-    let e = r.err().unwrap_or_else(|| panic!("{name}: the export must fail"));
-    assert!(check(&e), "{name}: unexpected error {e}");
+    let mut o = opts(&tmp, run.memory);
+    (o.workers, o.ranges) = (run.workers, run.ranges);
+    let r = export(&root, head, src, &o, &mut |_| {});
+    let e = r.err().unwrap_or_else(|| panic!("{name} {run:?}: the export must fail"));
+    assert!(check(&e), "{name} {run:?}: unexpected error {e}");
     eprintln!("{name}: {e}");
     assert!(!root.join(manifest_path(&head.block_hash)).exists());
     assert_same_files(&before, &files(&root));
@@ -402,7 +431,14 @@ fn aborts_write_no_manifest_and_leave_latest() {
     let w = world(200, 3000, 21);
     let head = w.head;
     let vs = || VecSource::new(&w.accounts, &w.code);
-    for memory in [1 << 30, 32 << 10] {
+    let runs = [
+        Run { memory: 1 << 30, workers: 1, ranges: 1 },
+        Run { memory: 1 << 30, workers: 4, ranges: 64 },
+        Run { memory: 32 << 10, workers: 1, ranges: 1 },
+        Run { memory: 256 << 10, workers: 6, ranges: 1000 },
+    ];
+    for run in runs {
+        let memory = run;
         // Wrong state root.
         let mut bad = head;
         bad.state_root = B256::repeat_byte(7);
@@ -420,10 +456,15 @@ fn aborts_write_no_manifest_and_leave_latest() {
         code.get_mut(&used).unwrap()[0] ^= 1;
         assert_aborts("code-hash", &head, &VecSource::new(&w.accounts, &code), memory, |e| matches!(e, ExportError::Code { what: "bytecode hashes differently", .. }));
 
-        // Accounts out of order, and a repeated account.
+        // Accounts out of order, and a repeated account. Over one range the
+        // swap is seen as such; over many, binary search into an unsorted
+        // slice loses or misplaces one of the two, and the range check or
+        // the state root catches it.
         let mut acc = w.accounts.clone();
         acc.swap(50, 51);
-        assert_aborts("unsorted-accounts", &head, &VecSource::new(&acc, &w.code), memory, |e| matches!(e, ExportError::UnsortedAccounts { .. }));
+        assert_aborts("unsorted-accounts", &head, &VecSource::new(&acc, &w.code), memory, |e| {
+            matches!(e, ExportError::UnsortedAccounts { .. }) || (run.ranges > 1 && matches!(e, ExportError::AccountOutsideRange { .. } | ExportError::StateRoot { .. }))
+        });
         let mut acc = w.accounts.clone();
         acc.insert(60, acc[60].clone());
         assert_aborts("repeated-account", &head, &VecSource::new(&acc, &w.code), memory, |e| matches!(e, ExportError::UnsortedAccounts { prev, next } if prev == next));
@@ -451,8 +492,14 @@ fn aborts_write_no_manifest_and_leave_latest() {
         // big trie, a code lookup.
         let source_err = |during: &'static str| move |e: &ExportError| matches!(e, ExportError::Source { during: d, .. } if d.starts_with(during));
         let mut f = Faulty::new(vs());
-        f.account_at = Some(150);
+        f.account_at = Some(w.accounts[150].hashed);
         assert_aborts("err-accounts", &head, &f, memory, source_err("accounts"));
+        // A source that ignores the range it is asked for.
+        if run.ranges > 1 {
+            let mut f = Faulty::new(vs());
+            f.ignore_range = true;
+            assert_aborts("ignores-range", &head, &f, memory, |e| matches!(e, ExportError::AccountOutsideRange { .. }));
+        }
         let mut f = Faulty::new(vs());
         f.storage_open = Some(w.accounts[100].hashed);
         assert_aborts("err-open-storage", &head, &f, memory, source_err("storage of"));
@@ -492,6 +539,77 @@ fn a_large_storage_trie_reports_progress_while_it_builds() {
         }
     })
     .unwrap();
+    // The main thread may report it more than once while it waits.
+    seen.dedup();
     assert_eq!(seen, vec![(accounts[0].hashed, 65_536)]);
     std::fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn parallel_output_is_byte_identical_to_one_worker() {
+    // Contracts large enough that some range waits on one while workers run
+    // ahead, under budgets where the waiting accounts fill the queue and the
+    // workers' sorters spill and merge across each other.
+    let mut w = world(1000, 20_000, 31);
+    let mut rng = ChaCha8Rng::seed_from_u64(32);
+    for i in [400, 401, 700] {
+        w.accounts[i].storage = random_slots(&mut rng, 6000);
+    }
+    w.accounts = with_roots(std::mem::take(&mut w.accounts));
+    w.head = head_for(&w.accounts, 0xAC);
+    let src = VecSource::new(&w.accounts, &w.code);
+    let base = scratch("par");
+    let produced = produce_with(&base.join("produce"), &w.head, "", w.accounts.iter().cloned(), &w.code, ProduceOptions::default()).unwrap();
+    let produced_files = files(&base.join("produce"));
+    let run = |memory: u64, workers: usize, ranges: usize| {
+        let name = format!("{workers}-{ranges}-{memory}");
+        let (root, tmp) = (base.join(&name), base.join("tmp"));
+        let mut o = opts(&tmp, memory);
+        (o.workers, o.ranges) = (workers, ranges);
+        let st = export(&root, &w.head, &src, &o, &mut |_| {}).unwrap().stats;
+        eprintln!("{name}: {:?} build {:?} wait {:?} sort {:?}", st.elapsed, st.build, st.build_wait, st.sort_time);
+        no_scratch_left(&tmp);
+        let f = files(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        (name, st, f)
+    };
+    for memory in [1 << 30, 256 << 10] {
+        let (_, one, reference) = run(memory, 1, 1);
+        assert_eq!(one.workers, 1);
+        assert_same_files(&produced_files, &reference);
+        assert_eq!(one.tables, produced.stats.tables);
+        for (workers, ranges) in [(1, 64), (2, 2), (3, 7), (4, 1000), (8, 64), (16, 16_384)] {
+            let (name, st, f) = run(memory, workers, ranges);
+            assert_same_files(&reference, &f);
+            assert_eq!(st.tables, one.tables, "{name}");
+            assert_eq!(
+                (st.accounts, st.storage_slots, st.storage_tries, st.largest_storage, st.code_refs, st.account_nodes, st.storage_nodes, st.embedded),
+                (one.accounts, one.storage_slots, one.storage_tries, one.largest_storage, one.code_refs, one.account_nodes, one.storage_nodes, one.embedded),
+                "{name}"
+            );
+            for t in 0..4 {
+                assert_eq!(st.sort[t].entries, one.sort[t].entries, "{name} table {t}");
+            }
+            assert!(st.peak_sort_bytes <= memory, "{name}: the chunks within the budget: {}", st.peak_sort_bytes);
+            if memory == 256 << 10 {
+                assert_eq!(st.workers, workers.min(14), "{name}");
+                assert!(st.sort[TABLE_STORAGE_NODES as usize].spills > st.workers as u64, "{name}: {:?}", st.sort);
+            } else {
+                assert_eq!(st.workers, workers);
+                assert_eq!(st.spill_bytes(), 0, "{name}: in memory");
+            }
+        }
+    }
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn a_tiny_budget_runs_fewer_workers() {
+    let w = world(200, 1000, 41);
+    let src = VecSource::new(&w.accounts, &w.code);
+    let (st, _) = compare_with(&w, &src, 48 << 10, true, "few", |o| o.workers = 64);
+    assert_eq!(st.workers, 1);
+    assert!(st.peak_sort_bytes <= 48 << 10);
+    let (st, _) = compare_with(&w, &src, 1 << 20, true, "some", |o| o.workers = 64);
+    assert_eq!(st.workers, ((1u64 << 20) - (1 << 16)) as usize / (16 << 10) - 1);
 }
