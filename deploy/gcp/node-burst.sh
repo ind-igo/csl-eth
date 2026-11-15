@@ -24,7 +24,10 @@ export PATH="/data/bin:$HOME/.cargo/bin:$PATH"
 if [ ! -x /data/bin/reth ]; then
   curl -sSfL "https://github.com/paradigmxyz/reth/releases/download/$RETH_VERSION/reth-$RETH_VERSION-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C /data/bin reth
 fi
-say "reth $(/data/bin/reth --version | head -1)"
+# The release binary wants glibc 2.39+ (Debian 13, not 12): fail here, not
+# an hour into the download.
+v=$(/data/bin/reth --version 2>&1) || { say "reth does not run: $v"; exit 1; }
+say "reth ${v%%$'\n'*}"
 
 # 1b. The exporter, built while the snapshot downloads.
 (

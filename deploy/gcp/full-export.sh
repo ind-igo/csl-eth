@@ -62,7 +62,7 @@ if ! gcloud compute instances describe "$VM" --zone "$ZONE" --project "$PROJECT"
     --machine-type n2-highmem-8 \
     --local-ssd interface=NVME --local-ssd interface=NVME --local-ssd interface=NVME --local-ssd interface=NVME \
     --boot-disk-size 50GB --boot-disk-type pd-balanced \
-    --image-family debian-12 --image-project debian-cloud \
+    --image-family debian-13 --image-project debian-cloud \
     --network-interface "subnet=csl-eth" \
     --service-account "$SA" --scopes https://www.googleapis.com/auth/devstorage.read_write \
     --tags producer,node \
@@ -105,11 +105,11 @@ seen=0
 while true; do
   sleep 60
   state=$(remote systemctl show csl-export -p ActiveState -p Result --value | tr '\n' ' ' || echo "unreachable")
-  lines=$(remote bash -c "journalctl -u csl-export --no-pager -o cat | grep '^csl-export' | tail -n +$((seen + 1))" || true)
+  lines=$(remote bash -c "sudo journalctl -u csl-export --no-pager -o cat | grep '^csl-export' | tail -n +$((seen + 1))" || true)
   [ -n "$lines" ] && { echo "$lines"; seen=$((seen + $(echo "$lines" | wc -l))); }
   case "$state" in
     "inactive success"*) log "burst finished"; break ;;
-    "failed"* | "inactive "*) log "burst failed: $state"; remote bash -c 'journalctl -u csl-export --no-pager -o cat | tail -40' || true; exit 1 ;;
+    "failed"* | "inactive "*) log "burst failed: $state"; remote bash -c 'sudo journalctl -u csl-export --no-pager -o cat | tail -40' || true; exit 1 ;;
   esac
 done
 
