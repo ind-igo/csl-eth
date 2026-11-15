@@ -151,6 +151,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: csl_eth_snap::history::cli::HistoryCmd,
     },
+    /// The accumulator route's files (beacon `block_roots` and
+    /// `historical_summaries` proofs) for the verified head; measured
+    /// against the walk; its fault table on real files.
+    Beacon {
+        #[command(subcommand)]
+        cmd: csl_eth_snap::beacon::BeaconCmd,
+    },
     /// Ask testnet peers for EIP-7928 block access lists (eth/71, snap/2)
     /// and verify each against its header. One JSON line per peer, then a
     /// summary.
@@ -297,7 +304,10 @@ fn log_filter() -> tracing_subscriber::EnvFilter {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use tracing_subscriber::util::SubscriberInitExt;
     let cli = Cli::parse();
-    if matches!(cli.cmd, Cmd::Produce(_) | Cmd::History { .. }) {
+    if matches!(
+        cli.cmd,
+        Cmd::Produce(_) | Cmd::History { .. } | Cmd::Beacon { .. }
+    ) {
         // stdout carries the cycle lines (the JSON document) only.
         subscriber(log_filter(), std::io::stderr).init();
     } else {
@@ -313,6 +323,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::History { cmd } => {
             let out = csl_eth_snap::history::cli::run(cmd).await?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Cmd::Beacon { cmd } => {
+            let out = tokio::task::spawn_blocking(move || csl_eth_snap::beacon::run(cmd)).await??;
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
         Cmd::Faults(args) => {

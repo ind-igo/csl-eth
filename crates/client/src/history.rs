@@ -238,10 +238,13 @@ pub enum HeaderRoute {
     Accumulator,
 }
 
-/// Below this many blocks from the walked chain a header is walked to:
-/// measured on mainnet, a 64-block walk costs about what the accumulator's
-/// row and proof do, in one round fewer.
-pub const ACCUM_MIN_DEPTH: u64 = 64;
+/// Below this many blocks from the walked chain a header is walked to.
+/// Measured on mainnet (2026-11-16): the accumulator costs about 5.5 KB
+/// at any depth (the header's 4 KB page, then 1.4 to 1.8 KB of proof) in
+/// two rounds, the walk 819 B a block in one; at 16 blocks the walk is
+/// 16 KB. Inside a transaction read the accumulator's second round
+/// overlaps the transaction lookup's, so it adds none there.
+pub const ACCUM_MIN_DEPTH: u64 = 16;
 
 /// The manifest's checks: the anchor's block, this format, contiguous
 /// periods covering the span, `tx_lookup` pieces covering the periods.

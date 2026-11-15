@@ -17,6 +17,7 @@
 //! and writes and reads the §3c history tables ([`history`]).
 
 pub mod bal;
+pub mod beacon;
 pub mod discovery;
 pub mod faults;
 pub mod fcr;

@@ -1,0 +1,48 @@
+{
+ "checkpoint": "0x431b33af8452e2d644377405e69d4f382182ab906f31461190ca24cb3401d70b",
+ "now": 1794777563,
+ "slot": 15662720,
+ "beacon_root": "0xaeaa95c85933bfa439ac95bee7fd36043f7bc5e71c53a55cfb963cb423a3b7cb",
+ "targets": [
+  {
+   "slot": 15662368,
+   "block_hash": "0x556fd9a91814fe9924c866574d1490144e844861cf18c59b5031aa443cef25d5",
+   "route": "ring"
+  },
+  {
+   "slot": 15662304,
+   "block_hash": "0xab7821c5c9d8a2176d8176222a3eb80a878686ccb3514fc498165b49773b7fd9",
+   "route": "ring"
+  },
+  {
+   "slot": 15662176,
+   "block_hash": "0x5a3b24f1081f9aae77eb646c4dd951b0d6c549563bbe22ee4951beb39f402d59",
+   "route": "ring"
+  },
+  {
+   "slot": 15661406,
+   "block_hash": "0x1931a3428ac6fc2de5a079251cfd37ae931831c714ffabe3f3036d6298b40832",
+   "route": "ring"
+  },
+  {
+   "slot": 15660379,
+   "block_hash": "0xd9c31e49ae7adad923ab5dc62453df42feaa9663866e57632dd5ded0b964ecd7",
+   "route": "ring"
+  },
+  {
+   "slot": 15658328,
+   "block_hash": "0xc4ba79a8ef9d8688568d931aafc7efb3ccbe81805455f5d0856f201ac2a17c7f",
+   "route": "ring"
+  },
+  {
+   "slot": 15655218,
+   "block_hash": "0x66f5530a39f82ac5e385349cbe7c3e48ff9903c87cee1c36435a8296fa9047f3",
+   "route": "ring"
+  },
+  {
+   "slot": 15662432,
+   "block_hash": "0xc4eb4f8e3d334b01d5b0867fc2c510f14185a02e02549d8b4cf23b986fa0dc92",
+   "route": "ring"
+  }
+ ]
+}
