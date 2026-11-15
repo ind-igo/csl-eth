@@ -20,9 +20,11 @@
 # era1 host nor this VM is trusted for what gets published.
 #
 # Not run yet. The sizing behind it (docs/decisions.md, "the history tables
-# from reth"): about 1.2 TB downloaded, 1.8 TB of reth on disk, 4 to 5 TB of
-# output, and on the order of 10^8 blob objects, whose upload, not the
-# export, likely bounds the run; hence 9 TB of disk and 48 hours.
+# from reth" and "history packs"): about 1.2 TB downloaded, 1.8 TB of reth on
+# disk, 4 to 5 TB of output in about 18,000 objects (runs and one pack per
+# period) and 0.3 TB of scratch for tx_lookup; about 8 to 12 hours, the
+# export and the upload of the bytes about equal; hence 9 TB of disk, and 48
+# hours as a ceiling.
 set -euo pipefail
 
 PROJECT="${CSL_ETH_PROJECT:-csl-eth}"
@@ -56,7 +58,6 @@ if ! mountpoint -q /data; then
   DEBIAN_FRONTEND=noninteractive apt-get install -y -q mdadm build-essential clang libclang-dev pkg-config curl rsync git zstd
   devs=$(ls /dev/disk/by-id/google-local-nvme-ssd-* | sort)
   [ -e /dev/md0 ] || mdadm --create /dev/md0 --level=0 --raid-devices=$(echo "$devs" | wc -l) $devs --force --run
-  # One inode per 16 KiB (the default) is ~550 M on 9 TB: room for the blobs.
   mkfs.ext4 -q -F -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/md0
   mkdir -p /data && mount -o discard,noatime /dev/md0 /data && chmod 1777 /data
 fi

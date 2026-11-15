@@ -15,9 +15,11 @@
 #    every transaction and receipt (no --minimal: reth.toml from the download
 #    prunes neither), and exits.
 # 3. With the day's cache: reth against it, block by block and file by file.
-# 4. The exporter writes blocks 0..BLOCK_NUMBER to /data/out: runs and blobs,
-#    then the manifest, then history/latest, only if every block verified.
-# 5. Upload: runs and blobs (immutable) first, then history-full/head/*, the
+# 4. The exporter writes blocks 0..BLOCK_NUMBER to /data/out: runs and packs
+#    (about 18k objects), then the manifest, then history/latest, only if
+#    every block verified. The tx_lookup rows pass through scratch under
+#    /data/out/history (about 160 GB) before they merge into two runs.
+# 5. Upload: runs and packs (immutable) first, then history-full/head/*, the
 #    manifest, and history/latest last.
 set -euo pipefail
 : "${BLOCK_HASH:?}" "${BLOCK_NUMBER:?}" "${BUCKET:?}"
@@ -107,13 +109,11 @@ pub() { CSL_ETH_GCS_BUCKET="$BUCKET" /data/src/scripts/gcs-publish.sh "$@"; }
 imm=(--no-clobber --cache-control 'public, max-age=31536000, immutable' --content-type application/octet-stream)
 cd /data/out
 t0=$(date +%s)
+gcloud storage rsync -r "${imm[@]}" history/packs "gs://$BUCKET/$PREFIX/history/packs"
+say "packs up in $(( $(date +%s) - t0 ))s ($(ls history/packs | wc -l) files, $(du -sh history/packs | cut -f1))"
+t0=$(date +%s)
 gcloud storage rsync -r "${imm[@]}" history/runs "gs://$BUCKET/$PREFIX/history/runs"
-say "runs up in $(( $(date +%s) - t0 ))s ($(ls history/runs | wc -l) files)"
-if [ -d blobs ]; then
-  t0=$(date +%s)
-  gcloud storage rsync -r "${imm[@]}" blobs "gs://$BUCKET/$PREFIX/blobs"
-  say "blobs up in $(( $(date +%s) - t0 ))s"
-fi
+say "runs up in $(( $(date +%s) - t0 ))s ($(ls history/runs | wc -l) files, $(du -sh history/runs | cut -f1))"
 cd /data/head
 find . -type f -print0 | while IFS= read -r -d '' f; do pub put "$PREFIX/head/${f#./}" "$f"; done
 cd /data/out

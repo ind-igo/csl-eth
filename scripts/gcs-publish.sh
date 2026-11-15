@@ -63,9 +63,9 @@ case "${1:-}" in
     case "$rel" in
       head/bootstrap/* | snapshots/0x*/* | snapshots/[0-9a-f]*/* | blobs/*)
         cc='public, max-age=31536000, immutable' ;;
-      # History: runs are named by their blake3, a manifest by the block
-      # its span ends at; neither is ever rewritten.
-      history/runs/* | history/[0-9a-f]*/manifest.json)
+      # History: runs and packs are named by their blake3, a manifest by
+      # the block its span ends at; none is ever rewritten.
+      history/runs/* | history/packs/* | history/[0-9a-f]*/manifest.json)
         cc='public, max-age=31536000, immutable' ;;
       *) cc='no-cache' ;; # head/optimistic, finality, fcr, updates/<period>, snapshots/latest, history/latest
     esac
