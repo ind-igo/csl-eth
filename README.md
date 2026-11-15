@@ -77,10 +77,15 @@ above. Details in `docs/decisions.md`.
 - **One slice, not full state.** The full-state plan is one export from a
   local reth node, then a diff of changed trie nodes per snapshot, so the cost
   of a snapshot scales with what changed, not with the state. Not yet measured.
+- **State only, no history yet.** Blocks, transactions, receipts and logs
+  are the next tables: append-only, verified against each header's
+  `transactionsRoot` and `receiptsRoot`, so a light client and a basic
+  indexer read them the same way. Not built.
 - **The producer needs care.** It restarts under k3s, but nothing alerts when
   cycles fail, and each failed fetch costs about four epochs.
-- **The checkpoint.** The default root (slot 15,551,104, 2026-10-31) must be
-  replaced before it leaves the weak-subjectivity period, around mid-November.
+- **The checkpoint.** The default root (slot 15,661,216, 2026-11-15) must be
+  replaced before it leaves the weak-subjectivity period, around the end of
+  November.
   The page also accepts `?checkpoint=` and `?bucket=` from the URL without a
   warning.
 - **Gloas.** EIP-7732 removes the state root from the light-client header, so

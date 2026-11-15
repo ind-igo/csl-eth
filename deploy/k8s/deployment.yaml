@@ -7,6 +7,11 @@
 # of the bucket, state.json with what is published and which pointer write is
 # pending) is data/produce under the same mount, so it survives restarts.
 #
+# Checkpoint: the page's default root (browser/src/main.ts, viz.ts), here so
+# the producer publishes head/bootstrap/<root>. state.json is tied to it, so
+# moving it means a fresh work directory: scale to 0, move data/produce aside
+# on the box (data/produce-<old root prefix>), then apply.sh.
+#
 # One replica and Recreate: two producers would race on the bucket's
 # pointers. hostNetwork because the fetcher speaks discv4 (UDP 30399) and
 # RLPx to mainnet peers, which is how it was measured from this box.
@@ -64,7 +69,7 @@ spec:
             - --work
             - data/produce
             - --checkpoint
-            - "0xe59d78041964322427cc209a44edcad243487378b78895a6cc0bfa7a7577cf0b"
+            - "0x431b33af8452e2d644377405e69d4f382182ab906f31461190ca24cb3401d70b"
             - --publish
             - /work/scripts/r2-s3-publish.sh
             - --every-mins
