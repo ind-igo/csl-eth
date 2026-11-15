@@ -17,6 +17,8 @@
 //! serve; every value and absence is still proven by the trie walk to the
 //! `state_root` the client verified for itself.
 
+pub mod export;
+pub mod extsort;
 pub mod producer;
 
 use alloy_primitives::B256;
@@ -24,6 +26,7 @@ use csl_run::RunRef;
 use serde::{Deserialize, Serialize};
 
 pub use csl_eth_trie as trie;
+pub use export::{export, CodeIter, ExportError, ExportOptions, ExportStats, Exported, Phase as ExportPhase, SourceAccount, StateSource, VecSource};
 pub use producer::{
     produce, produce_with, AccountLeaf, Head, Options as ProduceOptions, ProduceError, Produced,
     Stats as ProduceStats,

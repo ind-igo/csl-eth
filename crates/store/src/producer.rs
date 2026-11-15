@@ -9,9 +9,9 @@
 //! are written through the shared `csl-run` writer in key order.
 //!
 //! Nodes are sorted in memory. A 1/256 mainnet slice is a few million
-//! nodes, well within a workstation; the full-trie export of milestone 4
-//! needs the external sort cinder's sealer has, which is a later change
-//! behind the same `produce` call.
+//! nodes, well within a workstation. The full-state export streams instead
+//! and sorts externally: [`crate::export`], which writes the same files for
+//! the same state.
 
 use crate::{
     blob_path, manifest_path, profile_id, snapshot_dir, Manifest, TableRef, CODE_BLOB_THRESHOLD, EPSILON, FORMAT_VERSION, LATEST_FILE, RUN_FORMAT, TABLE_ACCOUNT_NODES,
@@ -409,7 +409,7 @@ where
 
 /// Write to a temporary name and rename, so a reader never sees a partial
 /// file.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
