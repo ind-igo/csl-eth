@@ -3,8 +3,9 @@
 //! execution block hashes proven to it from the records `csl-eth beacon
 //! build` wrote (kept sparse: only the ranges these reads touch). Each
 //! fixture is one head: `h1` (slot 15,662,720, period 1911) reaches its
-//! targets through its own `block_roots`; `h2`, when present (a head in
-//! 1912), reaches the same blocks through `historical_summaries[1153]`.
+//! targets through its own `block_roots`; `h2` (slot 15,663,104, the
+//! first of 1912) reaches the same blocks through period 1911's file and
+//! `historical_summaries[1153]`.
 //! The anchor block of the day's history span is among the targets, with
 //! its hash from the history producer, not the beacon files. `now` is
 //! pinned near each head.
@@ -146,10 +147,7 @@ fn prove<D: Driver>(
 }
 
 fn check(name: &str) {
-    let Some(f) = load(name) else {
-        eprintln!("no fixture {name}");
-        return;
-    };
+    let f = load(name).expect("fixture");
     let mut lies = 0;
     for t in &f.targets {
         let (r, (req, bytes, rounds)) = prove(&f.files, f.anchor, t.slot, &t.hash);
