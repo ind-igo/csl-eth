@@ -11,7 +11,7 @@ use csl_eth_client::{
     DirDriver, Driver, Got, HttpDriver, VerifiedHead, Want,
 };
 use csl_eth_store::{
-    history::{decode_header, decode_receipt, history_table_name, tx_hash, write_history, BlockSource, HistoryManifest},
+    history::{decode_header, decode_receipt, history_table_name, tx_hash, write_history_with, BlockSource, HistoryManifest, HistoryOptions},
     producer::write_atomic,
     EPSILON,
 };
@@ -84,6 +84,9 @@ pub struct BuildArgs {
     /// anchor `anchor.json` recorded.
     #[arg(long)]
     pub offline: bool,
+    /// Threads verifying and writing (the output does not depend on it).
+    #[arg(long, default_value_t = 1)]
+    pub workers: usize,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -274,7 +277,8 @@ async fn build(a: BuildArgs) -> Result<Value, String> {
         serde_json::to_value(s).map_err(|e| e.to_string())?
     };
     let started = Instant::now();
-    let w = write_history(&a.out, &BlockCache(a.work.clone()), first, (anchor.number, anchor.hash), a.epsilon).map_err(|e| e.to_string())?;
+    let mut opts = HistoryOptions { workers: a.workers, ..Default::default() };
+    let w = write_history_with(&a.out, &BlockCache(a.work.clone()), first, (anchor.number, anchor.hash), a.epsilon, &mut opts).map_err(|e| e.to_string())?;
     let mut totals: BTreeMap<&str, (u64, u64, u64, u64, u64)> = BTreeMap::new();
     let mut periods = Vec::new();
     for p in &w.stats {

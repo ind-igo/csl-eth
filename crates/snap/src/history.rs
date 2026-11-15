@@ -329,20 +329,8 @@ fn count_block(s: &mut AcquireStats, b: &Block) {
     s.receipt_bytes += b.receipts.iter().map(|r| r.len() as u64).sum::<u64>();
 }
 
-pub fn block_path(work: &Path, n: u64) -> PathBuf {
-    work.join("blocks").join(n.to_string())
-}
-
-/// The producer's verified block cache as a [`BlockSource`].
-pub struct BlockCache(pub PathBuf);
-
-impl BlockSource for BlockCache {
-    fn block(&self, n: u64) -> Result<Block, String> {
-        let p = block_path(&self.0, n);
-        let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-        Block::decode(&bytes).ok_or_else(|| format!("{}: not a cached block", p.display()))
-    }
-}
+/// The producer's verified block cache: `<work>/blocks/<n>`.
+pub use csl_eth_store::history::{block_path, BlockCache};
 
 /// A cached block that is the verified header's block, or `None`.
 fn cached(work: &Path, h: &Header) -> Option<Block> {

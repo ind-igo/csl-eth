@@ -35,8 +35,8 @@
 //! with the block; terms sharing the three bytes interleave, and a reader
 //! filters them out by the remaining 24 bytes.
 
-use crate::{blob_path, producer::write_atomic, profile_id, TableRef, CODE_BLOB_THRESHOLD};
-use alloy_primitives::{keccak256, Address, Bloom, BloomInput, B256};
+use crate::{CODE_BLOB_THRESHOLD, TableRef, blob_path, producer::write_atomic, profile_id};
+use alloy_primitives::{Address, B256, Bloom, BloomInput, keccak256};
 use alloy_rlp::{Decodable, Header as RlpHeader};
 use alloy_trie::root::ordered_trie_root_encoded;
 use csl_run::{Config, Entry, Writer};
@@ -46,6 +46,11 @@ use std::{
     fmt,
     fs::{self, File},
     path::{Path, PathBuf},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 /// Bumped when a key, value or the manifest changes shape.
@@ -103,8 +108,18 @@ pub const MAINNET_GENESIS_TIME: u64 = 1_606_824_023;
 pub const SLOTS_PER_PERIOD: u64 = 8192;
 pub const SECONDS_PER_SLOT: u64 = 12;
 
-pub fn period_of_timestamp(ts: u64) -> u64 {
-    ts.saturating_sub(MAINNET_GENESIS_TIME) / SECONDS_PER_SLOT / SLOTS_PER_PERIOD
+/// The first mainnet block with EIP-658 receipts (a status, not a state
+/// root).
+pub const MAINNET_BYZANTIUM_BLOCK: u64 = 4_370_000;
+
+/// The sync-committee period of a block's timestamp. Blocks older than the
+/// beacon chain (before 2020-12-01, about block 11.4 M) fall in negative
+/// periods of the same length, the clock run backwards, so the whole
+/// chain is cut into spans of about 27 hours (6,000 to 8,000 blocks) the
+/// same way.
+pub fn period_of_timestamp(ts: u64) -> i64 {
+    let span = (SECONDS_PER_SLOT * SLOTS_PER_PERIOD) as i128;
+    (ts as i128 - MAINNET_GENESIS_TIME as i128).div_euclid(span) as i64
 }
 
 /// `block u40 ‖ index u24 ‖ zeros`.
@@ -293,15 +308,21 @@ pub struct Log {
 pub struct ReceiptFields {
     /// 0 for legacy.
     pub tx_type: u8,
-    /// Post-Byzantium: whether the transaction succeeded.
+    /// Post-Byzantium: whether the transaction succeeded. False for a
+    /// pre-Byzantium receipt, which does not say.
     pub success: bool,
+    /// Pre-Byzantium (blocks below 4,370,000 on mainnet): the state root
+    /// after the transaction, which the receipt carries in place of the
+    /// status (EIP-658 replaced it).
+    pub post_state: Option<B256>,
     pub cumulative_gas_used: u64,
     pub bloom: Bloom,
     pub logs: Vec<Log>,
 }
 
 /// Decode a receipt leaf: `type ‖ rlp([status, cumulativeGas, bloom,
-/// logs])`, or the bare list for a legacy receipt.
+/// logs])`, or the bare list for a legacy receipt. The first field is the
+/// status (empty or `0x01`) or, before Byzantium, a 32-byte state root.
 pub fn decode_receipt(leaf: &[u8]) -> Result<ReceiptFields, &'static str> {
     let (tx_type, body) = match leaf.first() {
         None => return Err("empty receipt"),
@@ -314,6 +335,12 @@ pub fn decode_receipt(leaf: &[u8]) -> Result<ReceiptFields, &'static str> {
         return Err("receipt is not four fields");
     }
     let status: alloy_primitives::Bytes = item(it[0], "receipt status")?;
+    let (success, post_state) = match status.as_ref() {
+        [] => (false, None),
+        [1] => (true, None),
+        root if root.len() == 32 => (false, Some(B256::from_slice(root))),
+        _ => return Err("receipt status is neither a status nor a state root"),
+    };
     let logs_items = list_items(it[3])?;
     let mut logs = Vec::with_capacity(logs_items.len());
     for l in logs_items {
@@ -334,7 +361,8 @@ pub fn decode_receipt(leaf: &[u8]) -> Result<ReceiptFields, &'static str> {
     }
     Ok(ReceiptFields {
         tx_type,
-        success: status.as_ref() == [1u8],
+        success,
+        post_state,
         cumulative_gas_used: item(it[1], "cumulativeGasUsed")?,
         bloom: item(it[2], "receipt bloom")?,
         logs,
@@ -540,7 +568,8 @@ impl Block {
 /// One period's runs, as the manifest carries them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeriodRef {
-    pub period: u64,
+    /// Negative before the beacon chain ([`period_of_timestamp`]).
+    pub period: i64,
     /// The blocks of the span in this period, inclusive.
     pub first_block: u64,
     pub last_block: u64,
@@ -600,10 +629,16 @@ impl HistoryManifest {
     }
 }
 
-/// Where the writer reads verified blocks from: a producer's cache, or
-/// memory in tests.
+/// Where the writer reads verified blocks from: a producer's cache, a
+/// node's database, or memory in tests.
 pub trait BlockSource {
     fn block(&self, number: u64) -> Result<Block, String>;
+}
+
+impl<S: BlockSource + ?Sized> BlockSource for &S {
+    fn block(&self, number: u64) -> Result<Block, String> {
+        (**self).block(number)
+    }
 }
 
 impl BlockSource for BTreeMap<u64, Block> {
@@ -611,6 +646,35 @@ impl BlockSource for BTreeMap<u64, Block> {
         self.get(&number)
             .cloned()
             .ok_or_else(|| format!("no block {number}"))
+    }
+}
+
+/// Opens a [`BlockSource`] for each worker thread of
+/// [`write_history_with`]: a node's database wants a read transaction per
+/// thread. A source that is `Sync` is its own.
+pub trait BlockSources: Sync {
+    fn open(&self) -> Result<Box<dyn BlockSource + '_>, String>;
+}
+
+impl<S: BlockSource + Sync> BlockSources for S {
+    fn open(&self) -> Result<Box<dyn BlockSource + '_>, String> {
+        Ok(Box::new(self))
+    }
+}
+
+/// A producer's block cache, `<work>/blocks/<n>` in [`Block::encode`]'s
+/// form. Nothing in it is believed: the writer verifies every block.
+pub struct BlockCache(pub PathBuf);
+
+pub fn block_path(work: &Path, n: u64) -> PathBuf {
+    work.join("blocks").join(n.to_string())
+}
+
+impl BlockSource for BlockCache {
+    fn block(&self, n: u64) -> Result<Block, String> {
+        let p = block_path(&self.0, n);
+        let bytes = fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        Block::decode(&bytes).ok_or_else(|| format!("{}: not a cached block", p.display()))
     }
 }
 
@@ -668,11 +732,22 @@ pub struct HistoryTableStats {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct PeriodStats {
-    pub period: u64,
+    pub period: i64,
     pub blocks: u64,
     pub transactions: u64,
     pub logs: u64,
     pub tables: Vec<HistoryTableStats>,
+}
+
+impl PeriodStats {
+    /// Runs and blob bytes (shared blobs counted in every period that
+    /// names them).
+    pub fn bytes(&self) -> u64 {
+        self.tables
+            .iter()
+            .map(|t| t.file_bytes + t.blob_bytes)
+            .sum()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -681,23 +756,101 @@ pub struct HistoryWritten {
     pub stats: Vec<PeriodStats>,
     /// Every file written, bucket-relative, in the order a publisher must
     /// put them: runs and blobs, then the manifest, then `history/latest`.
+    /// Without [`HistoryOptions::list_blobs`], blobs are left out.
     pub files: Vec<String>,
 }
 
-/// What one period needs after the first pass.
+/// How [`write_history_with`] runs.
+pub struct HistoryOptions<'a> {
+    /// Worker threads, each with a source of its own from
+    /// [`BlockSources::open`]. Verification takes runs of
+    /// [`chunk_blocks`](Self::chunk_blocks) blocks, writing takes whole
+    /// periods, both in ascending order.
+    pub workers: usize,
+    pub chunk_blocks: u64,
+    /// List every blob in [`HistoryWritten::files`]. A full chain names
+    /// tens of millions; off, the list holds the runs, the manifest and
+    /// `history/latest`.
+    pub list_blobs: bool,
+    pub progress_every: Duration,
+    /// Called on the calling thread every `progress_every`, and at the end
+    /// of each phase.
+    pub progress: Option<&'a mut dyn FnMut(&HistoryProgress)>,
+}
+
+impl Default for HistoryOptions<'_> {
+    fn default() -> Self {
+        HistoryOptions {
+            workers: 1,
+            chunk_blocks: SLOTS_PER_PERIOD,
+            list_blobs: true,
+            progress_every: Duration::from_secs(60),
+            progress: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum HistoryPhase {
+    /// Pass 1: every block verified and chained to the anchor; nothing is
+    /// written.
+    Verify,
+    /// Pass 2: each period's runs.
+    Write,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct HistoryProgress {
+    pub phase: HistoryPhase,
+    pub workers: usize,
+    /// Blocks done in this phase, of `of_blocks`.
+    pub blocks: u64,
+    pub of_blocks: u64,
+    pub transactions: u64,
+    /// Periods written, of `of_periods` (known once verification ends).
+    pub periods: u64,
+    pub of_periods: u64,
+    /// Runs and blob bytes of the periods written.
+    pub written_bytes: u64,
+    pub elapsed_s: f64,
+}
+
+/// One period's span, from pass 1.
+#[derive(Clone, Debug)]
 struct PeriodPlan {
-    period: u64,
+    period: i64,
     first: u64,
     last: u64,
     txs: u64,
     receipts: u64,
-    logs: u64,
-    tx_lookup: Vec<([u8; 32], [u8; 8])>,
-    log_lookup: Vec<[u8; 32]>,
+}
+
+/// What pass 1 learns from a run of consecutive blocks.
+struct Scan {
+    first: u64,
+    /// The first block's `parentHash`.
+    parent: B256,
+    hashes: Vec<B256>,
+    periods: Vec<PeriodPlan>,
+}
+
+/// One period written.
+struct PeriodOut {
+    period: PeriodRef,
+    stats: PeriodStats,
+    files: Vec<String>,
+}
+
+#[derive(Default)]
+struct Counters {
+    blocks: AtomicU64,
+    txs: AtomicU64,
+    periods: AtomicU64,
+    bytes: AtomicU64,
 }
 
 /// Write the span `first ..= anchor.0` from `src`, which must end at the
-/// block `anchor.1`, under `root`. Every block is checked again here (its
+/// block `anchor.1`, under `root`. Every block is checked here (its
 /// header's hash, the chain to the anchor, both roots) before anything is
 /// written, so a bucket never holds a block its header does not commit to,
 /// whatever the source. Runs and blobs first, then the manifest, then
@@ -709,7 +862,30 @@ pub fn write_history(
     anchor: (u64, B256),
     epsilon: u16,
 ) -> Result<HistoryWritten, HistoryError> {
-    write_history_inner(root, src, first, anchor, epsilon, None)
+    write_inner(
+        root,
+        Src::One(src),
+        first,
+        anchor,
+        epsilon,
+        None,
+        &mut HistoryOptions::default(),
+    )
+}
+
+/// [`write_history`] on `opts.workers` threads, for spans too large to
+/// hold: the whole chain. The output is the same file for file whatever
+/// the worker count. Memory is the blocks' hashes (32 bytes a block, about
+/// 0.85 GB for mainnet) and, per worker, one period's hint rows.
+pub fn write_history_with(
+    root: &Path,
+    sources: &dyn BlockSources,
+    first: u64,
+    anchor: (u64, B256),
+    epsilon: u16,
+    opts: &mut HistoryOptions,
+) -> Result<HistoryWritten, HistoryError> {
+    write_inner(root, Src::Many(sources), first, anchor, epsilon, None, opts)
 }
 
 /// A `tx_lookup` row: the key and the locator.
@@ -737,191 +913,142 @@ pub fn write_history_tampered(
     epsilon: u16,
     tamper: &Tamper,
 ) -> Result<HistoryWritten, HistoryError> {
-    write_history_inner(root, src, first, anchor, epsilon, Some(tamper))
+    write_inner(
+        root,
+        Src::One(src),
+        first,
+        anchor,
+        epsilon,
+        Some(tamper),
+        &mut HistoryOptions::default(),
+    )
 }
 
-fn write_history_inner(
+enum Src<'a> {
+    /// Everything on the calling thread.
+    One(&'a dyn BlockSource),
+    /// A source per worker.
+    Many(&'a dyn BlockSources),
+}
+
+fn write_inner(
     root: &Path,
-    src: &dyn BlockSource,
+    src: Src,
     first: u64,
     anchor: (u64, B256),
     epsilon: u16,
     tamper: Option<&Tamper>,
+    opts: &mut HistoryOptions,
 ) -> Result<HistoryWritten, HistoryError> {
     let (last, anchor_hash) = anchor;
     if first > last || last > MAX_BLOCK {
         return Err(HistoryError::Span(format!("blocks {first} to {last}")));
     }
+    let started = Instant::now();
+    let workers = match src {
+        Src::One(_) => 1,
+        Src::Many(_) => opts.workers.max(1),
+    };
+    let total = last - first + 1;
+    let counters = Counters::default();
+    let stop = AtomicBool::new(false);
+    let report = |opts: &mut HistoryOptions, phase, of_periods| {
+        let p = HistoryProgress {
+            phase,
+            workers,
+            blocks: counters.blocks.load(Ordering::Relaxed),
+            of_blocks: total,
+            transactions: counters.txs.load(Ordering::Relaxed),
+            periods: counters.periods.load(Ordering::Relaxed),
+            of_periods,
+            written_bytes: counters.bytes.load(Ordering::Relaxed),
+            elapsed_s: started.elapsed().as_secs_f64(),
+        };
+        if let Some(f) = opts.progress.as_mut() {
+            f(&p);
+        }
+    };
 
     // Pass 1: verify the chain and every block, plan the periods.
-    let mut plans: Vec<PeriodPlan> = Vec::new();
-    let mut prev: Option<HeaderFields> = None;
-    // Each block's hash as verified here, chained to the anchor: pass 2
-    // writes a block only if it is this one again.
-    let mut verified: Vec<B256> = Vec::with_capacity((last - first + 1) as usize);
-    for n in first..=last {
-        let mut b = src.block(n).map_err(HistoryError::Source)?;
-        if b.number != n {
-            return Err(HistoryError::Source(format!(
-                "asked for block {n}, got {}",
-                b.number
-            )));
+    let scans = match src {
+        Src::One(s) => vec![scan(s, first, last, tamper, &counters, &stop)?],
+        Src::Many(sources) => {
+            let chunk = opts.chunk_blocks.max(1);
+            let jobs = total.div_ceil(chunk) as usize;
+            let job = |s: &dyn BlockSource, i: usize| {
+                let lo = first + i as u64 * chunk;
+                scan(s, lo, (lo + chunk - 1).min(last), None, &counters, &stop)
+            };
+            let every = opts.progress_every;
+            par_jobs(sources, workers, jobs, &job, &stop, every, &mut || {
+                report(opts, HistoryPhase::Verify, 0)
+            })?
         }
-        let h = b.verify()?;
-        verified.push(h.hash);
-        if let Some(t) = tamper {
-            (t.block)(&mut b);
-        }
-        if let Some(p) = &prev {
-            if h.parent_hash != p.hash {
-                return Err(BlockError::Chain { number: p.number }.into());
-            }
-        }
-        if b.txs.len() as u64 > MAX_INDEX {
-            return Err(HistoryError::Span(format!(
-                "block {n} has {} transactions",
-                b.txs.len()
-            )));
-        }
-        let period = period_of_timestamp(h.timestamp);
-        if plans.last().is_none_or(|p| p.period != period) {
-            if plans.last().is_some_and(|p| p.period > period) {
-                return Err(HistoryError::Span(format!(
-                    "block {n} is in an earlier period than its parent"
-                )));
-            }
-            plans.push(PeriodPlan {
-                period,
-                first: n,
-                last: n,
-                txs: 0,
-                receipts: 0,
-                logs: 0,
-                tx_lookup: Vec::new(),
-                log_lookup: Vec::new(),
-            });
-        }
-        let plan = plans.last_mut().expect("pushed");
-        plan.last = n;
-        plan.txs += b.txs.len() as u64;
-        plan.receipts += b.receipts.len() as u64;
-        for (i, t) in b.txs.iter().enumerate() {
-            plan.tx_lookup
-                .push((tx_lookup_key(&tx_hash(t)), locator(n, i as u64)));
-        }
-        let mut terms = std::collections::BTreeSet::new();
-        for r in &b.receipts {
-            // Verified above, unless a fault table's edit broke it.
-            let Ok(r) = decode_receipt(r) else { continue };
-            plan.logs += r.logs.len() as u64;
-            for l in &r.logs {
-                terms.insert(Term::Address(l.address));
-                for t in &l.topics {
-                    terms.insert(Term::Topic(*t));
-                }
-            }
-        }
-        for t in terms {
-            plan.log_lookup.push(log_lookup_key(&t.hash(), n));
-        }
-        prev = Some(h);
-    }
-    let top = prev.expect("at least one block");
-    if top.hash != anchor_hash {
-        return Err(HistoryError::Span(format!(
-            "block {last} is {}, the anchor is {anchor_hash}",
-            top.hash
-        )));
-    }
+    };
+    let (plans, verified) = join(scans, anchor)?;
+    report(opts, HistoryPhase::Verify, plans.len() as u64);
 
     // Pass 2: write each period's runs.
-    let runs_dir = root.join("history/runs");
-    fs::create_dir_all(&runs_dir)?;
+    fs::create_dir_all(root.join("history/runs"))?;
     fs::create_dir_all(root.join("blobs"))?;
-    let mut files: Vec<String> = Vec::new();
-    let mut periods = Vec::new();
-    let mut stats = Vec::new();
-    let cfg = |table_id: u16| Config {
-        profile_id: profile_id(),
-        table_id,
-        value_size: 0,
-        epsilon,
+    counters.blocks.store(0, Ordering::Relaxed);
+    counters.txs.store(0, Ordering::Relaxed);
+    let list_blobs = opts.list_blobs;
+    let outs = match src {
+        Src::One(s) => {
+            let mut v = Vec::with_capacity(plans.len());
+            for p in &plans {
+                let w = PeriodWrite {
+                    root,
+                    epsilon,
+                    list_blobs,
+                    counters: &counters,
+                    stop: &stop,
+                };
+                v.push(w.write(s, p, period_hashes(&verified, first, p), tamper)?);
+            }
+            v
+        }
+        Src::Many(sources) => {
+            let job = |s: &dyn BlockSource, i: usize| {
+                let p = &plans[i];
+                let w = PeriodWrite {
+                    root,
+                    epsilon,
+                    list_blobs,
+                    counters: &counters,
+                    stop: &stop,
+                };
+                w.write(s, p, period_hashes(&verified, first, p), None)
+            };
+            let every = opts.progress_every;
+            let n = plans.len() as u64;
+            par_jobs(
+                sources,
+                workers,
+                plans.len(),
+                &job,
+                &stop,
+                every,
+                &mut || report(opts, HistoryPhase::Write, n),
+            )?
+        }
     };
-    for plan in &mut plans {
-        let mut ps = PeriodStats {
-            period: plan.period,
-            blocks: plan.last - plan.first + 1,
-            transactions: plan.txs,
-            logs: plan.logs,
-            tables: Vec::new(),
-        };
-        let mut tables = Vec::new();
-        let blocks = plan.last - plan.first + 1;
-        let mut w_headers = RunOut::new(&runs_dir, cfg(H_HEADERS), blocks)?;
-        let mut w_txs = RunOut::new(&runs_dir, cfg(H_TRANSACTIONS), plan.txs)?;
-        let mut w_receipts = RunOut::new(&runs_dir, cfg(H_RECEIPTS), plan.receipts)?;
-        for n in plan.first..=plan.last {
-            let mut b = src.block(n).map_err(HistoryError::Source)?;
-            // The source served this block once already. The bytes written
-            // are verified again here (header hash, both roots, receipts
-            // decoding) and must be the block pass 1 chained to the anchor:
-            // a source that changed in between is a fault, not something
-            // to write.
-            let was = verified[(n - first) as usize];
-            let changed = || HistoryError::Source(format!("block {n} changed between passes"));
-            if b.number != n || b.hash != was {
-                return Err(changed());
-            }
-            match b.verify() {
-                Ok(h) if h.hash == was => {}
-                _ => return Err(changed()),
-            }
-            if let Some(t) = tamper {
-                (t.block)(&mut b);
-            }
-            w_headers.push(root, &mut files, block_key(n, 0), b.header)?;
-            for (i, t) in b.txs.into_iter().enumerate() {
-                w_txs.push(root, &mut files, block_key(n, i as u64), t)?;
-            }
-            for (i, r) in b.receipts.into_iter().enumerate() {
-                w_receipts.push(root, &mut files, block_key(n, i as u64), r)?;
-            }
-        }
-        plan.tx_lookup.sort_unstable();
-        plan.log_lookup.sort_unstable();
-        plan.log_lookup.dedup();
-        if plan.tx_lookup.windows(2).any(|w| w[0].0 == w[1].0) {
-            return Err(HistoryError::Span("two transactions with one hash".into()));
-        }
-        if let Some(t) = tamper {
-            (t.tx_lookup)(&mut plan.tx_lookup);
-            (t.log_lookup)(&mut plan.log_lookup);
-        }
-        let mut w_tx_lookup =
-            RunOut::new(&runs_dir, cfg(H_TX_LOOKUP), plan.tx_lookup.len() as u64)?;
-        for (k, v) in &plan.tx_lookup {
-            w_tx_lookup.push(root, &mut files, *k, v.to_vec())?;
-        }
-        let mut w_log_lookup =
-            RunOut::new(&runs_dir, cfg(H_LOG_LOOKUP), plan.log_lookup.len() as u64)?;
-        for k in &plan.log_lookup {
-            w_log_lookup.push(root, &mut files, *k, Vec::new())?;
-        }
-        for w in [w_headers, w_txs, w_receipts, w_tx_lookup, w_log_lookup] {
-            if let Some((tr, st)) = w.finish(root, &mut files)? {
-                tables.push(tr);
-                ps.tables.push(st);
-            }
-        }
-        periods.push(PeriodRef {
-            period: plan.period,
-            first_block: plan.first,
-            last_block: plan.last,
-            tables,
-        });
-        stats.push(ps);
-    }
+    report(opts, HistoryPhase::Write, plans.len() as u64);
 
+    let mut files: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut periods = Vec::with_capacity(outs.len());
+    let mut stats = Vec::with_capacity(outs.len());
+    for o in outs {
+        for f in o.files {
+            if seen.insert(f.clone()) {
+                files.push(f);
+            }
+        }
+        periods.push(o.period);
+        stats.push(o.stats);
+    }
     let manifest = HistoryManifest {
         format_version: HISTORY_FORMAT_VERSION,
         profile_id: profile_id(),
@@ -945,8 +1072,384 @@ fn write_history_inner(
     })
 }
 
+/// Pass 1 over `lo ..= hi`: each block verified on its own (header hash,
+/// both roots, receipts decoding) and chained to the one before it.
+fn scan(
+    src: &dyn BlockSource,
+    lo: u64,
+    hi: u64,
+    tamper: Option<&Tamper>,
+    c: &Counters,
+    stop: &AtomicBool,
+) -> Result<Scan, HistoryError> {
+    let mut out = Scan {
+        first: lo,
+        parent: B256::ZERO,
+        hashes: Vec::with_capacity((hi - lo + 1) as usize),
+        periods: Vec::new(),
+    };
+    let mut prev: Option<HeaderFields> = None;
+    for n in lo..=hi {
+        if stop.load(Ordering::Relaxed) {
+            return Err(stopped());
+        }
+        let mut b = src.block(n).map_err(HistoryError::Source)?;
+        if b.number != n {
+            return Err(HistoryError::Source(format!(
+                "asked for block {n}, got {}",
+                b.number
+            )));
+        }
+        let h = b.verify()?;
+        out.hashes.push(h.hash);
+        if let Some(t) = tamper {
+            (t.block)(&mut b);
+        }
+        match &prev {
+            Some(p) if h.parent_hash != p.hash => {
+                return Err(BlockError::Chain { number: p.number }.into());
+            }
+            Some(_) => {}
+            None => out.parent = h.parent_hash,
+        }
+        if b.txs.len() as u64 > MAX_INDEX {
+            return Err(HistoryError::Span(format!(
+                "block {n} has {} transactions",
+                b.txs.len()
+            )));
+        }
+        let period = period_of_timestamp(h.timestamp);
+        let (txs, receipts) = (b.txs.len() as u64, b.receipts.len() as u64);
+        match out.periods.last_mut() {
+            Some(p) if p.period == period => {
+                p.last = n;
+                p.txs += txs;
+                p.receipts += receipts;
+            }
+            Some(p) if p.period > period => return Err(earlier_period(n)),
+            _ => out.periods.push(PeriodPlan {
+                period,
+                first: n,
+                last: n,
+                txs,
+                receipts,
+            }),
+        }
+        c.blocks.fetch_add(1, Ordering::Relaxed);
+        c.txs.fetch_add(txs, Ordering::Relaxed);
+        prev = Some(h);
+    }
+    Ok(out)
+}
+
+fn earlier_period(n: u64) -> HistoryError {
+    HistoryError::Span(format!("block {n} is in an earlier period than its parent"))
+}
+
+/// The hashes pass 1 verified for a period's blocks.
+fn period_hashes<'a>(verified: &'a [B256], first: u64, p: &PeriodPlan) -> &'a [B256] {
+    &verified[(p.first - first) as usize..=(p.last - first) as usize]
+}
+
+/// A worker giving up because another failed; never the error returned.
+fn stopped() -> HistoryError {
+    HistoryError::Span("stopped: another worker failed".into())
+}
+
+/// Pass 1's runs in order, into periods and the blocks' hashes, checking
+/// that each run follows the last and the span ends at the anchor.
+fn join(
+    scans: Vec<Scan>,
+    anchor: (u64, B256),
+) -> Result<(Vec<PeriodPlan>, Vec<B256>), HistoryError> {
+    let (last, anchor_hash) = anchor;
+    let mut hashes: Vec<B256> = Vec::with_capacity(scans.iter().map(|s| s.hashes.len()).sum());
+    let mut plans: Vec<PeriodPlan> = Vec::new();
+    for s in scans {
+        if let Some(prev) = hashes.last() {
+            if s.parent != *prev {
+                return Err(BlockError::Chain {
+                    number: s.first - 1,
+                }
+                .into());
+            }
+        }
+        hashes.extend(s.hashes);
+        for p in s.periods {
+            match plans.last_mut() {
+                Some(q) if q.period == p.period => {
+                    q.last = p.last;
+                    q.txs += p.txs;
+                    q.receipts += p.receipts;
+                }
+                Some(q) if q.period > p.period => return Err(earlier_period(p.first)),
+                _ => plans.push(p),
+            }
+        }
+    }
+    let top = *hashes.last().expect("at least one block");
+    if top != anchor_hash {
+        return Err(HistoryError::Span(format!(
+            "block {last} is {top}, the anchor is {anchor_hash}"
+        )));
+    }
+    Ok((plans, hashes))
+}
+
+/// Run `jobs` jobs on `workers` threads, each with its own source, in
+/// ascending order of index; the results come back in index order. The
+/// first job to fail stops the others (they finish the block they are on)
+/// and its error is returned. A worker that panics stops the others too,
+/// and the panic resumes here once they have.
+fn par_jobs<T: Send>(
+    sources: &dyn BlockSources,
+    workers: usize,
+    jobs: usize,
+    job: &(dyn Fn(&dyn BlockSource, usize) -> Result<T, HistoryError> + Sync),
+    stop: &AtomicBool,
+    every: Duration,
+    tick: &mut dyn FnMut(),
+) -> Result<Vec<T>, HistoryError> {
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<T>>> = Mutex::new((0..jobs).map(|_| None).collect());
+    let failed: Mutex<Option<HistoryError>> = Mutex::new(None);
+    let threads = workers.clamp(1, jobs.max(1));
+    let running = AtomicUsize::new(threads);
+    let fail = |e: HistoryError| {
+        let mut f = failed.lock().unwrap_or_else(|p| p.into_inner());
+        if f.is_none() {
+            *f = Some(e);
+        }
+        stop.store(true, Ordering::Relaxed);
+    };
+    /// Counts a worker out however it ends, and stops the others if it
+    /// panicked.
+    struct Out<'a>(&'a AtomicUsize, &'a AtomicBool);
+    impl Drop for Out<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.1.store(true, Ordering::Relaxed);
+            }
+            self.0.fetch_sub(1, Ordering::Release);
+        }
+    }
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                let _out = Out(&running, stop);
+                let src = match sources.open() {
+                    Ok(src) => src,
+                    Err(e) => return fail(HistoryError::Source(e)),
+                };
+                while !stop.load(Ordering::Relaxed) {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= jobs {
+                        break;
+                    }
+                    match job(&*src, i) {
+                        Ok(t) => results.lock().unwrap_or_else(|p| p.into_inner())[i] = Some(t),
+                        Err(e) => return fail(e),
+                    }
+                }
+            });
+        }
+        let mut last = Instant::now();
+        while running.load(Ordering::Acquire) > 0 {
+            std::thread::sleep(Duration::from_millis(50).min(every));
+            if last.elapsed() >= every {
+                last = Instant::now();
+                tick();
+            }
+        }
+    });
+    if let Some(e) = failed.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        return Err(e);
+    }
+    results
+        .into_inner()
+        .unwrap_or_else(|p| p.into_inner())
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| r.ok_or_else(|| HistoryError::Span(format!("job {i} did not finish"))))
+        .collect()
+}
+
+/// Pass 2 for one period.
+struct PeriodWrite<'a> {
+    root: &'a Path,
+    epsilon: u16,
+    list_blobs: bool,
+    counters: &'a Counters,
+    stop: &'a AtomicBool,
+}
+
+impl PeriodWrite<'_> {
+    /// Read the period's blocks again, check each is the block pass 1
+    /// chained to the anchor (`verified`, the period's hashes) and verifies
+    /// again, and write the five runs; the hint rows come from the same
+    /// bytes.
+    fn write(
+        &self,
+        src: &dyn BlockSource,
+        plan: &PeriodPlan,
+        verified: &[B256],
+        tamper: Option<&Tamper>,
+    ) -> Result<PeriodOut, HistoryError> {
+        let root = self.root;
+        let runs_dir = root.join("history/runs");
+        let cfg = |table_id: u16| Config {
+            profile_id: profile_id(),
+            table_id,
+            value_size: 0,
+            epsilon: self.epsilon,
+        };
+        let mut files = Files {
+            list: Vec::new(),
+            seen: std::collections::HashSet::new(),
+            list_blobs: self.list_blobs,
+        };
+        let blocks = plan.last - plan.first + 1;
+        let tag = format!("{}-{}", std::process::id(), plan.first);
+        let mut w_headers = RunOut::new(&runs_dir, &tag, cfg(H_HEADERS), blocks)?;
+        let mut w_txs = RunOut::new(&runs_dir, &tag, cfg(H_TRANSACTIONS), plan.txs)?;
+        let mut w_receipts = RunOut::new(&runs_dir, &tag, cfg(H_RECEIPTS), plan.receipts)?;
+        let mut tx_lookup: Vec<TxLookupRow> = Vec::with_capacity(plan.txs as usize);
+        let mut log_lookup: Vec<[u8; 32]> = Vec::new();
+        let mut logs = 0u64;
+        for n in plan.first..=plan.last {
+            if self.stop.load(Ordering::Relaxed) {
+                return Err(stopped());
+            }
+            let mut b = src.block(n).map_err(HistoryError::Source)?;
+            // The source served this block once already. The bytes written
+            // are verified again here (header hash, both roots, receipts
+            // decoding) and must be the block pass 1 chained to the anchor:
+            // a source that changed in between is a fault, not something
+            // to write.
+            let was = verified[(n - plan.first) as usize];
+            let changed = || HistoryError::Source(format!("block {n} changed between passes"));
+            if b.number != n || b.hash != was {
+                return Err(changed());
+            }
+            match b.verify() {
+                Ok(h) if h.hash == was => {}
+                _ => return Err(changed()),
+            }
+            if let Some(t) = tamper {
+                (t.block)(&mut b);
+            }
+            for (i, t) in b.txs.iter().enumerate() {
+                tx_lookup.push((tx_lookup_key(&tx_hash(t)), locator(n, i as u64)));
+            }
+            let mut terms = std::collections::BTreeSet::new();
+            for r in &b.receipts {
+                // Verified above, unless a fault table's edit broke it.
+                let Ok(r) = decode_receipt(r) else { continue };
+                logs += r.logs.len() as u64;
+                for l in &r.logs {
+                    terms.insert(Term::Address(l.address));
+                    for t in &l.topics {
+                        terms.insert(Term::Topic(*t));
+                    }
+                }
+            }
+            for t in terms {
+                log_lookup.push(log_lookup_key(&t.hash(), n));
+            }
+            let txs = b.txs.len() as u64;
+            w_headers.push(root, &mut files, block_key(n, 0), b.header)?;
+            for (i, t) in b.txs.into_iter().enumerate() {
+                w_txs.push(root, &mut files, block_key(n, i as u64), t)?;
+            }
+            for (i, r) in b.receipts.into_iter().enumerate() {
+                w_receipts.push(root, &mut files, block_key(n, i as u64), r)?;
+            }
+            self.counters.blocks.fetch_add(1, Ordering::Relaxed);
+            self.counters.txs.fetch_add(txs, Ordering::Relaxed);
+        }
+        tx_lookup.sort_unstable();
+        log_lookup.sort_unstable();
+        log_lookup.dedup();
+        if tx_lookup.windows(2).any(|w| w[0].0 == w[1].0) {
+            return Err(HistoryError::Span("two transactions with one hash".into()));
+        }
+        if let Some(t) = tamper {
+            (t.tx_lookup)(&mut tx_lookup);
+            (t.log_lookup)(&mut log_lookup);
+        }
+        let mut w_tx_lookup =
+            RunOut::new(&runs_dir, &tag, cfg(H_TX_LOOKUP), tx_lookup.len() as u64)?;
+        for (k, v) in &tx_lookup {
+            w_tx_lookup.push(root, &mut files, *k, v.to_vec())?;
+        }
+        drop(tx_lookup);
+        let mut w_log_lookup =
+            RunOut::new(&runs_dir, &tag, cfg(H_LOG_LOOKUP), log_lookup.len() as u64)?;
+        for k in &log_lookup {
+            w_log_lookup.push(root, &mut files, *k, Vec::new())?;
+        }
+        let mut stats = PeriodStats {
+            period: plan.period,
+            blocks,
+            transactions: plan.txs,
+            logs,
+            tables: Vec::new(),
+        };
+        let mut tables = Vec::new();
+        for w in [w_headers, w_txs, w_receipts, w_tx_lookup, w_log_lookup] {
+            if let Some((tr, st)) = w.finish(root, &mut files.list)? {
+                tables.push(tr);
+                stats.tables.push(st);
+            }
+        }
+        self.counters.periods.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .bytes
+            .fetch_add(stats.bytes(), Ordering::Relaxed);
+        Ok(PeriodOut {
+            period: PeriodRef {
+                period: plan.period,
+                first_block: plan.first,
+                last_block: plan.last,
+                tables,
+            },
+            stats,
+            files: files.list,
+        })
+    }
+}
+
+/// One period's files, in the order written; each blob once.
+struct Files {
+    list: Vec<String>,
+    seen: std::collections::HashSet<[u8; 32]>,
+    list_blobs: bool,
+}
+
+/// Write `bytes` to `path` through a temporary name no other writer uses,
+/// so two workers writing the same blob both leave it whole.
+fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("blob");
+    let tmp = path.with_file_name(format!(
+        "{name}.{}-{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let r = (|| {
+        let mut f = File::create(&tmp)?;
+        std::io::Write::write_all(&mut f, bytes)?;
+        fs::rename(&tmp, path)
+    })();
+    if r.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    r
+}
+
 /// One run being written under a temporary name, renamed to its `blake3`
-/// when finished. Values above the inline size go to `blobs/`.
+/// when finished, removed if it never is. Values above the inline size go
+/// to `blobs/`.
 struct RunOut {
     tmp: PathBuf,
     w: Option<Writer<File>>,
@@ -956,9 +1459,17 @@ struct RunOut {
     blob_bytes: u64,
 }
 
+impl Drop for RunOut {
+    fn drop(&mut self) {
+        if self.w.take().is_some() {
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
+}
+
 impl RunOut {
-    fn new(dir: &Path, cfg: Config, entries: u64) -> Result<RunOut, HistoryError> {
-        let tmp = dir.join(format!("tmp-{}-{}.run", cfg.table_id, std::process::id()));
+    fn new(dir: &Path, tag: &str, cfg: Config, entries: u64) -> Result<RunOut, HistoryError> {
+        let tmp = dir.join(format!("tmp-{tag}-{}.run", cfg.table_id));
         let w = if entries == 0 {
             None
         } else {
@@ -983,7 +1494,7 @@ impl RunOut {
     fn push(
         &mut self,
         root: &Path,
-        files: &mut Vec<String>,
+        files: &mut Files,
         key: [u8; 32],
         value: Vec<u8>,
     ) -> Result<(), HistoryError> {
@@ -993,13 +1504,15 @@ impl RunOut {
             .ok_or_else(|| HistoryError::Span("an entry for a table counted empty".into()))?;
         if value.len() > CODE_BLOB_THRESHOLD {
             let h = *blake3::hash(&value).as_bytes();
-            let rel = blob_path(&h);
-            let p = root.join(&rel);
-            if !p.exists() {
-                write_atomic(&p, &value)?;
-            }
-            if !files.contains(&rel) {
-                files.push(rel);
+            if files.seen.insert(h) {
+                let rel = blob_path(&h);
+                let p = root.join(&rel);
+                if !p.exists() {
+                    write_new(&p, &value)?;
+                }
+                if files.list_blobs {
+                    files.list.push(rel);
+                }
             }
             self.blobs += 1;
             self.blob_bytes += value.len() as u64;
@@ -1011,16 +1524,25 @@ impl RunOut {
     }
 
     fn finish(
-        self,
+        mut self,
         root: &Path,
         files: &mut Vec<String>,
     ) -> Result<Option<(TableRef, HistoryTableStats)>, HistoryError> {
-        let Some(w) = self.w else {
+        let Some(w) = self.w.take() else {
             return Ok(None);
         };
-        let built = w.finish()?;
+        let built = match w.finish() {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = fs::remove_file(&self.tmp);
+                return Err(e.into());
+            }
+        };
         let rel = history_run_path(&built.root);
-        fs::rename(&self.tmp, root.join(&rel))?;
+        if let Err(e) = fs::rename(&self.tmp, root.join(&rel)) {
+            let _ = fs::remove_file(&self.tmp);
+            return Err(e.into());
+        }
         files.push(rel);
         let tr = TableRef {
             table_id: self.table_id,
@@ -1074,7 +1596,11 @@ pub fn encode_receipt(r: &ReceiptFields) -> Vec<u8> {
             list(&[enc(&l.address), list(&topics), enc(&l.data[..])])
         })
         .collect();
-    let status: &[u8] = if r.success { &[1] } else { &[] };
+    let status: &[u8] = match (&r.post_state, r.success) {
+        (Some(root), _) => root.as_slice(),
+        (None, true) => &[1],
+        (None, false) => &[],
+    };
     let body = list(&[
         enc(status),
         enc(&r.cumulative_gas_used),
@@ -1158,6 +1684,19 @@ pub mod synthetic {
     /// 12 seconds apart, chained from a made-up parent. Same seed, same
     /// chain.
     pub fn chain(seed: u64, first: u64, count: u64, ts_first: u64) -> BTreeMap<u64, Block> {
+        chain_with(seed, first, count, ts_first, false)
+    }
+
+    /// [`chain`], or with `pre_byzantium` a chain of legacy transactions
+    /// whose receipts carry a post-state root in place of the status, as
+    /// mainnet's below block 4,370,000 do.
+    pub fn chain_with(
+        seed: u64,
+        first: u64,
+        count: u64,
+        ts_first: u64,
+        pre_byzantium: bool,
+    ) -> BTreeMap<u64, Block> {
         let mut rng = Rng(keccak256(seed.to_be_bytes()));
         let mut parent = keccak256(format!("synthetic parent {seed}"));
         let empty_ommers = keccak256([0xc0u8]);
@@ -1184,6 +1723,7 @@ pub mod synthetic {
                     *b = (rng.0[j % 32]) ^ (j as u8);
                 }
                 let tx_type = [0u8, 2, 2, 2, 3][rng.below(5) as usize];
+                let tx_type = if pre_byzantium { 0 } else { tx_type };
                 let body = list(&[enc(&n), enc(&i), enc(&rng.next()), enc(&payload[..])]);
                 let tx = if tx_type == 0 {
                     body
@@ -1229,7 +1769,8 @@ pub mod synthetic {
                 gas += 21_000 + rng.below(200_000);
                 let r = ReceiptFields {
                     tx_type,
-                    success: rng.below(20) != 0,
+                    success: rng.below(20) != 0 && !pre_byzantium,
+                    post_state: pre_byzantium.then(|| keccak256(format!("post state {n} {i}"))),
                     cumulative_gas_used: gas,
                     bloom,
                     logs,
@@ -1409,6 +1950,373 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Every file under `dir`, by its path relative to `dir`.
+    fn tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(base: &Path, d: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+            for e in fs::read_dir(d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(base, &p, out);
+                } else {
+                    let rel = p.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+                    out.insert(rel, fs::read(&p).unwrap());
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(dir, dir, &mut out);
+        out
+    }
+
+    /// A chain over the boundary between periods 1911 and 1912 and through
+    /// part of the next, so a span has three periods.
+    fn three_periods() -> (BTreeMap<u64, Block>, u64, u64) {
+        let ts = MAINNET_GENESIS_TIME + 1912 * 8192 * 12 - 12 * 30;
+        let c = synthetic::chain(3, 1_000, 90, ts);
+        let mut c2 = c.clone();
+        // Push the last 20 blocks a period on, keeping them chained.
+        let mut parent = c[&1_069].hash;
+        for n in 1_070..1_090 {
+            let b = &c[&n];
+            let mut it: Vec<Vec<u8>> = list_items(&b.header)
+                .unwrap()
+                .iter()
+                .map(|x| x.to_vec())
+                .collect();
+            let ts: u64 = item(&it[11], "ts").unwrap();
+            it[0] = alloy_rlp::encode(parent);
+            it[11] = alloy_rlp::encode(ts + 8192 * 12);
+            let header = synthetic_list(&it);
+            let hash = keccak256(&header);
+            c2.insert(
+                n,
+                Block {
+                    header,
+                    hash,
+                    ..b.clone()
+                },
+            );
+            parent = hash;
+        }
+        (c2, 1_000, 1_089)
+    }
+
+    fn synthetic_list(items: &[Vec<u8>]) -> Vec<u8> {
+        let len = items.iter().map(Vec::len).sum();
+        let mut out = Vec::new();
+        RlpHeader {
+            list: true,
+            payload_length: len,
+        }
+        .encode(&mut out);
+        for i in items {
+            out.extend_from_slice(i);
+        }
+        out
+    }
+
+    fn par(
+        dir: &Path,
+        c: &BTreeMap<u64, Block>,
+        first: u64,
+        last: u64,
+        workers: usize,
+        chunk: u64,
+    ) -> Result<HistoryWritten, HistoryError> {
+        let mut seen = Vec::new();
+        let mut progress = |p: &HistoryProgress| seen.push(p.phase);
+        let mut opts = HistoryOptions {
+            workers,
+            chunk_blocks: chunk,
+            progress_every: Duration::from_millis(1),
+            progress: Some(&mut progress),
+            ..Default::default()
+        };
+        let r = write_history_with(dir, c, first, (last, c[&last].hash), 4, &mut opts);
+        if r.is_ok() {
+            assert!(
+                seen.contains(&HistoryPhase::Verify) && seen.last() == Some(&HistoryPhase::Write)
+            );
+        }
+        r
+    }
+
+    #[test]
+    fn the_parallel_writer_writes_what_the_single_one_does() {
+        let (c, first, last) = three_periods();
+        let one = scratch("par-one");
+        let w = write_history(&one, &c, first, (last, c[&last].hash), 4).unwrap();
+        let ps: Vec<_> = w
+            .manifest
+            .periods
+            .iter()
+            .map(|p| (p.period, p.first_block, p.last_block))
+            .collect();
+        assert_eq!(ps.len(), 3, "{ps:?}");
+        assert_eq!((ps[1].0, ps[2].0), (1912, 1913));
+        let want = tree(&one);
+        for (workers, chunk) in [(1, 8192), (2, 1), (3, 7), (8, 13), (16, 64)] {
+            let dir = scratch(&format!("par-{workers}-{chunk}"));
+            let got = par(&dir, &c, first, last, workers, chunk).unwrap();
+            assert_eq!(
+                got.manifest, w.manifest,
+                "{workers} workers, chunks of {chunk}"
+            );
+            assert_eq!(got.files, w.files, "{workers} workers, chunks of {chunk}");
+            assert!(
+                tree(&dir) == want,
+                "{workers} workers, chunks of {chunk}: the files differ"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+        // Without the blob list: the same bucket, a shorter list.
+        let dir = scratch("par-noblobs");
+        let mut opts = HistoryOptions {
+            workers: 4,
+            chunk_blocks: 5,
+            list_blobs: false,
+            ..Default::default()
+        };
+        let got = write_history_with(&dir, &c, first, (last, c[&last].hash), 4, &mut opts).unwrap();
+        assert!(tree(&dir) == want);
+        assert!(got.files.iter().all(|f| !f.starts_with("blobs/")));
+        assert_eq!(
+            got.files.len(),
+            w.files.iter().filter(|f| !f.starts_with("blobs/")).count()
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&one);
+    }
+
+    #[test]
+    fn blocks_before_the_beacon_chain_write_in_negative_periods() {
+        // 40 blocks, 15 s apart, over the beacon chain's genesis time.
+        let c = synthetic::chain(4, 11_000_000, 40, MAINNET_GENESIS_TIME - 12 * 20);
+        let (first, last) = (11_000_000, 11_000_039);
+        let one = scratch("negative-one");
+        let w = write_history(&one, &c, first, (last, c[&last].hash), 4).unwrap();
+        let ps: Vec<_> = w
+            .manifest
+            .periods
+            .iter()
+            .map(|p| (p.period, p.first_block, p.last_block))
+            .collect();
+        assert_eq!(ps, vec![(-1, first, first + 19), (0, first + 20, last)]);
+        let back = HistoryManifest::from_json(w.manifest.to_json().as_bytes()).unwrap();
+        assert_eq!(back, w.manifest);
+        let dir = scratch("negative-par");
+        par(&dir, &c, first, last, 4, 3).unwrap();
+        assert!(tree(&dir) == tree(&one));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&one);
+    }
+
+    #[test]
+    fn pre_byzantium_receipts_carry_a_state_root_and_write() {
+        let c = synthetic::chain_with(
+            5,
+            4_000_000,
+            30,
+            MAINNET_GENESIS_TIME - 12 * 8192 * 400,
+            true,
+        );
+        let mut roots = 0;
+        for b in c.values() {
+            b.verify().unwrap();
+            for r in &b.receipts {
+                let f = decode_receipt(r).unwrap();
+                assert!(f.post_state.is_some() && !f.success && f.tx_type == 0);
+                assert_eq!(&encode_receipt(&f), r);
+                roots += 1;
+            }
+        }
+        assert!(roots > 100);
+        let dir = scratch("pre-byzantium");
+        let w = par(&dir, &c, 4_000_000, 4_000_029, 3, 4).unwrap();
+        assert_eq!(w.manifest.periods.len(), 1);
+        assert!(w.manifest.periods[0].period < 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_receipt_status_is_a_status_or_a_state_root() {
+        let mut f = decode_receipt(
+            &synthetic::chain(1, 100, 20, MAINNET_GENESIS_TIME)
+                .values()
+                .find(|b| !b.receipts.is_empty())
+                .unwrap()
+                .receipts[0],
+        )
+        .unwrap();
+        f.post_state = None;
+        for (status, ok) in [
+            (vec![], true),
+            (vec![1], true),
+            (vec![0], false),
+            (vec![2], false),
+            (vec![7; 31], false),
+            (vec![7; 32], true),
+            (vec![7; 33], false),
+        ] {
+            let body = synthetic_list(&[
+                alloy_rlp::encode(&status[..]),
+                alloy_rlp::encode(f.cumulative_gas_used),
+                alloy_rlp::encode(f.bloom),
+                synthetic_list(&[]),
+            ]);
+            assert_eq!(decode_receipt(&body).is_ok(), ok, "status {status:?}");
+        }
+    }
+
+    /// No manifest, no `history/latest`, no temporary run left behind.
+    fn nothing_published(dir: &Path) {
+        assert!(!dir.join(HISTORY_LATEST).exists());
+        let runs = dir.join("history/runs");
+        if runs.exists() {
+            for e in fs::read_dir(&runs).unwrap() {
+                let name = e.unwrap().file_name().into_string().unwrap();
+                assert!(!name.starts_with("tmp-"), "{name} left behind");
+            }
+        }
+        for e in fs::read_dir(dir.join("history")).into_iter().flatten() {
+            let p = e.unwrap().path();
+            assert!(!p.join("manifest.json").exists(), "{} written", p.display());
+        }
+    }
+
+    #[test]
+    fn a_bad_block_anywhere_stops_every_worker_and_publishes_nothing() {
+        let (c, first, last) = three_periods();
+        // A body that does not rebuild its root, late in the span.
+        let mut bad = c.clone();
+        let at = bad
+            .range(1_080..)
+            .find(|(_, b)| !b.txs.is_empty())
+            .map(|(n, _)| *n)
+            .unwrap();
+        bad.get_mut(&at).unwrap().txs[0].push(0);
+        let dir = scratch("par-bad-body");
+        match par(&dir, &bad, first, last, 4, 5) {
+            Err(HistoryError::Block(BlockError::TransactionsRoot { number })) => {
+                assert_eq!(number, at)
+            }
+            other => panic!("{:?}", other.map(|w| w.manifest.block_number)),
+        }
+        nothing_published(&dir);
+        assert!(!dir.join("history/runs").exists(), "pass 1 wrote something");
+        let _ = fs::remove_dir_all(&dir);
+
+        // A block from another chain at a chunk boundary: each chunk
+        // verifies alone, the join does not.
+        let other = synthetic::chain(
+            9,
+            1_000,
+            90,
+            MAINNET_GENESIS_TIME + 1912 * 8192 * 12 - 12 * 30,
+        );
+        let mut forked = c.clone();
+        forked.insert(1_010, other[&1_010].clone());
+        let dir = scratch("par-fork");
+        match par(&dir, &forked, first, last, 4, 10) {
+            Err(HistoryError::Block(BlockError::Chain { number })) => {
+                assert!(number == 1_009 || number == 1_010, "{number}")
+            }
+            other => panic!("{:?}", other.map(|w| w.manifest.block_number)),
+        }
+        nothing_published(&dir);
+        let _ = fs::remove_dir_all(&dir);
+
+        // An anchor the chain does not end at.
+        let dir = scratch("par-anchor");
+        let mut opts = HistoryOptions {
+            workers: 4,
+            chunk_blocks: 9,
+            ..Default::default()
+        };
+        match write_history_with(&dir, &c, first, (last, B256::repeat_byte(1)), 4, &mut opts) {
+            Err(HistoryError::Span(e)) => assert!(e.contains("anchor"), "{e}"),
+            other => panic!("{:?}", other.map(|w| w.manifest.block_number)),
+        }
+        nothing_published(&dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Serves `chain`, but a block from another chain in place of `at` once
+    /// it has been read `after` times: a source changing under the writer.
+    struct Shifting {
+        chain: BTreeMap<u64, Block>,
+        other: BTreeMap<u64, Block>,
+        at: u64,
+        after: u32,
+        reads: Mutex<u32>,
+    }
+
+    impl BlockSource for Shifting {
+        fn block(&self, n: u64) -> Result<Block, String> {
+            if n == self.at {
+                let mut r = self.reads.lock().unwrap();
+                *r += 1;
+                if *r > self.after {
+                    return self.other.block(n);
+                }
+            }
+            self.chain.block(n)
+        }
+    }
+
+    #[test]
+    fn a_block_that_changes_while_periods_are_written_publishes_nothing() {
+        let (c, first, last) = three_periods();
+        let other = synthetic::chain(
+            9,
+            1_000,
+            90,
+            MAINNET_GENESIS_TIME + 1912 * 8192 * 12 - 12 * 30,
+        );
+        let src = Shifting {
+            chain: c.clone(),
+            other,
+            at: 1_085,
+            after: 1,
+            reads: Mutex::new(0),
+        };
+        let dir = scratch("par-shift");
+        let mut opts = HistoryOptions {
+            workers: 3,
+            chunk_blocks: 4,
+            ..Default::default()
+        };
+        match write_history_with(&dir, &src, first, (last, c[&last].hash), 4, &mut opts) {
+            Err(HistoryError::Source(e)) => assert!(e.contains("changed"), "{e}"),
+            other => panic!("{:?}", other.map(|w| w.manifest.block_number)),
+        }
+        nothing_published(&dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct Panicking(BTreeMap<u64, Block>);
+
+    impl BlockSource for Panicking {
+        fn block(&self, n: u64) -> Result<Block, String> {
+            assert!(n != 1_050, "a source that panics");
+            self.0.block(n)
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "a scoped thread panicked")]
+    fn a_worker_that_panics_is_not_a_hang() {
+        let (c, first, last) = three_periods();
+        let hash = c[&last].hash;
+        let dir = scratch("par-panic");
+        let mut opts = HistoryOptions {
+            workers: 4,
+            chunk_blocks: 3,
+            ..Default::default()
+        };
+        let _ = write_history_with(&dir, &Panicking(c), first, (last, hash), 4, &mut opts);
+    }
+
     #[test]
     fn a_synthetic_chain_verifies_and_round_trips_its_receipts() {
         let c = synthetic::chain(1, 100, 20, MAINNET_GENESIS_TIME + 12 * 8192 * 5);
@@ -1423,6 +2331,18 @@ mod tests {
             }
             prev = Some(h);
         }
+    }
+
+    #[test]
+    fn blocks_before_the_beacon_chain_fall_in_negative_periods() {
+        let span = SECONDS_PER_SLOT * SLOTS_PER_PERIOD;
+        assert_eq!(period_of_timestamp(MAINNET_GENESIS_TIME - 1), -1);
+        assert_eq!(period_of_timestamp(MAINNET_GENESIS_TIME - span), -1);
+        assert_eq!(period_of_timestamp(MAINNET_GENESIS_TIME - span - 1), -2);
+        // Mainnet's genesis block (2015-07-30 15:26:13 UTC) is 1,715
+        // periods back.
+        assert_eq!(period_of_timestamp(1_438_269_973), -1715);
+        assert_eq!(period_of_timestamp(0), -16346);
     }
 
     #[test]
