@@ -12,8 +12,9 @@ use csl_eth_store::{
     history::{
         decode_header, decode_receipt, encode_receipt, locator, synthetic, tx_hash, tx_lookup_key,
         write_history, write_history_tampered, Block, Tamper, MAINNET_GENESIS_TIME,
-        SECONDS_PER_SLOT, SLOTS_PER_PERIOD,
+        SECONDS_PER_SLOT, SLOTS_PER_PERIOD, H_TRANSACTIONS,
     },
+    CODE_BLOB_THRESHOLD,
     EPSILON,
 };
 use std::{collections::BTreeMap, path::PathBuf};
@@ -91,9 +92,24 @@ fn the_span_spans_two_periods() {
     );
     assert_eq!(w.files.last().map(String::as_str), Some("history/latest"));
     assert!(
-        w.files.iter().any(|f| f.starts_with("blobs/")),
-        "the chain has blob-sized leaves"
+        w.manifest.periods.iter().all(|p| p.pack.is_some()),
+        "the chain has values above the inline size, packed by period"
     );
+    assert!(!w.files.iter().any(|f| f.starts_with("blobs/")));
+    // Runs for four tables and a pack per period, two tx_lookup pieces,
+    // the manifest and the pointer.
+    assert_eq!(w.manifest.tx_lookup.len(), 2);
+    assert_eq!(w.files.len(), 2 * 5 + 2 + 2);
+}
+
+#[test]
+fn opening_is_one_request() {
+    let c = chain();
+    let dir = scratch("open");
+    write_history(&dir, &c, FIRST, (LAST, c[&LAST].hash), EPSILON).unwrap();
+    let h = open(&dir, &c);
+    let cost = h.cost();
+    assert_eq!((cost.requests, cost.rounds), (1, 1), "the manifest only");
 }
 
 #[test]
@@ -103,7 +119,8 @@ fn every_transaction_and_receipt_reads_back_verified() {
     write_history(&dir, &c, FIRST, (LAST, c[&LAST].hash), EPSILON).unwrap();
     let mut h = open(&dir, &c);
     let mut worst = HistoryCost::default();
-    let mut blobs = 0;
+    let mut packed = 0;
+    let mut first = true;
     for b in c.values().step_by(3) {
         for (i, t) in b.txs.iter().enumerate().step_by(5) {
             h.forget_headers();
@@ -115,17 +132,28 @@ fn every_transaction_and_receipt_reads_back_verified() {
             );
             assert_eq!(&r.tx, t);
             assert_eq!(&r.receipt_leaf, &b.receipts[i]);
-            if t.len() > 3968 || b.receipts[i].len() > 3968 {
-                blobs += 1;
+            let large = b.txs.iter().chain(&b.receipts).filter(|v| v.len() > CODE_BLOB_THRESHOLD).count();
+            if large > 0 {
+                packed += 1;
+                // A block's packed values are one range.
+                assert!(cost.table_bytes.contains_key("packs"));
             }
-            worst.rounds = worst.rounds.max(cost.rounds);
-            worst.requests = worst.requests.max(cost.requests);
+            if first {
+                // The first read loads the models it touches: the pieces',
+                // then the period's, a round each.
+                assert!(cost.rounds <= 7, "first read took {} rounds", cost.rounds);
+                first = false;
+            } else {
+                worst.rounds = worst.rounds.max(cost.rounds);
+                worst.requests = worst.requests.max(cost.requests);
+            }
         }
     }
-    assert!(blobs > 0, "some reads resolve blobs");
+    assert!(packed > 0, "some reads resolve packed values");
     // The hint and the block, each a round or two (two when the model's
-    // page is off and the `ε` window follows), then the blobs.
-    assert!(worst.rounds <= 5, "worst read took {} rounds", worst.rounds);
+    // page is off and the `ε` window follows; one more the first time a
+    // read reaches a period, for its models), then the packed values.
+    assert!(worst.rounds <= 6, "worst read took {} rounds", worst.rounds);
 
     let (r, _) = h.tx(&B256::repeat_byte(0x42));
     assert_eq!(r.unwrap_err(), Insufficient::NotIndexed);
@@ -227,9 +255,10 @@ enum Fault {
     HeaderOutOfChain,
     TxLookupWrongPlace,
     LogLookupOmitsBlock,
+    PackedOffsetWrong,
 }
 
-const FAULTS: [Fault; 7] = [
+const FAULTS: [Fault; 8] = [
     Fault::ReceiptAltered,
     Fault::LogDropped,
     Fault::ReceiptsReordered,
@@ -237,7 +266,16 @@ const FAULTS: [Fault; 7] = [
     Fault::HeaderOutOfChain,
     Fault::TxLookupWrongPlace,
     Fault::LogLookupOmitsBlock,
+    Fault::PackedOffsetWrong,
 ];
+
+/// A block with a transaction above the inline size, near the middle of
+/// the span.
+fn packed_target(c: &BTreeMap<u64, Block>) -> u64 {
+    (FIRST + 50..LAST)
+        .find(|n| c[n].txs.iter().any(|t| t.len() > CODE_BLOB_THRESHOLD))
+        .expect("a block with a packed transaction")
+}
 
 /// A block with a busy log in its first receipt and at least two
 /// transactions, near the middle of the span.
@@ -300,10 +338,21 @@ fn hostile(c: &BTreeMap<u64, Block>, fault: Fault) -> PathBuf {
             rows.retain(|k| *k != omitted);
         }
     };
+    // The packed transactions of one block point one byte early: the
+    // wrong bytes, under the entry's hash.
+    let p = packed_target(c);
+    let packed = move |table: u16, key: &[u8; 32], r: &mut csl_run::PackedRef| {
+        if let Fault::PackedOffsetWrong = fault {
+            if table == H_TRANSACTIONS && key[..5] == p.to_be_bytes()[3..] {
+                r.off = r.off.checked_sub(1).unwrap_or(1);
+            }
+        }
+    };
     let tamper = Tamper {
         block: &block,
         tx_lookup: &tx_lookup,
         log_lookup: &log_lookup,
+        packed: &packed,
     };
     write_history_tampered(&dir, c, FIRST, (LAST, c[&LAST].hash), EPSILON, &tamper).unwrap();
     dir
@@ -322,8 +371,9 @@ fn every_fault_ends_insufficient_or_correct() {
         let mut insufficient = 0;
         let mut short = 0;
 
-        // Every transaction of the target block and its neighbours.
-        for n in [t - 1, t, t + 1] {
+        // Every transaction of the target block and its neighbours, and of
+        // the block with packed transactions.
+        for n in [t - 1, t, t + 1, packed_target(&c)] {
             for (i, tx) in c[&n].txs.iter().enumerate() {
                 h.forget_headers();
                 match h.tx(&tx_hash(tx)).0 {
@@ -390,5 +440,120 @@ fn every_fault_ends_insufficient_or_correct() {
                 assert!(insufficient > 0, "{fault:?}: no read noticed");
             }
         }
+    }
+}
+
+/// A span of `periods` periods, `per` blocks each.
+fn many_periods(periods: u64, per: u64) -> (BTreeMap<u64, Block>, Anchor) {
+    let secs = SLOTS_PER_PERIOD * SECONDS_PER_SLOT / per;
+    let t = MAINNET_GENESIS_TIME + 1900 * SLOTS_PER_PERIOD * SECONDS_PER_SLOT;
+    let c = synthetic::chain_spaced(9, FIRST, periods * per, t, secs, false);
+    let last = FIRST + periods * per - 1;
+    let a = Anchor { number: last, hash: c[&last].hash };
+    (c, a)
+}
+
+/// Warm transaction reads (models loaded, headers kept) over every
+/// `step`th block: the worst requests and rounds, and the tx_lookup bytes.
+fn warm_tx_reads(h: &mut History<DirDriver>, c: &BTreeMap<u64, Block>, step: usize) -> (u64, u32, u64) {
+    let (mut requests, mut rounds, mut lookup) = (0, 0, 0);
+    for b in c.values().step_by(step) {
+        let Some(t) = b.txs.first() else { continue };
+        let (r, cost) = h.tx(&tx_hash(t));
+        let r = r.unwrap_or_else(|e| panic!("block {}: {e}", b.number));
+        assert_eq!((r.block_number, r.index), (b.number, 0));
+        requests = requests.max(cost.requests);
+        rounds = rounds.max(cost.rounds);
+        lookup = lookup.max(cost.table_bytes.get("tx_lookup").copied().unwrap_or(0));
+    }
+    (requests, rounds, lookup)
+}
+
+#[test]
+fn a_tx_read_does_not_grow_with_the_periods() {
+    let mut worst = Vec::new();
+    for periods in [2u64, 64] {
+        let (c, a) = many_periods(periods, 2);
+        let dir = scratch(&format!("many-{periods}"));
+        let w = write_history(&dir, &c, FIRST, (a.number, a.hash), EPSILON).unwrap();
+        assert_eq!(w.manifest.periods.len() as u64, periods);
+        assert_eq!(w.manifest.tx_lookup.len(), 2, "the base and the open period");
+        let mut h = History::open(DirDriver::new(&dir), a).unwrap();
+        assert_eq!(h.cost().requests, 1, "opening fetches the manifest only");
+        // Load what the reads touch, then measure.
+        h.header(FIRST).0.unwrap();
+        warm_tx_reads(&mut h, &c, 1);
+        worst.push(warm_tx_reads(&mut h, &c, 1));
+    }
+    let (two, many) = (worst[0], worst[1]);
+    // Two pieces probed whatever the periods: a request each, and when a
+    // larger piece's model misses its page, the `ε + 1` window around it
+    // in one more round. A probe per period would be 64 requests.
+    let window = 2 * (u64::from(EPSILON) + 1) + 1;
+    assert!(many.0 <= two.0 + 2, "{two:?} vs {many:?}");
+    assert!(many.1 <= two.1 + 1, "{two:?} vs {many:?}");
+    assert!(many.2 <= 2 * (window + 1) * 4096, "{many:?}");
+}
+
+/// The cost of a span of thousands of periods: run with
+/// `cargo test -p csl-eth-client --release --test history -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn measure_many_periods() {
+    for (periods, per) in [(1u64, 64u64), (3_630, 1)] {
+        let (c, a) = many_periods(periods, per);
+        let dir = scratch(&format!("measure-{periods}"));
+        let t0 = std::time::Instant::now();
+        let w = write_history(&dir, &c, FIRST, (a.number, a.hash), EPSILON).unwrap();
+        let write_s = t0.elapsed().as_secs_f64();
+        let manifest = std::fs::read(dir.join(csl_eth_store::history::history_manifest_path(&a.hash))).unwrap();
+        let pretty = serde_json::to_vec_pretty(&w.manifest).unwrap();
+        let t0 = std::time::Instant::now();
+        let mut h = History::open(DirDriver::new(&dir), a).unwrap();
+        let open_s = t0.elapsed().as_secs_f64();
+        let open = h.cost();
+        // A first read after opening: a fresh client.
+        let mid = &c[&(FIRST + periods * per / 2)];
+        let probe = mid.txs.first().or_else(|| c.values().find_map(|b| b.txs.first())).unwrap().clone();
+        let (r, first) = h.tx(&tx_hash(&probe));
+        r.unwrap();
+        // Cold: headers and packs forgotten, models kept.
+        let mut cold = Vec::new();
+        for b in c.values().step_by((c.len() / 50).max(1)) {
+            let Some(t) = b.txs.first() else { continue };
+            h.forget();
+            let (r, cost) = h.tx(&tx_hash(t));
+            r.unwrap();
+            cold.push((cost.requests, cost.rounds, cost.bytes, cost.headers_verified));
+        }
+        // Warm: every header verified and kept, the models loaded; what a
+        // transaction costs past the header walk.
+        h.forget();
+        h.header(FIRST).0.unwrap();
+        let mut warm = Vec::new();
+        for b in c.values().step_by((c.len() / 50).max(1)) {
+            let Some(t) = b.txs.first() else { continue };
+            h.tx(&tx_hash(t)).0.unwrap();
+            let (r, cost) = h.tx(&tx_hash(t));
+            r.unwrap();
+            warm.push((cost.requests, cost.rounds, cost.bytes, cost.headers_verified));
+        }
+        let n = cold.len() as f64;
+        let mean = |f: fn(&(u64, u32, u64, u64)) -> f64| cold.iter().map(f).sum::<f64>() / n;
+        let wn = warm.len() as f64;
+        let wmean = |f: fn(&(u64, u32, u64, u64)) -> f64| warm.iter().map(f).sum::<f64>() / wn;
+        println!(
+            "{}",
+            serde_json::json!({
+                "periods": periods, "blocks": c.len(), "write_s": write_s, "objects": w.files.len(),
+                "tx_lookup_pieces": w.manifest.tx_lookup.len(),
+                "manifest_bytes": manifest.len(), "manifest_bytes_pretty": pretty.len(),
+                "open": { "requests": open.requests, "bytes": open.bytes, "rounds": open.rounds, "secs": open_s },
+                "first_tx": { "requests": first.requests, "bytes": first.bytes, "rounds": first.rounds, "table_bytes": first.table_bytes },
+                "cold_tx_mean": { "requests": mean(|x| x.0 as f64), "rounds": mean(|x| x.1 as f64), "bytes": mean(|x| x.2 as f64), "headers": mean(|x| x.3 as f64) },
+                "warm_tx_mean": { "requests": wmean(|x| x.0 as f64), "rounds": wmean(|x| x.1 as f64), "bytes": wmean(|x| x.2 as f64) },
+            })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

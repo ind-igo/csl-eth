@@ -11,7 +11,7 @@ use csl_eth_client::{
     DirDriver, Driver, Got, HttpDriver, VerifiedHead, Want,
 };
 use csl_eth_store::{
-    history::{decode_header, decode_receipt, history_table_name, tx_hash, write_history_with, BlockSource, HistoryManifest, HistoryOptions},
+    history::{decode_header, decode_receipt, history_table_name, tx_hash, write_history_with, BlockSource, HistoryManifest, HistoryOptions, HistoryTableStats},
     producer::write_atomic,
     EPSILON,
 };
@@ -281,29 +281,42 @@ async fn build(a: BuildArgs) -> Result<Value, String> {
     let w = write_history_with(&a.out, &BlockCache(a.work.clone()), first, (anchor.number, anchor.hash), a.epsilon, &mut opts).map_err(|e| e.to_string())?;
     let mut totals: BTreeMap<&str, (u64, u64, u64, u64, u64)> = BTreeMap::new();
     let mut periods = Vec::new();
+    let table_json = |t: &HistoryTableStats| {
+        json!({
+            "table": history_table_name(t.table_id), "entries": t.entries, "pages": t.pages, "file_bytes": t.file_bytes,
+            "model_bytes": t.model_bytes, "eight_per_page": 8 * t.pages, "packed": t.packed, "packed_bytes": t.packed_bytes,
+        })
+    };
+    let mut add = |t: &HistoryTableStats| {
+        let e = totals.entry(history_table_name(t.table_id)).or_default();
+        e.0 += t.entries;
+        e.1 += t.pages;
+        e.2 += t.file_bytes;
+        e.3 += t.model_bytes;
+        e.4 += t.packed_bytes;
+    };
+    let mut pack_bytes = 0;
     for p in &w.stats {
-        let mut tables = Vec::new();
-        for t in &p.tables {
-            let name = history_table_name(t.table_id);
-            let e = totals.entry(name).or_default();
-            e.0 += t.entries;
-            e.1 += t.pages;
-            e.2 += t.file_bytes;
-            e.3 += t.model_bytes;
-            e.4 += t.blob_bytes;
-            tables.push(json!({
-                "table": name, "entries": t.entries, "pages": t.pages, "file_bytes": t.file_bytes,
-                "model_bytes": t.model_bytes, "eight_per_page": 8 * t.pages, "blobs": t.blobs, "blob_bytes": t.blob_bytes,
-            }));
-        }
-        periods.push(json!({ "period": p.period, "blocks": p.blocks, "transactions": p.transactions, "logs": p.logs, "tables": tables }));
+        p.tables.iter().for_each(&mut add);
+        pack_bytes += p.pack_bytes;
+        let tables: Vec<Value> = p.tables.iter().map(table_json).collect();
+        periods.push(json!({ "period": p.period, "blocks": p.blocks, "transactions": p.transactions, "logs": p.logs,
+                             "pack_bytes": p.pack_bytes, "tables": tables }));
     }
+    w.lookup_stats.iter().for_each(&mut add);
+    let lookup: Vec<Value> = w
+        .manifest
+        .tx_lookup
+        .iter()
+        .zip(&w.lookup_stats)
+        .map(|(l, t)| json!({ "first_period": l.first_period, "last_period": l.last_period, "run": table_json(t) }))
+        .collect();
     let totals: Vec<Value> = totals
         .iter()
-        .map(|(n, (e, pg, fb, mb, bb))| {
+        .map(|(n, (e, pg, fb, mb, pb))| {
             json!({ "table": n, "entries": e, "pages": pg, "file_bytes": fb, "model_bytes": mb, "eight_per_page": 8 * pg,
-                    "model_over_eight_per_page": *mb as f64 / (8 * pg).max(1) as f64, "blob_bytes": bb,
-                    "bytes_per_block": (*fb + *bb) as f64 / blocks as f64 })
+                    "model_over_eight_per_page": *mb as f64 / (8 * pg).max(1) as f64, "packed_bytes": pb,
+                    "bytes_per_block": (*fb + *pb) as f64 / blocks as f64 })
         })
         .collect();
     Ok(json!({
@@ -314,7 +327,9 @@ async fn build(a: BuildArgs) -> Result<Value, String> {
         "acquisition": acquisition,
         "write_secs": started.elapsed().as_secs_f64(),
         "files": w.files.len(),
+        "pack_bytes": pack_bytes,
         "tables": totals,
+        "tx_lookup": lookup,
         "periods": periods,
     }))
 }
@@ -451,6 +466,8 @@ fn truth(src: &dyn BlockSource, term: &Term, from: u64, to: u64) -> Result<Vec<L
 
 fn measure(a: MeasureArgs) -> Result<Value, String> {
     let (mut h, head) = open(&a.source)?;
+    // Opening is the manifest; models load as reads reach their runs.
+    let open_cost = h.cost();
     let m: HistoryManifest = h.manifest().clone();
     let (first, last) = (m.first_block, m.block_number);
     let src = BlockCache(a.work.clone());
@@ -474,6 +491,8 @@ fn measure(a: MeasureArgs) -> Result<Value, String> {
     let mut cold: Vec<Costs> = bands.iter().map(|_| Costs::default()).collect();
     let mut all_cold = Costs::default();
     let mut receipt_share = Vec::new();
+    // The first read after opening also loads the models it touches.
+    let first_cost = picks.first().map(|(_, _, hash, _)| h.tx(hash).1);
     for (n, i, hash, leaf) in &picks {
         h.forget();
         let (r, c) = h.tx(hash);
@@ -576,14 +595,13 @@ fn measure(a: MeasureArgs) -> Result<Value, String> {
 
     // Table sizes, from the manifest.
     let mut tables: BTreeMap<&str, (u64, u64, u64)> = BTreeMap::new();
-    for p in &m.periods {
-        for t in &p.tables {
-            let e = tables.entry(history_table_name(t.table_id)).or_default();
-            e.0 += t.page_count;
-            e.1 += u64::from(t.model_bytes);
-            e.2 += t.entry_count;
-        }
+    for t in m.periods.iter().flat_map(|p| &p.tables).chain(m.tx_lookup.iter().map(|l| &l.table)) {
+        let e = tables.entry(history_table_name(t.table_id)).or_default();
+        e.0 += t.page_count;
+        e.1 += u64::from(t.model_bytes);
+        e.2 += t.entry_count;
     }
+    let pack_bytes: u64 = m.periods.iter().filter_map(|p| p.pack).map(|k| k.bytes).sum();
     let tables: Vec<Value> = tables
         .iter()
         .map(|(n, (pages, model, entries))| {
@@ -600,6 +618,11 @@ fn measure(a: MeasureArgs) -> Result<Value, String> {
         "head": head,
         "span": [first, last],
         "periods": m.periods.len(),
+        "objects": m.run_paths().len() + 2,
+        "tx_lookup_pieces": m.tx_lookup.len(),
+        "pack_bytes": pack_bytes,
+        "open": cost_json(&open_cost),
+        "tx_first": first_cost.as_ref().map(cost_json),
         "tx_cold": all_cold.json(),
         "tx_cold_by_depth": bands_json,
         "tx_warm": warm.json(),

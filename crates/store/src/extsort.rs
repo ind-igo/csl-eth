@@ -495,6 +495,18 @@ impl ExtSort {
         merge(srcs, table, t.dups, emit)
     }
 
+    /// Take a file of records already in key order, written by
+    /// [`SortedFile::write`], as one of `table`'s spills: a caller that
+    /// sorted its records itself (one period's hint rows) skips the chunk.
+    /// Its order is not checked here; a repeat across files is found by
+    /// the merge, as for any spill.
+    pub fn adopt(&mut self, table: usize, f: SortedFile) {
+        let t = &mut self.tables[table];
+        t.stats.records += f.records;
+        t.stats.spills += 1;
+        t.spills.push(Spill { path: f.path, records: f.records });
+    }
+
     /// Remove a table's spills once it is written.
     pub fn clear(&mut self, table: usize) {
         for s in self.tables[table].spills.drain(..) {
@@ -508,6 +520,28 @@ impl Drop for ExtSort {
         for t in 0..self.tables.len() {
             self.clear(t);
         }
+    }
+}
+
+/// A spill file of records in key order, written outside any sorter, for
+/// [`ExtSort::adopt`].
+pub struct SortedFile {
+    path: PathBuf,
+    records: u64,
+}
+
+impl SortedFile {
+    pub fn write<'a>(path: &Path, buf: usize, recs: impl IntoIterator<Item = (&'a [u8; KEY], &'a [u8])>) -> io::Result<SortedFile> {
+        let mut w = SpillWriter::create(path, buf)?;
+        for (k, v) in recs {
+            w.write(k, v)?;
+        }
+        let s = w.finish(path.to_path_buf())?;
+        Ok(SortedFile { path: s.path, records: s.records })
+    }
+
+    pub fn records(&self) -> u64 {
+        self.records
     }
 }
 

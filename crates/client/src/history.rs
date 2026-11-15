@@ -25,7 +25,16 @@
 //! Like the state client, this does no I/O: each `try_` attempt computes
 //! from the [`Store`] and notes every range it can predict before returning
 //! [`Pending`], so a read is a few rounds whatever its size: the hint, then
-//! the headers and the block together, then any blobs.
+//! the headers and the block together, then the block's packed values (one
+//! range: a block's values above the inline size sit side by side in its
+//! period's pack, and each must hash to its entry).
+//!
+//! Opening fetches the manifest only. A run's model is fetched the first
+//! time a read touches the run and kept for the session, so a span of
+//! thousands of periods opens in one request, and a read pays one more
+//! round the first time it reaches a period. `tx_lookup` is a few pieces
+//! over ranges of periods (two for a fresh full history), every one probed
+//! in the same round.
 //!
 //! Old headers come by the `parentHash` route only: a header a day back is
 //! a day of headers. The accumulator route (`historical_summaries`) is not
@@ -44,9 +53,9 @@ pub use csl_eth_store::history::{
 use csl_eth_store::{
     blob_path,
     history::{
-        block_key, history_manifest_path, history_run_path, log_lookup_block, log_lookup_key,
-        ordered_root, parse_locator, tx_hash, tx_lookup_key, HISTORY_FORMAT_VERSION,
-        HISTORY_LATEST, HISTORY_RUN_FORMAT, MAX_INDEX,
+        block_key, history_manifest_path, history_pack_path, history_run_path, log_lookup_block,
+        log_lookup_key, ordered_root, parse_locator, tx_hash, tx_lookup_key,
+        HISTORY_FORMAT_VERSION, HISTORY_LATEST, HISTORY_RUN_FORMAT, MAX_INDEX,
     },
 };
 use csl_run::{Entry, Reader};
@@ -86,7 +95,8 @@ pub enum Insufficient {
     /// A run file misbehaved: a short or failed range, a malformed page,
     /// fences that do not partition the keys.
     Run { table: u16, error: String },
-    /// A blob that is missing or does not hash to its name.
+    /// A blob or packed value that is missing, out of its pack, or does
+    /// not hash to its name or entry.
     Blob(String),
     /// The header chain from the anchor breaks at `block`.
     Header { block: u64, what: String },
@@ -130,8 +140,8 @@ pub struct HistoryCost {
     pub requests: u64,
     pub bytes: u64,
     pub rounds: u32,
-    /// Bytes received per table (`headers`, `receipts`, ...), blobs as
-    /// `blobs`.
+    /// Bytes received per table (`headers`, `receipts`, ...), packed values as
+    /// `packs`.
     pub table_bytes: BTreeMap<&'static str, u64>,
     /// Headers this read verified (not those the session already held).
     pub headers_verified: u64,
@@ -200,7 +210,7 @@ pub struct Logs {
 }
 
 /// The manifest's checks: the anchor's block, this format, contiguous
-/// periods covering the span.
+/// periods covering the span, `tx_lookup` pieces covering the periods.
 fn check_history_manifest(bytes: &[u8], anchor: &Anchor) -> Result<HistoryManifest, String> {
     let m = HistoryManifest::from_json(bytes).map_err(|e| e.to_string())?;
     if m.block_hash != anchor.hash || m.block_number != anchor.number {
@@ -225,17 +235,33 @@ fn check_history_manifest(bytes: &[u8], anchor: &Anchor) -> Result<HistoryManife
     if m.periods.is_empty() || next != m.block_number + 1 {
         return Err("history manifest periods do not end at its block".into());
     }
+    let mut at = 0usize;
+    for l in &m.tx_lookup {
+        let ok = m.periods.get(at).is_some_and(|p| p.period == l.first_period)
+            && l.last_period >= l.first_period;
+        if !ok {
+            return Err("history manifest tx_lookup pieces do not cover the periods".into());
+        }
+        while m.periods.get(at).is_some_and(|p| p.period <= l.last_period) {
+            at += 1;
+        }
+    }
+    if at != m.periods.len() {
+        return Err("history manifest tx_lookup pieces do not cover the periods".into());
+    }
     Ok(m)
 }
 
-type Readers = Vec<Option<Result<Reader<RunView>, String>>>;
+type Slot = Option<Result<Reader<RunView>, String>>;
+
+type Readers = Vec<Slot>;
 
 fn table_slot(t: u16) -> usize {
     (t - H_HEADERS) as usize
 }
 
-/// A history span being opened: the manifest, then every run's model in
-/// one round.
+/// A history span being opened: the manifest, one request. Run models are
+/// fetched as reads reach them.
 pub struct HistoryOpener<D> {
     driver: Option<D>,
     store: Arc<Store>,
@@ -276,47 +302,32 @@ impl<D: Driver> HistoryOpener<D> {
             }
             Err(e) => return Ok(Err(e)),
         };
-        let mut readers: Vec<Readers> = Vec::new();
         let mut rels = HashMap::new();
-        let mut pending = false;
+        let mut reader = |tr: &csl_eth_store::TableRef, last_block: u64| -> Slot {
+            let rel = history_run_path(&tr.root);
+            rels.insert(rel.clone(), tr.table_id);
+            let view = RunView {
+                store: self.store.clone(),
+                rel,
+            };
+            Some(
+                Reader::try_with_format(view, tr.run_ref(last_block), HISTORY_RUN_FORMAT)
+                    .map_err(|e| e.to_string()),
+            )
+        };
+        let mut readers: Vec<Readers> = Vec::with_capacity(manifest.periods.len());
         for p in &manifest.periods {
-            let mut row: Readers = Vec::new();
-            for t in HISTORY_TABLES {
-                let Some(tr) = p.table(t) else {
-                    row.push(None);
-                    continue;
-                };
-                let rel = history_run_path(&tr.root);
-                rels.insert(rel.clone(), t);
-                let view = RunView {
-                    store: self.store.clone(),
-                    rel,
-                };
-                let mut r = match Reader::try_with_format(
-                    view,
-                    tr.run_ref(p.last_block),
-                    HISTORY_RUN_FORMAT,
-                ) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        row.push(Some(Err(e.to_string())));
-                        continue;
-                    }
-                };
-                match r.prepare() {
-                    Ok(()) => row.push(Some(Ok(r))),
-                    Err(e) if is_pending(&e) => {
-                        pending = true;
-                        row.push(Some(Ok(r)));
-                    }
-                    Err(e) => row.push(Some(Err(e.to_string()))),
-                }
-            }
+            let row: Readers = HISTORY_TABLES
+                .iter()
+                .map(|&t| p.table(t).and_then(|tr| reader(tr, p.last_block)))
+                .collect();
             readers.push(row);
         }
-        if pending {
-            return Err(Pending);
-        }
+        let lookup: Vec<Slot> = manifest
+            .tx_lookup
+            .iter()
+            .map(|l| reader(&l.table, manifest.block_number))
+            .collect();
         Ok(Ok(History {
             driver: self.driver.take().expect("opened once"),
             store: self.store.clone(),
@@ -331,6 +342,7 @@ impl<D: Driver> HistoryOpener<D> {
             tally: BTreeMap::new(),
             headers_at_begin: 0,
             blocks_verified: 0,
+            lookup,
         }))
     }
 }
@@ -342,7 +354,8 @@ pub struct History<D> {
     manifest: HistoryManifest,
     anchor: Anchor,
     /// Per period, per table (`H_HEADERS..`): the run's reader, `None`
-    /// when the period has no such run.
+    /// when the period has no such run (`tx_lookup` never has one), an
+    /// error once its model failed to load.
     readers: Vec<Readers>,
     rels: HashMap<String, u16>,
     /// Verified headers, always one contiguous range ending at the anchor.
@@ -357,6 +370,8 @@ pub struct History<D> {
     tally: BTreeMap<&'static str, u64>,
     headers_at_begin: usize,
     blocks_verified: u64,
+    /// The `tx_lookup` pieces' readers, in the manifest's order.
+    lookup: Vec<Slot>,
 }
 
 impl<D: Driver> History<D> {
@@ -394,7 +409,7 @@ impl<D: Driver> History<D> {
 
     /// Forget the session: verified headers and fetched blobs. The next
     /// read costs what a fresh client's would, but for the manifest and
-    /// the run models, which an open span holds.
+    /// the run models already loaded, which an open span keeps.
     pub fn forget(&mut self) {
         self.headers.clear();
         self.store.forget_files("blobs/");
@@ -423,6 +438,7 @@ impl<D: Driver> History<D> {
                 let name = match self.rels.get(w.rel()) {
                     Some(t) => history_table_name(*t),
                     None if w.rel().starts_with("blobs/") => "blobs",
+                    None if w.rel().starts_with("history/packs/") => "packs",
                     None => "files",
                 };
                 *self.tally.entry(name).or_default() += v.len() as u64;
@@ -493,12 +509,12 @@ impl<D: Driver> History<D> {
     }
 
     pub fn try_tx(&mut self, hash: &B256) -> Result<HRead<TxReceipt>, Pending> {
-        // The hint, in every period's run at once.
+        // The hint, in every piece at once.
         let key = tx_lookup_key(hash);
         let mut rows = Vec::new();
         let mut pending = false;
-        for pi in 0..self.manifest.periods.len() {
-            match self.scan(pi, H_TX_LOOKUP, &key, &key) {
+        for slot in &mut self.lookup {
+            match scan_run(&self.store, self.hint, slot, H_TX_LOOKUP, &key, &key) {
                 Err(Pending) => pending = true,
                 Ok(Err(e)) => return Ok(Err(e)),
                 Ok(Ok(es)) => rows.extend(es),
@@ -795,7 +811,7 @@ impl<D: Driver> History<D> {
         Ok(Ok(()))
     }
 
-    /// Every leaf of `block` in `table` (transactions or receipts), blobs
+    /// Every leaf of `block` in `table` (transactions or receipts), packed values
     /// resolved, in index order. Unverified: the caller rebuilds the root.
     fn try_leaves(&mut self, block: u64, table: u16) -> Result<HRead<Vec<Vec<u8>>>, Pending> {
         let Some(pi) = self.manifest.period_of(block) else {
@@ -821,14 +837,48 @@ impl<D: Driver> History<D> {
         self.resolve(&es)
     }
 
-    /// Entry values with blob entries fetched and checked against their
-    /// names; every missing blob is wanted before `Pending`.
+    /// Entry values with blob and packed entries fetched and checked
+    /// against their hashes; every missing one is wanted before `Pending`.
+    /// A packed entry's key names its block, so its period, so its pack;
+    /// the ranges of one block's values touch and go as one request.
     fn resolve(&mut self, es: &[Entry]) -> Result<HRead<Vec<Vec<u8>>>, Pending> {
         let mut out = Vec::with_capacity(es.len());
         let mut pending = false;
         for e in es {
             match e.tag {
                 0 => out.push(e.value.clone()),
+                3 => {
+                    let Some(pr) = e.packed_ref() else {
+                        return Ok(Err(Insufficient::Blob("malformed packed entry".into())));
+                    };
+                    let pack = parse_locator(&e.key[..8])
+                        .and_then(|(block, _)| self.manifest.period_of(block))
+                        .and_then(|pi| self.manifest.periods[pi].pack);
+                    let Some(pack) = pack else {
+                        return Ok(Err(Insufficient::Blob(
+                            "packed entry in a period without a pack".into(),
+                        )));
+                    };
+                    if pr.off.checked_add(u64::from(pr.len)).is_none_or(|end| end > pack.bytes) {
+                        return Ok(Err(Insufficient::Blob(format!(
+                            "packed value at {} (+{}) is past the pack's {} bytes",
+                            pr.off, pr.len, pack.bytes
+                        ))));
+                    }
+                    let rel = history_pack_path(&pack.root);
+                    match self.store.range(&rel, pr.off, pr.len as usize) {
+                        Err(Pending) => pending = true,
+                        Ok(Ok(v)) if *blake3::hash(&v).as_bytes() == pr.hash => out.push(v),
+                        Ok(Ok(_)) => {
+                            return Ok(Err(Insufficient::Blob(format!(
+                                "the bytes at {} of pack {} do not hash to the entry",
+                                pr.off,
+                                hex::encode(pack.root)
+                            ))));
+                        }
+                        Ok(Err(e)) => return Ok(Err(Insufficient::Blob(e))),
+                    }
+                }
                 2 => {
                     let Ok(h) = <[u8; 32]>::try_from(e.value.as_slice()) else {
                         return Ok(Err(Insufficient::Blob("blob entry without a hash".into())));
@@ -860,13 +910,8 @@ impl<D: Driver> History<D> {
         Ok(Ok(out))
     }
 
-    /// The entries of `table` in period `pi` with keys in `lo..=hi`, from
-    /// the store. The pages the model predicts for both ends, and every
-    /// page between, are wanted at once (widened by the hint); a page the
-    /// prediction missed is wanted with its `ε + 1` neighbourhood, so a
-    /// miss costs one more round, not one per page. Fences route; nothing
-    /// here is evidence, and an entry the run omits is caught by the root
-    /// or the chain it fails to rebuild.
+    /// The entries of `table` in period `pi` with keys in `lo..=hi`
+    /// ([`scan_run`]).
     fn scan(
         &mut self,
         pi: usize,
@@ -874,69 +919,105 @@ impl<D: Driver> History<D> {
         lo: &[u8; 32],
         hi: &[u8; 32],
     ) -> Result<HRead<Vec<Entry>>, Pending> {
-        let h = self.hint;
-        let store = self.store.clone();
-        let broken = |e: String| Insufficient::Run { table, error: e };
-        let r = match self.readers[pi][table_slot(table)].as_mut() {
-            None => return Ok(Ok(Vec::new())),
-            Some(Err(e)) => return Ok(Err(broken(e.clone()))),
-            Some(Ok(r)) => r,
-        };
-        let Some(layout) = r.layout().copied() else {
-            return Ok(Err(broken("no valid run layout".into())));
-        };
-        let pc = layout.page_count;
-        let eps = u64::from(r.run_ref().epsilon_pages);
-        let rel = history_run_path(&r.run_ref().root);
-        let rec = layout.record_bytes;
-        let want = |a: u64, b: u64| {
-            let (a, b) = (a.max(1), b.min(pc));
-            if a <= b {
-                store.want_range(&rel, layout.record_off(a), ((b - a + 1) * rec) as usize);
+        scan_run(
+            &self.store,
+            self.hint,
+            &mut self.readers[pi][table_slot(table)],
+            table,
+            lo,
+            hi,
+        )
+    }
+}
+
+/// The entries of one run (`table`'s, in `slot`) with keys in `lo..=hi`,
+/// from the store. The run's model first, kept in the reader once loaded
+/// (a model that fails to load breaks the slot for the session). Then the
+/// pages the model predicts for both ends, and every page between, are
+/// wanted at once (widened by the hint); a page the prediction missed is
+/// wanted with its `ε + 1` neighbourhood, so a miss costs one more round,
+/// not one per page. Fences route; nothing here is evidence, and an entry
+/// the run omits is caught by the root or the chain it fails to rebuild.
+fn scan_run(
+    store: &Arc<Store>,
+    h: Hint,
+    slot: &mut Slot,
+    table: u16,
+    lo: &[u8; 32],
+    hi: &[u8; 32],
+) -> Result<HRead<Vec<Entry>>, Pending> {
+    let broken = |e: String| Insufficient::Run { table, error: e };
+    let prepared = match slot.as_mut() {
+        None => return Ok(Ok(Vec::new())),
+        Some(Err(e)) => return Ok(Err(broken(e.clone()))),
+        Some(Ok(r)) => r.prepare(),
+    };
+    match prepared {
+        Ok(()) => {}
+        Err(e) if is_pending(&e) => return Err(Pending),
+        Err(e) => {
+            let e = e.to_string();
+            *slot = Some(Err(e.clone()));
+            return Ok(Err(broken(e)));
+        }
+    }
+    let Some(Ok(r)) = slot.as_mut() else {
+        unreachable!("prepared above");
+    };
+    let Some(layout) = r.layout().copied() else {
+        return Ok(Err(broken("no valid run layout".into())));
+    };
+    let pc = layout.page_count;
+    let eps = u64::from(r.run_ref().epsilon_pages);
+    let rel = history_run_path(&r.run_ref().root);
+    let rec = layout.record_bytes;
+    let want = |a: u64, b: u64| {
+        let (a, b) = (a.max(1), b.min(pc));
+        if a <= b {
+            store.want_range(&rel, layout.record_off(a), ((b - a + 1) * rec) as usize);
+        }
+    };
+    let predict = |r: &mut Reader<RunView>, k: &[u8; 32]| r.predict_page(csl_run::k64(k));
+    let (p_lo, p_hi) = match (predict(r, lo), predict(r, hi)) {
+        (Ok(a), Ok(b)) => (a.clamp(1, pc), b.clamp(1, pc).max(a.clamp(1, pc))),
+        (Err(e), _) | (_, Err(e)) => return Ok(Err(broken(e.to_string()))),
+    };
+    let held = |p: u64| store.holds_range(&rel, layout.record_off(p), rec as usize);
+    let first_try = !held(p_lo);
+    want(p_lo.saturating_sub(h.below), p_hi + h.above);
+    let start = match r.locate(lo) {
+        Ok((p, _, _)) => p,
+        Err(e) if is_pending(&e) => {
+            if !first_try {
+                want(p_lo.saturating_sub(eps + 1), p_lo + eps + 1);
             }
-        };
-        let predict = |r: &mut Reader<RunView>, k: &[u8; 32]| r.predict_page(csl_run::k64(k));
-        let (p_lo, p_hi) = match (predict(r, lo), predict(r, hi)) {
-            (Ok(a), Ok(b)) => (a.clamp(1, pc), b.clamp(1, pc).max(a.clamp(1, pc))),
-            (Err(e), _) | (_, Err(e)) => return Ok(Err(broken(e.to_string()))),
-        };
-        let held = |p: u64| store.holds_range(&rel, layout.record_off(p), rec as usize);
-        let first_try = !held(p_lo);
-        want(p_lo.saturating_sub(h.below), p_hi + h.above);
-        let start = match r.locate(lo) {
-            Ok((p, _, _)) => p,
-            Err(e) if is_pending(&e) => {
-                if !first_try {
-                    want(p_lo.saturating_sub(eps + 1), p_lo + eps + 1);
-                }
-                return Err(Pending);
-            }
+            return Err(Pending);
+        }
+        Err(e) => return Ok(Err(broken(e.to_string()))),
+    };
+    let mut out = Vec::new();
+    let mut q = start;
+    loop {
+        if !held(q) {
+            want(q, q.max(p_hi) + eps + 1);
+            return Err(Pending);
+        }
+        let page = match r.fetch_page(q) {
+            Ok(p) => p,
+            Err(e) if is_pending(&e) => return Err(Pending),
             Err(e) => return Ok(Err(broken(e.to_string()))),
         };
-        let mut out = Vec::new();
-        let mut q = start;
-        loop {
-            if !held(q) {
-                want(q, q.max(p_hi) + eps + 1);
-                return Err(Pending);
+        for e in &page.entries {
+            if e.key >= *lo && e.key <= *hi {
+                out.push(e.clone());
             }
-            let page = match r.fetch_page(q) {
-                Ok(p) => p,
-                Err(e) if is_pending(&e) => return Err(Pending),
-                Err(e) => return Ok(Err(broken(e.to_string()))),
-            };
-            for e in &page.entries {
-                if e.key >= *lo && e.key <= *hi {
-                    out.push(e.clone());
-                }
-            }
-            if q >= pc || *hi < page.hi {
-                break;
-            }
-            q += 1;
         }
-        Ok(Ok(out))
+        if q >= pc || *hi < page.hi {
+            break;
+        }
+        q += 1;
     }
+    Ok(Ok(out))
 }
 
 /// A block's transactions and receipts against its header.

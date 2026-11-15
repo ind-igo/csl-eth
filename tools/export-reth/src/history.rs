@@ -72,7 +72,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Write the history tables for `--first ..= --block-number` into a
-    /// bucket directory: runs and blobs, then the manifest, then
+    /// bucket directory: runs and packs, then the manifest, then
     /// history/latest, only if every block verifies and chains to the hash.
     Export(ExportArgs),
     /// Validation: build a span from reth and from a peer-built block cache
@@ -113,7 +113,9 @@ struct Datadir {
 #[derive(Args)]
 struct Run {
     /// Worker threads. Default: the cores. Each holds a read transaction
-    /// and one period's hint rows.
+    /// and one period's hint rows. Every period's `tx_lookup` rows also go
+    /// to scratch under the output's history/ (44 bytes a transaction)
+    /// until the pieces merge.
     #[arg(long)]
     workers: Option<usize>,
     /// Blocks per verification job.
@@ -140,7 +142,7 @@ struct ExportArgs {
     /// The oldest block of the span.
     #[arg(long, default_value_t = 0)]
     first: u64,
-    /// The bucket directory to write (history/ and blobs/ under it).
+    /// The bucket directory to write (history/ under it).
     #[arg(long)]
     out: PathBuf,
 }
@@ -566,7 +568,7 @@ fn write(
     let mut opts = HistoryOptions {
         workers: workers(run),
         chunk_blocks: run.chunk_blocks,
-        list_blobs: false,
+        tx_lookup_base: None,
         progress_every: Duration::from_secs(run.progress_secs.max(1)),
         progress: Some(&mut progress),
     };
@@ -583,28 +585,37 @@ fn write(
 /// Per-table totals of a written span.
 fn summary(w: &HistoryWritten) -> Value {
     let mut totals: BTreeMap<&str, (u64, u64, u64, u64)> = BTreeMap::new();
-    let (mut blocks, mut txs, mut logs) = (0, 0, 0);
+    let (mut blocks, mut txs, mut logs, mut pack_bytes) = (0, 0, 0, 0);
     for p in &w.stats {
         blocks += p.blocks;
         txs += p.transactions;
         logs += p.logs;
-        for t in &p.tables {
-            let e = totals.entry(history_table_name(t.table_id)).or_default();
-            e.0 += t.entries;
-            e.1 += t.file_bytes;
-            e.2 += t.blobs;
-            e.3 += t.blob_bytes;
-        }
+        pack_bytes += p.pack_bytes;
+    }
+    for t in w
+        .stats
+        .iter()
+        .flat_map(|p| &p.tables)
+        .chain(&w.lookup_stats)
+    {
+        let e = totals.entry(history_table_name(t.table_id)).or_default();
+        e.0 += t.entries;
+        e.1 += t.file_bytes;
+        e.2 += t.packed;
+        e.3 += t.packed_bytes;
     }
     let tables: Vec<Value> = totals
         .iter()
-        .map(|(n, (e, fb, b, bb))| json!({ "table": n, "entries": e, "file_bytes": fb, "blobs": b, "blob_bytes": bb, "bytes_per_block": (fb + bb) as f64 / blocks.max(1) as f64 }))
+        .map(|(n, (e, fb, k, kb))| json!({ "table": n, "entries": e, "file_bytes": fb, "packed": k, "packed_bytes": kb, "bytes_per_block": (fb + kb) as f64 / blocks.max(1) as f64 }))
         .collect();
     json!({
         "first_block": w.manifest.first_block,
         "block_number": w.manifest.block_number,
         "block_hash": w.manifest.block_hash,
         "periods": w.manifest.periods.len(),
+        "objects": w.files.len(),
+        "pack_bytes": pack_bytes,
+        "tx_lookup_pieces": w.manifest.tx_lookup.len(),
         "blocks": blocks,
         "transactions": txs,
         "logs": logs,

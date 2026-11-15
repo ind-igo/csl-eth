@@ -17,9 +17,12 @@ use csl_eth_client::{
     history::{Anchor, History, LogAt, LogTier, Term},
     DirDriver,
 };
-use csl_eth_store::history::{
-    decode_header, decode_receipt, encode_receipt, locator, log_lookup_key, tx_hash, tx_lookup_key,
-    write_history_tampered, Block, BlockSource, Tamper,
+use csl_eth_store::{
+    history::{
+        decode_header, decode_receipt, encode_receipt, locator, log_lookup_key, tx_hash, tx_lookup_key,
+        write_history_tampered, Block, BlockSource, Tamper, H_TRANSACTIONS,
+    },
+    CODE_BLOB_THRESHOLD,
 };
 use serde::Serialize;
 use std::path::Path;
@@ -33,9 +36,10 @@ pub enum Fault {
     HeaderOutOfChain,
     TxLookupWrongPlace,
     LogLookupOmitsBlock,
+    PackedOffsetWrong,
 }
 
-pub const FAULTS: [Fault; 7] = [
+pub const FAULTS: [Fault; 8] = [
     Fault::ReceiptAltered,
     Fault::LogDropped,
     Fault::ReceiptsReordered,
@@ -43,6 +47,7 @@ pub const FAULTS: [Fault; 7] = [
     Fault::HeaderOutOfChain,
     Fault::TxLookupWrongPlace,
     Fault::LogLookupOmitsBlock,
+    Fault::PackedOffsetWrong,
 ];
 
 impl Fault {
@@ -55,14 +60,19 @@ impl Fault {
             Fault::HeaderOutOfChain => "header_out_of_chain",
             Fault::TxLookupWrongPlace => "tx_lookup_wrong_place",
             Fault::LogLookupOmitsBlock => "log_lookup_omits_block",
+            Fault::PackedOffsetWrong => "packed_offset_wrong",
         }
     }
 
     /// May the indexed tier come back short under this fault? Only when
     /// the hint omits: by the fault itself, or because the hostile
-    /// producer derived its hint from the receipts it altered.
+    /// producer derived its hint from the receipts it altered (a dropped
+    /// log; another block's receipts, which need not carry the term; a
+    /// flipped byte, which may land in an address or topic). Whether it
+    /// does depends on the target block, so these may also end every read
+    /// `Insufficient`.
     fn may_shorten(self) -> bool {
-        matches!(self, Fault::LogLookupOmitsBlock | Fault::LogDropped)
+        matches!(self, Fault::LogLookupOmitsBlock | Fault::LogDropped | Fault::ReceiptsFromAnotherBlock | Fault::ReceiptAltered)
     }
 }
 
@@ -112,18 +122,25 @@ fn truth(src: &dyn BlockSource, term: &Term, from: u64, to: u64) -> Result<Vec<L
 
 /// A block with two or more transactions whose first receipt has a log,
 /// in the upper half of the span (so the header walk to it is real), with
-/// a neighbour on each side.
+/// a neighbour on each side; one with a transaction above the inline size
+/// among the first 24 (the reads') if there is one, so that a lie about a
+/// packed value is read.
 fn target(src: &dyn BlockSource, first: u64, last: u64) -> Result<(u64, Term), String> {
+    let mut fallback = None;
     for n in (first + (last - first) / 2).max(first + 3)..last.saturating_sub(3) {
         let b = src.block(n)?;
         if b.txs.len() < 2 {
             continue;
         }
         if let Some(l) = decode_receipt(&b.receipts[0]).map_err(String::from)?.logs.first() {
-            return Ok((n, Term::Address(l.address)));
+            let t = (n, Term::Address(l.address));
+            if b.txs.iter().take(24).any(|t| t.len() > CODE_BLOB_THRESHOLD) {
+                return Ok(t);
+            }
+            fallback.get_or_insert(t);
         }
     }
-    Err("no block in the span has two transactions and a log in its first receipt".into())
+    fallback.ok_or_else(|| "no block in the span has two transactions and a log in its first receipt".into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -173,7 +190,14 @@ fn write_hostile(src: &dyn BlockSource, dir: &Path, first: u64, anchor: (u64, B2
             rows.retain(|k| *k != omitted);
         }
     };
-    let tamper = Tamper { block: &block, tx_lookup: &tx_lookup, log_lookup: &log_lookup };
+    // The target's packed transactions point one byte early: the wrong
+    // bytes, under the entry's hash.
+    let packed = move |table: u16, key: &[u8; 32], r: &mut csl_run::PackedRef| {
+        if fault == Fault::PackedOffsetWrong && table == H_TRANSACTIONS && key[..5] == t.to_be_bytes()[3..] {
+            r.off = r.off.checked_sub(1).unwrap_or(1);
+        }
+    };
+    let tamper = Tamper { block: &block, tx_lookup: &tx_lookup, log_lookup: &log_lookup, packed: &packed };
     let _ = std::fs::remove_dir_all(dir);
     write_history_tampered(dir, src, first, anchor, epsilon, &tamper).map_err(|e| e.to_string())?;
     Ok(())
