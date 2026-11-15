@@ -284,7 +284,7 @@ fn line(s: &ExportStats) -> serde_json::Value {
 
 fn main() -> eyre::Result<()> {
     if std::env::args_os().nth(1).is_some_and(|a| a == "history") {
-        return history::main(std::env::args_os().skip(1));
+        return history::main(std::iter::once("export-reth history".into()).chain(std::env::args_os().skip(2)));
     }
     let args = Args::parse();
     let spec = ChainSpecBuilder::mainnet().build();
