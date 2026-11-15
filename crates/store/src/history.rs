@@ -23,6 +23,8 @@
 //! over ranges of periods ([`LookupRun`], [`tx_lookup_plan`]): a base over
 //! the closed periods, pieces for the closed periods after it whose sizes
 //! are the binary digits of their count, and the open period alone. A
+//! piece whose periods hold no transactions has no run and only records
+//! that it covers them. A
 //! fresh write is the base and the open period; a span extended without
 //! rewriting the base adds pieces that merge as a binary counter does. The manifest names the newest block of the span,
 //! the block a client must reach from its verified head; a client reads
@@ -616,11 +618,14 @@ pub struct PackRef {
 }
 
 /// A `tx_lookup` run over the periods `first_period ..= last_period`.
+/// `table` is `None` when those periods hold no transactions: the piece
+/// still covers them, so the pieces always cover every period.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LookupRun {
     pub first_period: i64,
     pub last_period: i64,
-    pub table: TableRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<TableRef>,
 }
 
 /// The `tx_lookup` pieces over `n` periods, as inclusive ranges of indexes
@@ -709,7 +714,8 @@ impl HistoryManifest {
             .chain(
                 self.tx_lookup
                     .iter()
-                    .map(|l| history_run_path(&l.table.root)),
+                    .filter_map(|l| l.table.as_ref())
+                    .map(|t| history_run_path(&t.root)),
             )
             .collect();
         v.sort();
@@ -829,7 +835,7 @@ pub struct HistoryTableStats {
     pub model_bytes: u64,
     pub file_bytes: u64,
     /// Entries above the inline size, and their bytes, in the period's
-    /// pack (a value repeated within the period is stored once).
+    /// pack (a value repeated within a block is stored once).
     pub packed: u64,
     pub packed_bytes: u64,
 }
@@ -1205,14 +1211,24 @@ fn write_inner(
             Ok(())
         })?;
         drop(sort);
-        if let Some((tr, st)) = w.finish(root, &mut files)? {
-            tx_lookup.push(LookupRun {
-                first_period: periods[lo].period,
-                last_period: periods[hi].period,
-                table: tr,
-            });
-            lookup_stats.push(st);
-        }
+        // A piece with no transactions still covers its periods; it has no
+        // run, and zero stats keep `lookup_stats` in step with the pieces.
+        let (table, st) = match w.finish(root, &mut files)? {
+            Some((tr, st)) => (Some(tr), st),
+            None => (
+                None,
+                HistoryTableStats {
+                    table_id: H_TX_LOOKUP,
+                    ..Default::default()
+                },
+            ),
+        };
+        tx_lookup.push(LookupRun {
+            first_period: periods[lo].period,
+            last_period: periods[hi].period,
+            table,
+        });
+        lookup_stats.push(st);
     }
     drop(scratch);
     report(opts, HistoryPhase::Lookup, plans.len() as u64);
@@ -1492,6 +1508,7 @@ impl PeriodWrite<'_> {
             if self.stop.load(Ordering::Relaxed) {
                 return Err(stopped());
             }
+            pack.next_block();
             let mut b = src.block(n).map_err(HistoryError::Source)?;
             // The source served this block once already. The bytes written
             // are verified again here (header hash, both roots, receipts
@@ -1606,7 +1623,8 @@ impl PeriodWrite<'_> {
 
 /// One period's pack being written under a temporary name, renamed to its
 /// `blake3` when finished, removed if it never is. A value repeated within
-/// the period is stored once.
+/// a block is stored once; across blocks it is stored again, so a block's
+/// values stay one range.
 struct PackOut {
     tmp: PathBuf,
     out: Option<BufWriter<File>>,
@@ -1632,6 +1650,11 @@ impl PackOut {
             len: 0,
             seen: HashMap::new(),
         }
+    }
+
+    /// A new block: values before it are no longer shared.
+    fn next_block(&mut self) {
+        self.seen.clear();
     }
 
     fn add(&mut self, value: &[u8]) -> Result<PackedRef, HistoryError> {
@@ -2060,6 +2083,38 @@ pub mod synthetic {
         }
         out
     }
+
+    /// Empty the blocks of `c` that `pred` picks (no transactions, no
+    /// receipts, no gas, an empty bloom) and rebuild the headers from the
+    /// first of them, so the chain still links.
+    pub fn strip(c: &mut BTreeMap<u64, Block>, pred: impl Fn(u64) -> bool) {
+        let mut parent: Option<B256> = None;
+        for (&n, b) in c.iter_mut() {
+            let hit = pred(n);
+            if !hit && parent.is_none() {
+                continue;
+            }
+            let mut it: Vec<Vec<u8>> = list_items(&b.header)
+                .expect("a synthetic header")
+                .iter()
+                .map(|x| x.to_vec())
+                .collect();
+            if let Some(p) = parent {
+                it[0] = enc(&p);
+            }
+            if hit {
+                b.txs.clear();
+                b.receipts.clear();
+                it[4] = enc(&ordered_root(&[]));
+                it[5] = enc(&ordered_root(&[]));
+                it[6] = enc(&Bloom::ZERO);
+                it[10] = enc(&0u64);
+            }
+            b.header = list(&it);
+            b.hash = keccak256(&b.header);
+            parent = Some(b.hash);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2409,7 +2464,16 @@ mod tests {
         }
         let mut found = 0;
         for l in &w.manifest.tx_lookup {
-            let t = &l.table;
+            let ps = &w.manifest.periods;
+            let lo = ps.iter().position(|p| p.period == l.first_period).unwrap();
+            let hi = ps.iter().position(|p| p.period == l.last_period).unwrap();
+            let Some(t) = &l.table else {
+                let n: usize = (ps[lo].first_block..=ps[hi].last_block)
+                    .map(|b| c[&b].txs.len())
+                    .sum();
+                assert_eq!(n, 0, "a piece without a run covers no transactions");
+                continue;
+            };
             let run = fs::read(dir.join(history_run_path(&t.root))).unwrap();
             let rr = csl_run::RunRef {
                 root: t.root,
@@ -2422,9 +2486,6 @@ mod tests {
                 model_root: t.model_root,
             };
             let mut r = csl_run::Reader::with_format(run, rr, HISTORY_RUN_FORMAT);
-            let ps = &w.manifest.periods;
-            let lo = ps.iter().position(|p| p.period == l.first_period).unwrap();
-            let hi = ps.iter().position(|p| p.period == l.last_period).unwrap();
             let mut n = 0;
             for p in &ps[lo..=hi] {
                 for b in p.first_block..=p.last_block {
@@ -2447,25 +2508,7 @@ mod tests {
 
     #[test]
     fn large_values_go_in_one_pack_per_period_and_tx_lookup_in_pieces() {
-        // Ten periods of nine blocks each.
-        let ts = MAINNET_GENESIS_TIME + 1912 * 8192 * 12;
-        let mut c = synthetic::chain(5, 2_000, 90, ts);
-        let mut parent = c[&2_000].hash;
-        for n in 2_001..2_090 {
-            let b = c[&n].clone();
-            let mut it: Vec<Vec<u8>> = list_items(&b.header)
-                .unwrap()
-                .iter()
-                .map(|x| x.to_vec())
-                .collect();
-            let t: u64 = item(&it[11], "ts").unwrap();
-            it[0] = alloy_rlp::encode(parent);
-            it[11] = alloy_rlp::encode(t + (n - 2_000) / 9 * 8192 * 12);
-            let header = synthetic_list(&it);
-            let hash = keccak256(&header);
-            c.insert(n, Block { header, hash, ..b });
-            parent = hash;
-        }
+        let c = ten_periods();
         let (first, last) = (2_000, 2_089);
         // Base 1912..=1914, then 6 closed periods in 4 and 2, then the open
         // one; no base, 9 closed in 8 and 1.
@@ -2494,6 +2537,80 @@ mod tests {
             );
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Ten periods (1912..=1921) of nine blocks each, 2_000..=2_089.
+    fn ten_periods() -> BTreeMap<u64, Block> {
+        let ts = MAINNET_GENESIS_TIME + 1912 * 8192 * 12;
+        let mut c = synthetic::chain(5, 2_000, 90, ts);
+        let mut parent = c[&2_000].hash;
+        for n in 2_001..2_090 {
+            let b = c[&n].clone();
+            let mut it: Vec<Vec<u8>> = list_items(&b.header)
+                .unwrap()
+                .iter()
+                .map(|x| x.to_vec())
+                .collect();
+            let t: u64 = item(&it[11], "ts").unwrap();
+            it[0] = alloy_rlp::encode(parent);
+            it[11] = alloy_rlp::encode(t + (n - 2_000) / 9 * 8192 * 12);
+            let header = synthetic_list(&it);
+            let hash = keccak256(&header);
+            c.insert(n, Block { header, hash, ..b });
+            parent = hash;
+        }
+        c
+    }
+
+    #[test]
+    fn a_piece_without_transactions_still_covers_its_periods() {
+        // (strip, base, pieces, the empty piece): a middle piece (periods
+        // 1919..=1920 of (0,2),(3,6),(7,8),(9,9)), and the open period
+        // alone, as when the anchor opens a period.
+        let cases = [(7..=8, Some(1912 + 2), 4, 2), (9..=9, None, 2, 1)];
+        for (i, (strip, base, pieces, empty)) in cases.into_iter().enumerate() {
+            let mut c = ten_periods();
+            synthetic::strip(&mut c, |n| strip.contains(&((n - 2_000) / 9)));
+            let (first, last) = (2_000, 2_089);
+            let dir = scratch(&format!("empty-piece-{i}"));
+            let mut opts = HistoryOptions {
+                workers: 3,
+                tx_lookup_base: base,
+                ..Default::default()
+            };
+            let w =
+                write_history_with(&dir, &c, first, (last, c[&last].hash), 4, &mut opts).unwrap();
+            let m = &w.manifest;
+            assert_eq!(m.tx_lookup.len(), pieces, "case {i}");
+            for (j, l) in m.tx_lookup.iter().enumerate() {
+                assert_eq!(l.table.is_none(), j == empty, "case {i} piece {j}");
+            }
+            assert_eq!(w.lookup_stats.len(), pieces);
+            assert_eq!(
+                w.lookup_stats[empty],
+                HistoryTableStats {
+                    table_id: H_TX_LOOKUP,
+                    ..Default::default()
+                }
+            );
+            check_packs_and_pieces(&dir, &w, &c);
+            assert_eq!(w.files.len(), m.run_paths().len() + 2);
+            // The piece round-trips without a table.
+            let json = m.to_json();
+            assert_eq!(HistoryManifest::from_json(json.as_bytes()).unwrap(), *m);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // A span of one empty block: one period, one piece, no run.
+        let mut c = synthetic::chain(6, 0, 1, MAINNET_GENESIS_TIME - 12 * 100);
+        synthetic::strip(&mut c, |_| true);
+        let dir = scratch("empty-span");
+        let w = write_history(&dir, &c, 0, (0, c[&0].hash), 4).unwrap();
+        assert_eq!(w.manifest.periods.len(), 1);
+        assert_eq!(w.manifest.tx_lookup.len(), 1);
+        assert_eq!(w.manifest.tx_lookup[0].table, None);
+        assert!(!w.manifest.to_json().contains("\"table\""));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

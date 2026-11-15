@@ -10,8 +10,9 @@ use csl_eth_client::{
 };
 use csl_eth_store::{
     history::{
-        decode_header, decode_receipt, encode_receipt, locator, synthetic, tx_hash, tx_lookup_key,
-        write_history, write_history_tampered, Block, Tamper, MAINNET_GENESIS_TIME,
+        decode_header, decode_receipt, encode_receipt, history_manifest_path, locator, synthetic,
+        tx_hash, tx_lookup_key, write_history, write_history_tampered, Block, HistoryManifest,
+        Tamper, MAINNET_GENESIS_TIME,
         SECONDS_PER_SLOT, SLOTS_PER_PERIOD, H_TRANSACTIONS,
     },
     CODE_BLOB_THRESHOLD,
@@ -242,6 +243,79 @@ fn a_manifest_for_another_block_is_refused() {
     .err()
     .unwrap();
     assert!(e.contains("no history at block"), "{e}");
+}
+
+/// Every transaction of `blocks` of `c` reads back verified.
+fn txs_read(h: &mut History<DirDriver>, c: &BTreeMap<u64, Block>, blocks: impl Iterator<Item = u64>) -> u64 {
+    let mut n = 0;
+    for b in blocks {
+        for (i, t) in c[&b].txs.iter().enumerate() {
+            let r = h.tx(&tx_hash(t)).0.unwrap_or_else(|e| panic!("block {b} tx {i}: {e}"));
+            assert_eq!((r.block_number, r.index, &r.tx), (b, i as u64, t));
+            n += 1;
+        }
+    }
+    n
+}
+
+#[test]
+fn a_span_whose_open_period_is_empty_opens_and_reads() {
+    let honest = chain();
+    // The open period with no transactions: a tx_lookup piece without a
+    // run. Then the anchor alone in its period, empty, as when a span
+    // ends on the first block of a new period.
+    for (i, last) in [LAST, BOUNDARY].into_iter().enumerate() {
+        let mut c = honest.clone();
+        synthetic::strip(&mut c, |n| n >= BOUNDARY);
+        let dir = scratch(&format!("empty-open-{i}"));
+        let w = write_history(&dir, &c, FIRST, (last, c[&last].hash), EPSILON).unwrap();
+        let pieces: Vec<_> = w.manifest.tx_lookup.iter().map(|l| l.table.is_some()).collect();
+        assert_eq!(pieces, vec![true, false]);
+        let a = Anchor { number: last, hash: c[&last].hash };
+        let mut h = History::open(DirDriver::new(&dir), a).expect("an empty piece opens");
+        assert_eq!(h.header(FIRST).0.unwrap(), decode_header(&c[&FIRST].header).unwrap());
+        assert!(txs_read(&mut h, &c, FIRST..BOUNDARY) > 0);
+        // A transaction the stripped period no longer has is not indexed.
+        let gone = honest.range(BOUNDARY..).find_map(|(_, b)| b.txs.first()).unwrap();
+        assert_eq!(h.tx(&tx_hash(gone)).0.unwrap_err(), Insufficient::NotIndexed);
+        for tier in [LogTier::Indexed, LogTier::Complete] {
+            let r = h.logs(&busy(), FIRST, last, tier).0.unwrap();
+            assert_eq!(r.logs, truth(&c, &busy(), FIRST, last), "{}", tier.name());
+        }
+    }
+}
+
+#[test]
+fn a_manifest_that_drops_a_piece_never_reads_wrong() {
+    // A hostile manifest names no run for a piece that has transactions:
+    // its transactions are not indexed, never misplaced, and the other
+    // piece reads as before.
+    let c = chain();
+    let a = anchor(&c);
+    for drop in [0usize, 1] {
+        let dir = scratch(&format!("drop-piece-{drop}"));
+        write_history(&dir, &c, FIRST, (LAST, c[&LAST].hash), EPSILON).unwrap();
+        let path = dir.join(history_manifest_path(&c[&LAST].hash));
+        let mut m = HistoryManifest::from_json(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(m.tx_lookup[drop].table.is_some());
+        m.tx_lookup[drop].table = None;
+        std::fs::write(&path, m.to_json()).unwrap();
+        let mut h = History::open(DirDriver::new(&dir), a).expect("the bucket opens");
+        let (dropped, kept) = if drop == 0 {
+            (FIRST..BOUNDARY, BOUNDARY..LAST + 1)
+        } else {
+            (BOUNDARY..LAST + 1, FIRST..BOUNDARY)
+        };
+        let mut missing = 0;
+        for b in dropped {
+            for t in &c[&b].txs {
+                assert_eq!(h.tx(&tx_hash(t)).0.unwrap_err(), Insufficient::NotIndexed);
+                missing += 1;
+            }
+        }
+        assert!(missing > 0);
+        assert!(txs_read(&mut h, &c, kept) > 0);
+    }
 }
 
 /// The fault list. Each writes a hostile bucket from the honest chain and

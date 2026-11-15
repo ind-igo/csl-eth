@@ -595,7 +595,7 @@ fn measure(a: MeasureArgs) -> Result<Value, String> {
 
     // Table sizes, from the manifest.
     let mut tables: BTreeMap<&str, (u64, u64, u64)> = BTreeMap::new();
-    for t in m.periods.iter().flat_map(|p| &p.tables).chain(m.tx_lookup.iter().map(|l| &l.table)) {
+    for t in m.periods.iter().flat_map(|p| &p.tables).chain(m.tx_lookup.iter().filter_map(|l| l.table.as_ref())) {
         let e = tables.entry(history_table_name(t.table_id)).or_default();
         e.0 += t.page_count;
         e.1 += u64::from(t.model_bytes);

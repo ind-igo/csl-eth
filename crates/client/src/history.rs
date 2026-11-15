@@ -326,7 +326,13 @@ impl<D: Driver> HistoryOpener<D> {
         let lookup: Vec<Slot> = manifest
             .tx_lookup
             .iter()
-            .map(|l| reader(&l.table, manifest.block_number))
+            // A piece without a run (its periods hold no transactions) is
+            // an empty slot: it finds nothing, and a miss is `NotIndexed`.
+            .map(|l| {
+                l.table
+                    .as_ref()
+                    .and_then(|tr| reader(tr, manifest.block_number))
+            })
             .collect();
         Ok(Ok(History {
             driver: self.driver.take().expect("opened once"),
