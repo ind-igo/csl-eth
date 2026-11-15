@@ -43,6 +43,7 @@ use reth_ethereum::{
         BlockHashReader, BlockNumReader, ProviderError, ProviderFactory,
     },
 };
+use std::io::Write as _;
 use std::{
     cell::{RefCell, RefMut},
     path::PathBuf,
@@ -313,7 +314,10 @@ fn main() -> eyre::Result<()> {
     opts.progress_every = Duration::from_secs(60);
     opts.workers = args.workers.unwrap_or_else(|| 2 * std::thread::available_parallelism().map_or(1, |n| n.get()));
     opts.ranges = args.ranges;
-    let done = export(&args.out, &head, &readers, &opts, &mut |s| eprintln!("{}", line(s)))?;
+    let done = export(&args.out, &head, &readers, &opts, &mut |s| {
+        // Never panic on a closed log pipe: progress is not worth an export.
+        let _ = writeln!(std::io::stderr(), "{}", line(s));
+    })?;
     println!("{}", serde_json::json!({"dir": done.dir, "stats": line(&done.stats), "manifest": done.manifest}));
     Ok(())
 }

@@ -946,7 +946,20 @@ pub fn export<F: Sources + ?Sized>(root: &Path, head: &Head, sources: &F, opts: 
             }
             Ok(())
         };
+        // A panic while feeding (in the account builder, or in the caller's
+        // progress callback) must still release the workers, or the scope
+        // waits on threads blocked behind a queue nobody drains.
+        struct StopOnUnwind<'a>(&'a Shared);
+        impl Drop for StopOnUnwind<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.stop(None);
+                }
+            }
+        }
+        let guard = StopOnUnwind(&shared);
         let fed = feed();
+        drop(guard);
         if fed.is_err() {
             shared.stop(None);
         }
