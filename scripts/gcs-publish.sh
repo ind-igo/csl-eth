@@ -51,9 +51,11 @@ case "${1:-}" in
     key=$2
     file=$3
     [ -f "$file" ] || { echo "put $key: no such file: $file" >&2; exit 1; }
-    # Rules by the key under any "full/" prefix (the full-state export,
-    # deploy/gcp/node-burst.sh, publishes a second bucket layout there).
+    # Rules by the key under a "full/" or "history-full/" prefix (the
+    # full-state export, deploy/gcp/node-burst.sh, and the full history,
+    # deploy/gcp/history-burst.sh, publish whole bucket layouts there).
     rel=${key#full/}
+    rel=${rel#history-full/}
     case "$rel" in
       head/* | manifest.json | */manifest.json) ct=application/json ;;
       *) ct=application/octet-stream ;;
