@@ -383,11 +383,16 @@ async fn run_job(peer: &mut Peer, sh: &Shared, job: &Job) -> Result<Outcome, Pee
                     None => want.push((h.number, h.hash_slow())),
                 }
             }
-            for c in want.chunks(sh.cfg.body_batch) {
-                sh.push(Job::Bodies(c.to_vec()), false);
-            }
-            for c in want.chunks(sh.cfg.receipt_batch) {
-                sh.push(Job::Receipts(c.to_vec()), false);
+            // Bodies and receipts for the same blocks side by side, so a
+            // block's halves meet soon and few wait in memory.
+            let per = sh.cfg.body_batch.max(sh.cfg.receipt_batch);
+            for c in want.chunks(per) {
+                for b in c.chunks(sh.cfg.body_batch) {
+                    sh.push(Job::Bodies(b.to_vec()), false);
+                }
+                for r in c.chunks(sh.cfg.receipt_batch) {
+                    sh.push(Job::Receipts(r.to_vec()), false);
+                }
             }
             Ok(Outcome::Served { items: n, rest })
         }
