@@ -60,12 +60,15 @@ fi
 say "sync done in $(( $(date +%s) - t0 ))s"
 
 # 3. Export. The exporter checks the chain head in the DB is BLOCK_HASH and
-# the computed root is STATE_ROOT, and writes the manifest last.
+# the computed root is STATE_ROOT, and writes the manifest last. Reading reth
+# is page-fault latency, one fault in flight per thread: 16 workers on 8
+# vCPUs keep the NVMe busy, and a 16 GiB budget leaves the rest of the
+# 64 GB to the page cache over reth's database.
 t0=$(date +%s)
 /data/src/tools/export-reth/target/release/export-reth \
   --datadir /data/reth --block-hash "$BLOCK_HASH" --block-number "$BLOCK_NUMBER" \
   --timestamp "$BLOCK_TS" --state-root "$STATE_ROOT" --out /data/out \
-  --scratch /data/scratch --memory-gib 40 \
+  --scratch /data/scratch --memory-gib 16 --workers 16 \
   2>&1 | sed -u 's/^/csl-export export /'
 say "export done in $(( $(date +%s) - t0 ))s, $(du -sh /data/out | cut -f1)"
 
