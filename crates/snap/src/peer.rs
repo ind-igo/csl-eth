@@ -496,38 +496,16 @@ impl Peer {
     /// `eth/70` omit it and it is recomputed from the logs. On `eth/70` a
     /// peer may cut the last block short (`lastBlockIncomplete`); that
     /// block is continued from its next index until it is whole, and it is
-    /// dropped if the peer stops serving it. Unchecked: the caller rebuilds
-    /// each block's `receiptsRoot`.
+    /// dropped if the peer stops serving it. An answer with more lists than
+    /// blocks asked, or marked incomplete with no block in it, is a
+    /// protocol error. Unchecked otherwise: the caller rebuilds each
+    /// block's `receiptsRoot`.
     pub async fn receipts(&mut self, hashes: Vec<B256>) -> Result<Vec<Vec<Vec<u8>>>, PeerError> {
-        if self.eth_version < EthVersion::Eth70 {
-            let (blocks, _) = self.receipts_once(hashes, 0).await?;
-            return Ok(blocks);
-        }
-        let (mut blocks, mut incomplete) = self.receipts_once(hashes.clone(), 0).await?;
-        let mut rounds = 0;
-        while incomplete && !blocks.is_empty() {
-            rounds += 1;
-            let i = blocks.len() - 1;
-            let have = blocks[i].len() as u64;
-            if rounds > 256 {
-                return Err(PeerError::Protocol("receipts never completed"));
-            }
-            let (more, inc) = self.receipts_once(vec![hashes[i]], have).await?;
-            match more.into_iter().next() {
-                Some(rest) if !rest.is_empty() => {
-                    blocks[i].extend(rest);
-                    incomplete = inc;
-                }
-                _ => {
-                    blocks.pop();
-                    incomplete = false;
-                }
-            }
-        }
-        Ok(blocks)
+        let eth70 = self.eth_version >= EthVersion::Eth70;
+        receipts_continued(self, hashes, eth70).await
     }
 
-    async fn receipts_once(&mut self, hashes: Vec<B256>, first_index: u64) -> Result<(Vec<Vec<Vec<u8>>>, bool), PeerError> {
+    async fn receipts_page(&mut self, hashes: Vec<B256>, first_index: u64) -> Result<ReceiptsPage, PeerError> {
         let request_id = self.request_id();
         let msg = if self.eth_version >= EthVersion::Eth70 {
             EthMessage::<EthNetworkPrimitives>::GetReceipts70(RequestPair {
@@ -692,4 +670,143 @@ fn snap_request_id(m: &SnapProtocolMessage) -> Option<u64> {
         SnapProtocolMessage::GetBlockAccessLists(x) => x.request_id,
         SnapProtocolMessage::BlockAccessLists(x) => x.request_id,
     })
+}
+
+/// One `GetReceipts` answer: the receipt-trie leaves of a prefix of the
+/// asked blocks, and `eth/70`'s `lastBlockIncomplete`.
+pub(crate) type ReceiptsPage = (Vec<Vec<Vec<u8>>>, bool);
+
+/// Where [`receipts_continued`] gets each answer: a peer, or a test's
+/// scripted one.
+pub(crate) trait ReceiptPages {
+    async fn receipt_page(&mut self, hashes: Vec<B256>, first_index: u64) -> Result<ReceiptsPage, PeerError>;
+}
+
+impl ReceiptPages for Peer {
+    async fn receipt_page(&mut self, hashes: Vec<B256>, first_index: u64) -> Result<ReceiptsPage, PeerError> {
+        self.receipts_page(hashes, first_index).await
+    }
+}
+
+/// An answer to `asked` hashes is at most `asked` lists, and only an
+/// answer with a block in it can leave its last block incomplete. Checked
+/// before anything indexes the request by the answer.
+fn receipts_shape(asked: usize, (blocks, incomplete): &ReceiptsPage) -> Result<(), PeerError> {
+    if blocks.len() > asked {
+        return Err(PeerError::Protocol("more receipt lists than blocks asked"));
+    }
+    if *incomplete && blocks.is_empty() {
+        return Err(PeerError::Protocol("an incomplete receipts answer with no block"));
+    }
+    Ok(())
+}
+
+/// [`Peer::receipts`] over any source of answers: the first answer, then
+/// on `eth/70` the last block continued while the peer marks it
+/// incomplete. Every answer's shape is checked first.
+pub(crate) async fn receipts_continued(src: &mut impl ReceiptPages, hashes: Vec<B256>, eth70: bool) -> Result<Vec<Vec<Vec<u8>>>, PeerError> {
+    let first = src.receipt_page(hashes.clone(), 0).await?;
+    receipts_shape(hashes.len(), &first)?;
+    let (mut blocks, incomplete) = first;
+    if !eth70 {
+        return Ok(blocks);
+    }
+    let mut incomplete = incomplete;
+    let mut rounds = 0;
+    while incomplete {
+        rounds += 1;
+        if rounds > 256 {
+            return Err(PeerError::Protocol("receipts never completed"));
+        }
+        // Non-empty: an incomplete answer has a block (checked above and
+        // below), and a block is popped only with `incomplete` cleared.
+        let i = blocks.len() - 1;
+        let have = blocks[i].len() as u64;
+        let more = src.receipt_page(vec![hashes[i]], have).await?;
+        receipts_shape(1, &more)?;
+        let (more, inc) = more;
+        match more.into_iter().next() {
+            Some(rest) if !rest.is_empty() => {
+                blocks[i].extend(rest);
+                incomplete = inc;
+            }
+            _ => {
+                blocks.pop();
+                incomplete = false;
+            }
+        }
+    }
+    Ok(blocks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    /// Scripted answers, and the requests that drew them.
+    struct Scripted {
+        answers: VecDeque<ReceiptsPage>,
+        asked: Vec<(Vec<B256>, u64)>,
+    }
+
+    impl ReceiptPages for Scripted {
+        async fn receipt_page(&mut self, hashes: Vec<B256>, first_index: u64) -> Result<ReceiptsPage, PeerError> {
+            self.asked.push((hashes, first_index));
+            self.answers.pop_front().ok_or(PeerError::Protocol("no more scripted answers"))
+        }
+    }
+
+    fn scripted(answers: Vec<ReceiptsPage>) -> Scripted {
+        Scripted { answers: answers.into(), asked: Vec::new() }
+    }
+
+    fn hashes(n: u8) -> Vec<B256> {
+        (0..n).map(B256::repeat_byte).collect()
+    }
+
+    fn leaves(xs: &[u8]) -> Vec<Vec<u8>> {
+        xs.iter().map(|x| vec![*x]).collect()
+    }
+
+    #[tokio::test]
+    async fn more_receipt_lists_than_asked_is_a_protocol_error() {
+        for eth70 in [false, true] {
+            for incomplete in [false, true] {
+                let mut p = scripted(vec![(vec![leaves(&[1]), leaves(&[2]), leaves(&[3])], incomplete)]);
+                let r = receipts_continued(&mut p, hashes(2), eth70).await;
+                assert!(matches!(r, Err(PeerError::Protocol(_))), "eth70={eth70} incomplete={incomplete}: {r:?}");
+                assert_eq!(p.asked.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_continuation_is_a_protocol_error() {
+        // Incomplete with no block at all.
+        let mut p = scripted(vec![(vec![], true)]);
+        assert!(matches!(receipts_continued(&mut p, hashes(2), true).await, Err(PeerError::Protocol(_))));
+        // A continuation of one block answered with two lists.
+        let mut p = scripted(vec![(vec![leaves(&[1]), leaves(&[2])], true), (vec![leaves(&[3]), leaves(&[4])], false)]);
+        assert!(matches!(receipts_continued(&mut p, hashes(2), true).await, Err(PeerError::Protocol(_))));
+        // A continuation answered incomplete with no block.
+        let mut p = scripted(vec![(vec![leaves(&[1])], true), (vec![], true)]);
+        assert!(matches!(receipts_continued(&mut p, hashes(2), true).await, Err(PeerError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_last_block_is_continued_or_dropped() {
+        let h = hashes(3);
+        let mut p = scripted(vec![(vec![leaves(&[1]), leaves(&[2, 3])], true), (vec![leaves(&[4])], true), (vec![leaves(&[5])], false)]);
+        let r = receipts_continued(&mut p, h.clone(), true).await.unwrap();
+        assert_eq!(r, vec![leaves(&[1]), leaves(&[2, 3, 4, 5])]);
+        assert_eq!(p.asked[1..], [(vec![h[1]], 2), (vec![h[1]], 3)]);
+        // The peer stops serving the cut block: it is dropped, the rest kept.
+        let mut p = scripted(vec![(vec![leaves(&[1]), leaves(&[2])], true), (vec![], false)]);
+        assert_eq!(receipts_continued(&mut p, h.clone(), true).await.unwrap(), vec![leaves(&[1])]);
+        // Before eth/70 the flag cannot be set and nothing is continued.
+        let mut p = scripted(vec![(vec![leaves(&[1]), leaves(&[2])], false)]);
+        assert_eq!(receipts_continued(&mut p, h, false).await.unwrap().len(), 2);
+        assert_eq!(p.asked.len(), 1);
+    }
 }

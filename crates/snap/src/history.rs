@@ -77,6 +77,10 @@ pub struct AcquireConfig {
     pub receipt_batch: usize,
     /// Give up after this long (0: never).
     pub max_wall: Duration,
+    /// Give up when no header or block has arrived for this long (0:
+    /// never), whatever `max_wall` says: peers that stop serving must not
+    /// hold a run open forever.
+    pub max_stall: Duration,
 }
 
 impl Default for AcquireConfig {
@@ -94,6 +98,7 @@ impl Default for AcquireConfig {
             body_batch: 128,
             receipt_batch: 64,
             max_wall: Duration::from_secs(0),
+            max_stall: Duration::from_secs(600),
         }
     }
 }
@@ -168,6 +173,8 @@ pub struct AcquireStats {
 pub enum AcquireError {
     #[error("gave up after {wall:?} with {done} of {total} blocks")]
     Timeout { wall: Duration, done: u64, total: u64 },
+    #[error("nothing arrived for {stall:?}, with {done} of {total} blocks")]
+    Stalled { stall: Duration, done: u64, total: u64 },
     #[error("{0}")]
     Other(String),
 }
@@ -206,6 +213,9 @@ struct Shared {
     headers: Mutex<BTreeMap<u64, Header>>,
     partial: Mutex<HashMap<u64, Partial>>,
     done: AtomicU64,
+    /// Blocks counted in `done`, so a block that arrives twice (a job
+    /// requeued after a worker failed partway) counts once.
+    completed: Mutex<HashSet<u64>>,
     finished: AtomicBool,
     connected: AtomicUsize,
     banned: Mutex<HashSet<PeerId>>,
@@ -214,6 +224,26 @@ struct Shared {
 }
 
 impl Shared {
+    fn new(cfg: AcquireConfig, work: &Path, (number, hash): (u64, B256), first: u64, blocks: u64) -> Shared {
+        Shared {
+            cfg,
+            work: work.to_path_buf(),
+            first,
+            total: blocks,
+            queue: Mutex::new(VecDeque::new()),
+            notify: Notify::new(),
+            headers: Mutex::new(BTreeMap::new()),
+            partial: Mutex::new(HashMap::new()),
+            done: AtomicU64::new(0),
+            completed: Mutex::new(HashSet::new()),
+            finished: AtomicBool::new(false),
+            connected: AtomicUsize::new(0),
+            banned: Mutex::new(HashSet::new()),
+            stats: Mutex::new(AcquireStats { anchor_number: number, anchor_hash: hash, first_block: first, blocks, ..Default::default() }),
+            fatal: Mutex::new(None),
+        }
+    }
+
     fn push(&self, job: Job, front: bool) {
         let mut q = self.queue.lock().unwrap();
         if front {
@@ -241,6 +271,9 @@ impl Shared {
 
     /// A block's body or receipts verified: write the block once both are in.
     fn arrive(&self, n: u64, txs: Option<Vec<Vec<u8>>>, receipts: Option<Vec<Vec<u8>>>) {
+        if self.completed.lock().unwrap().contains(&n) {
+            return;
+        }
         let ready = {
             let mut p = self.partial.lock().unwrap();
             let e = p.entry(n).or_default();
@@ -276,10 +309,13 @@ impl Shared {
             s.fetched += 1;
             count_block(&mut s, &b);
         }
-        self.block_done();
+        self.block_done(n);
     }
 
-    fn block_done(&self) {
+    fn block_done(&self, n: u64) {
+        if !self.completed.lock().unwrap().insert(n) {
+            return;
+        }
         if self.done.fetch_add(1, Ordering::Relaxed) + 1 >= self.total {
             self.finished.store(true, Ordering::Relaxed);
             self.notify.notify_waiters();
@@ -376,9 +412,12 @@ async fn run_job(peer: &mut Peer, sh: &Shared, job: &Job) -> Result<Outcome, Pee
             for h in &hs {
                 match cached(&sh.work, h) {
                     Some(b) => {
-                        count_block(&mut sh.stats.lock().unwrap(), &b);
-                        sh.stats.lock().unwrap().from_cache += 1;
-                        sh.block_done();
+                        if !sh.completed.lock().unwrap().contains(&h.number) {
+                            let mut s = sh.stats.lock().unwrap();
+                            count_block(&mut s, &b);
+                            s.from_cache += 1;
+                        }
+                        sh.block_done(h.number);
                     }
                     None => want.push((h.number, h.hash_slow())),
                 }
@@ -397,7 +436,11 @@ async fn run_job(peer: &mut Peer, sh: &Shared, job: &Job) -> Result<Outcome, Pee
             Ok(Outcome::Served { items: n, rest })
         }
         Job::Bodies(list) => {
-            let bodies = peer.bodies(list.iter().map(|x| x.1).collect()).await?;
+            let bodies = match peer.bodies(list.iter().map(|x| x.1).collect()).await {
+                Ok(b) => b,
+                Err(PeerError::Protocol(w)) => return Ok(Outcome::Bad(w.into())),
+                Err(e) => return Err(e),
+            };
             if bodies.is_empty() {
                 return Ok(Outcome::Empty);
             }
@@ -420,7 +463,11 @@ async fn run_job(peer: &mut Peer, sh: &Shared, job: &Job) -> Result<Outcome, Pee
             Ok(Outcome::Served { items, rest })
         }
         Job::Receipts(list) => {
-            let blocks = peer.receipts(list.iter().map(|x| x.1).collect()).await?;
+            let blocks = match peer.receipts(list.iter().map(|x| x.1).collect()).await {
+                Ok(b) => b,
+                Err(PeerError::Protocol(w)) => return Ok(Outcome::Bad(w.into())),
+                Err(e) => return Err(e),
+            };
             if blocks.is_empty() {
                 return Ok(Outcome::Empty);
             }
@@ -443,7 +490,44 @@ async fn run_job(peer: &mut Peer, sh: &Shared, job: &Job) -> Result<Outcome, Pee
     }
 }
 
+/// A connected peer's place in `Shared::connected`, given back when its
+/// task ends however it ends (a panic included), so the dialer can fill it.
+struct Slot(Arc<Shared>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.connected.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A job a peer is working on: back on the queue's front when dropped,
+/// unless it was served. A worker that fails or panics partway loses no
+/// job.
+struct Held<'a> {
+    sh: &'a Shared,
+    job: Option<Job>,
+}
+
+impl Held<'_> {
+    fn job(&self) -> &Job {
+        self.job.as_ref().expect("held until served or dropped")
+    }
+
+    fn served(mut self) {
+        self.job = None;
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if let Some(job) = self.job.take() {
+            self.sh.push(job, true);
+        }
+    }
+}
+
 async fn peer_task(mut peer: Peer, sh: Arc<Shared>) {
+    let _slot = Slot(sh.clone());
     let client = peer.client.clone();
     let eth = peer.eth_version();
     let mut empties = 0;
@@ -461,7 +545,8 @@ async fn peer_task(mut peer: Peer, sh: Arc<Shared>) {
         };
         let kind = job.kind();
         let before = peer.bytes_in;
-        let r = run_job(&mut peer, &sh, &job).await;
+        let held = Held { sh: &sh, job: Some(job) };
+        let r = run_job(&mut peer, &sh, held.job()).await;
         {
             let mut s = sh.stats.lock().unwrap();
             s.requests.add(kind, 1);
@@ -469,6 +554,7 @@ async fn peer_task(mut peer: Peer, sh: Arc<Shared>) {
         }
         match r {
             Ok(Outcome::Served { items, rest }) => {
+                held.served();
                 empties = 0;
                 if !served {
                     served = true;
@@ -487,7 +573,7 @@ async fn peer_task(mut peer: Peer, sh: Arc<Shared>) {
             }
             Ok(Outcome::Empty) => {
                 sh.stats.lock().unwrap().empty.add(kind, 1);
-                sh.push(job, true);
+                drop(held);
                 empties += 1;
                 if empties >= 3 {
                     sh.stats.lock().unwrap().idle_peers += 1;
@@ -496,19 +582,18 @@ async fn peer_task(mut peer: Peer, sh: Arc<Shared>) {
                 let _ = peer.idle(Duration::from_secs(1)).await;
             }
             Ok(Outcome::Bad(w)) => {
-                sh.push(job, true);
+                drop(held);
                 sh.banned.lock().unwrap().insert(peer.id());
                 warn!(client = %client, eth, reason = %w, "dropping peer: answer does not verify");
                 sh.stats.lock().unwrap().bad_peers.push(Dropped { client: client.clone(), eth, reason: w.clone() });
                 break Some(w);
             }
             Err(e) => {
-                sh.push(job, true);
+                drop(held);
                 break Some(e.to_string());
             }
         }
     };
-    sh.connected.fetch_sub(1, Ordering::Relaxed);
     if let Some(w) = why {
         debug!(client = %client, reason = %w, "peer gone");
     }
@@ -523,22 +608,7 @@ pub async fn acquire(anchor: (u64, B256), work: &Path, cfg: AcquireConfig) -> Re
     let blocks = cfg.blocks.clamp(1, number + 1);
     let first = number + 1 - blocks;
     std::fs::create_dir_all(work.join("blocks")).map_err(|e| AcquireError::Other(e.to_string()))?;
-    let sh = Arc::new(Shared {
-        cfg: cfg.clone(),
-        work: work.to_path_buf(),
-        first,
-        total: blocks,
-        queue: Mutex::new(VecDeque::new()),
-        notify: Notify::new(),
-        headers: Mutex::new(BTreeMap::new()),
-        partial: Mutex::new(HashMap::new()),
-        done: AtomicU64::new(0),
-        finished: AtomicBool::new(false),
-        connected: AtomicUsize::new(0),
-        banned: Mutex::new(HashSet::new()),
-        stats: Mutex::new(AcquireStats { anchor_number: number, anchor_hash: hash, first_block: first, blocks, ..Default::default() }),
-        fatal: Mutex::new(None),
-    });
+    let sh = Arc::new(Shared::new(cfg.clone(), work, (number, hash), first, blocks));
     sh.push(Job::Headers { hash, number }, false);
 
     let key = peer::random_key();
@@ -595,6 +665,7 @@ pub async fn acquire(anchor: (u64, B256), work: &Path, cfg: AcquireConfig) -> Re
     }
 
     let mut last_log = Instant::now();
+    let (mut seen, mut last_arrival) = (0, Instant::now());
     let result = loop {
         if let Some(e) = sh.fatal.lock().unwrap().clone() {
             break Err(AcquireError::Other(e));
@@ -605,6 +676,12 @@ pub async fn acquire(anchor: (u64, B256), work: &Path, cfg: AcquireConfig) -> Re
         }
         if !cfg.max_wall.is_zero() && started.elapsed() > cfg.max_wall {
             break Err(AcquireError::Timeout { wall: cfg.max_wall, done, total: blocks });
+        }
+        let arrived = done + sh.headers.lock().unwrap().len() as u64;
+        if arrived != seen {
+            (seen, last_arrival) = (arrived, Instant::now());
+        } else if !cfg.max_stall.is_zero() && last_arrival.elapsed() > cfg.max_stall {
+            break Err(AcquireError::Stalled { stall: cfg.max_stall, done, total: blocks });
         }
         if last_log.elapsed() > Duration::from_secs(10) {
             last_log = Instant::now();
@@ -628,4 +705,49 @@ pub async fn acquire(anchor: (u64, B256), work: &Path, cfg: AcquireConfig) -> Re
     s.dialed = dialed.load(Ordering::Relaxed);
     s.wall_secs = started.elapsed().as_secs_f64();
     result.map(|()| s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared(blocks: u64) -> Arc<Shared> {
+        let work = std::env::temp_dir().join(format!("csl-history-acquire-{}", std::process::id()));
+        Arc::new(Shared::new(AcquireConfig::default(), &work, (100, B256::ZERO), 101 - blocks, blocks))
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_panics_gives_back_its_job_and_its_slot() {
+        let sh = shared(4);
+        sh.connected.fetch_add(1, Ordering::Relaxed);
+        let job = Job::Receipts(vec![(98, B256::repeat_byte(1)), (99, B256::repeat_byte(2))]);
+        let t = {
+            let sh = sh.clone();
+            tokio::spawn(async move {
+                let _slot = Slot(sh.clone());
+                let held = Held { sh: &sh, job: Some(job) };
+                let _ = held.job();
+                panic!("a worker fails partway");
+            })
+        };
+        assert!(t.await.unwrap_err().is_panic());
+        assert_eq!(sh.connected.load(Ordering::Relaxed), 0);
+        match sh.pop() {
+            Some(Job::Receipts(l)) => assert_eq!(l.iter().map(|x| x.0).collect::<Vec<_>>(), [98, 99]),
+            other => panic!("the job was not requeued: {other:?}"),
+        }
+        assert!(sh.pop().is_none());
+    }
+
+    #[test]
+    fn a_served_job_is_not_requeued_and_a_block_counts_once() {
+        let sh = shared(4);
+        Held { sh: &sh, job: Some(Job::Headers { hash: B256::ZERO, number: 100 }) }.served();
+        assert!(sh.pop().is_none());
+        drop(Held { sh: &sh, job: Some(Job::Headers { hash: B256::ZERO, number: 100 }) });
+        assert!(sh.pop().is_some());
+        sh.block_done(99);
+        sh.block_done(99);
+        assert_eq!(sh.done.load(Ordering::Relaxed), 1);
+    }
 }

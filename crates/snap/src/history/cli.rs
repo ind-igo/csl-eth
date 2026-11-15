@@ -77,6 +77,9 @@ pub struct BuildArgs {
     /// Give up acquiring after this many seconds (0: never).
     #[arg(long, default_value_t = 0)]
     pub max_secs: u64,
+    /// Give up when nothing has arrived for this many seconds (0: never).
+    #[arg(long, default_value_t = 600)]
+    pub stall_secs: u64,
     /// No head verification and no peers: build from the cache at the
     /// anchor `anchor.json` recorded.
     #[arg(long)]
@@ -264,6 +267,7 @@ async fn build(a: BuildArgs) -> Result<Value, String> {
             use_dns: !a.no_dns,
             use_discv4: !a.no_discv4,
             max_wall: Duration::from_secs(a.max_secs),
+            max_stall: Duration::from_secs(a.stall_secs),
             ..Default::default()
         };
         let s = acquire((anchor.number, anchor.hash), &a.work, cfg).await.map_err(|e| e.to_string())?;
