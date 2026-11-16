@@ -53,6 +53,7 @@ use std::{
     fs::{self, File},
     io::{Read as _, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{info, warn};
@@ -242,9 +243,19 @@ fn table_index(t: u16) -> usize {
 impl Store {
     /// The runs `manifest` names, under `root`.
     pub fn open(root: &Path, manifest: &Manifest) -> Result<Store, String> {
+        Store::open_with(root, manifest, true)
+    }
+
+    /// The runs `manifest` names, under `root`; the base's only when
+    /// `base` (a tracker without a local base reads it by range, see
+    /// [`crate::remote`]).
+    pub fn open_with(root: &Path, manifest: &Manifest, base: bool) -> Result<Store, String> {
         let mut runs: [Vec<Reader<File>>; 3] = Default::default();
         for t in [TABLE_ACCOUNT_NODES, TABLE_STORAGE_NODES, TABLE_CODE] {
             for at in manifest.runs(t).into_iter().rev() {
+                if !base && at.layer.is_none() {
+                    continue;
+                }
                 let f = File::open(root.join(&at.path)).map_err(|e| format!("{}: {e}", at.path))?;
                 let mut rref = at.table.run_ref(at.block_lo);
                 rref.block_hi = at.block_hi;
@@ -620,6 +631,11 @@ pub struct StepStats {
     /// Old nodes the local store did not have: the subtree was fetched
     /// whole instead (more bytes, same result).
     pub old_missing: u64,
+    /// Without a local base: old nodes asked for, and served by peers at
+    /// the old root and by the base in the bucket.
+    pub old_asked: u64,
+    pub old_peers: u64,
+    pub old_bucket: u64,
     pub accounts_changed: u64,
     pub storage_tries: u64,
     /// Storage tries copied from another owner with the same root.
@@ -710,6 +726,8 @@ pub enum StepError {
     Store(String),
     /// A node too deep for a table key.
     TooDeep,
+    /// The held state's node at a position is not local: ask for it.
+    Old(Need),
 }
 
 impl std::fmt::Display for StepError {
@@ -722,6 +740,7 @@ impl std::fmt::Display for StepError {
             StepError::Missing => write!(f, "a node the sync counted as local is missing"),
             StepError::Store(e) => write!(f, "local store: {e}"),
             StepError::TooDeep => write!(f, "a node too deep for a table key"),
+            StepError::Old(n) => write!(f, "old node {} not local", n.hash),
         }
     }
 }
@@ -738,14 +757,27 @@ fn compatible(prefix: Option<&Nibbles>, owner: &Option<B256>, path: &Nibbles) ->
 /// The account under `key` in the trie at `root`, walked through the local
 /// store; none when absent or when the store lacks a node on the way (the
 /// caller then treats the account as new, which fetches more, never less).
-fn old_account(store: &mut Store, root: B256, key: &Nibbles) -> Result<Option<Account>, String> {
+fn old_account(
+    store: &mut Store,
+    db: Option<&NodeDb>,
+    remote: bool,
+    root: B256,
+    key: &Nibbles,
+) -> Result<Option<Account>, StepError> {
     let mut path = Nibbles::default();
     let mut at = Ref::Hash(root);
     loop {
         let rlp = match &at {
             Ref::Inline(b) => b.clone(),
-            Ref::Hash(h) => match store.node(None, &path, h)? {
+            Ref::Hash(h) => match old_node(store, db, None, &path, h)? {
                 Some(b) => b,
+                None if remote => {
+                    return Err(StepError::Old(Need {
+                        owner: None,
+                        path,
+                        hash: *h,
+                    }))
+                }
                 None => return Ok(None),
             },
         };
@@ -767,6 +799,23 @@ fn old_account(store: &mut Store, root: B256, key: &Nibbles) -> Result<Option<Ac
             Ok(Shape::Empty) | Err(_) => return Ok(None),
         }
     }
+}
+
+/// The held state's node at a position: fetched for this step (old nodes
+/// a tracker without a local base asked for), or in the local runs.
+fn old_node(
+    store: &mut Store,
+    db: Option<&NodeDb>,
+    owner: Option<B256>,
+    path: &Nibbles,
+    h: &B256,
+) -> Result<Option<Bytes>, StepError> {
+    if let Some(db) = db {
+        if let Some(b) = db.get(h).map_err(StepError::Store)? {
+            return Ok(Some(b));
+        }
+    }
+    store.node(owner, path, h).map_err(StepError::Store)
 }
 
 /// A position to diff: the new state's reference there, and the held
@@ -803,6 +852,24 @@ struct Ctx<'a> {
     old_root: B256,
     prefix: Option<&'a Nibbles>,
     roots: Option<&'a mut RootIndex>,
+    /// Where old nodes the local runs lack come from.
+    old: OldSide<'a>,
+}
+
+/// Where a step's old side comes from when the base is not on disk: peers
+/// at the old root while it is in their window, then the base's runs in
+/// the bucket. Neither (the default) means the local runs hold the whole
+/// held state, and an old node they lack is diffed as absent.
+#[derive(Default)]
+pub struct OldSide<'a> {
+    pub peers: bool,
+    pub remote: Option<&'a mut crate::remote::RemoteBase>,
+}
+
+impl OldSide<'_> {
+    fn any(&self) -> bool {
+        self.peers || self.remote.is_some()
+    }
 }
 
 impl Ctx<'_> {
@@ -847,17 +914,28 @@ impl Ctx<'_> {
     }
 
     /// The new node `rlp` at `p`, diffed against the held state's.
-    fn open(&mut self, p: &Pos, rlp: &[u8], st: &mut StepStats) -> Result<Opened, StepError> {
+    fn open(
+        &mut self,
+        db: &NodeDb,
+        p: &Pos,
+        rlp: &[u8],
+        st: &mut StepStats,
+    ) -> Result<Opened, StepError> {
         let mut out = Opened::default();
+        let remote = self.old.any();
         let old_rlp: Option<Bytes> = match &p.old {
             None => None,
             Some(Ref::Inline(b)) => Some(b.clone()),
             Some(Ref::Hash(h)) => {
-                let b = self
-                    .store
-                    .node(p.owner, &p.path, h)
-                    .map_err(StepError::Store)?;
+                let b = old_node(self.store, Some(db), p.owner, &p.path, h)?;
                 if b.is_none() {
+                    if remote {
+                        return Err(StepError::Old(Need {
+                            owner: p.owner,
+                            path: p.path,
+                            hash: *h,
+                        }));
+                    }
                     st.old_missing += 1;
                 }
                 b
@@ -909,7 +987,7 @@ impl Ctx<'_> {
                     Some(Shape::Leaf { key: ok, value: ov }) if *ok == key => {
                         Account::decode(ov).ok()
                     }
-                    _ => old_account(self.store, self.old_root, &key).map_err(StepError::Store)?,
+                    _ => old_account(self.store, Some(db), remote, self.old_root, &key)?,
                 };
                 let old_root = old.map(|a| a.storage_root).unwrap_or(EMPTY_ROOT);
                 if acct.storage_root != EMPTY_ROOT && acct.storage_root != old_root {
@@ -1010,6 +1088,18 @@ struct Item {
     parent: Option<u32>,
 }
 
+/// A node whose opening waits for an old node (a tracker without a local
+/// base): its position, its slot (hashed) or its parent's (inline), its
+/// bytes, and the old node it waits for.
+struct Waiting {
+    pos: Pos,
+    slot: Option<u32>,
+    inline: bool,
+    rlp: Bytes,
+    need: Need,
+    tries: u8,
+}
+
 /// Needs one wave asks for at most.
 const WAVE: usize = 4096;
 const MAX_TRIES: u8 = 4;
@@ -1054,7 +1144,7 @@ async fn sync<S: Source>(
         slot: Option<u32>,
         rlp: &[u8],
     ) -> Result<(), StepError> {
-        let o = cx.open(pos, rlp, st)?;
+        let o = cx.open(db, pos, rlp, st)?;
         for k in o.kids {
             tree.dep(slot);
             stack.push(Item {
@@ -1076,8 +1166,49 @@ async fn sync<S: Source>(
         }
         Ok(())
     }
+    // Open, or wait for the old node it needs. The slot is completed
+    // (hashed) or the parent told (inline) once it opens.
+    #[allow(clippy::too_many_arguments)]
+    fn open_or_wait(
+        cx: &mut Ctx<'_>,
+        db: &mut NodeDb,
+        tree: &mut Tree,
+        stack: &mut Vec<Item>,
+        codes: &mut HashMap<B256, (Vec<u32>, u8)>,
+        st: &mut StepStats,
+        waiting: &mut Vec<Waiting>,
+        pos: &Pos,
+        slot: Option<u32>,
+        inline: bool,
+        rlp: &Bytes,
+        tries: u8,
+    ) -> Result<(), StepError> {
+        match open_slot(cx, db, tree, stack, codes, st, pos, slot, rlp) {
+            Ok(()) => {
+                if inline {
+                    tree.child_done(db, slot);
+                } else {
+                    tree.opened(db, slot.expect("a hashed node has a slot"));
+                }
+                Ok(())
+            }
+            Err(StepError::Old(need)) => {
+                waiting.push(Waiting {
+                    pos: pos.clone(),
+                    slot,
+                    inline,
+                    rlp: rlp.clone(),
+                    need,
+                    tries,
+                });
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+    let mut waiting: Vec<Waiting> = Vec::new();
     loop {
-        while fetch.len() < WAVE {
+        while fetch.len() + waiting.len() < WAVE {
             let Some(it) = stack.pop() else { break };
             steps += 1;
             if steps % 65_536 == 0 && Instant::now() > deadline {
@@ -1091,10 +1222,20 @@ async fn sync<S: Source>(
             match &p.new {
                 Ref::Inline(b) => {
                     let b = b.clone();
-                    open_slot(
-                        cx, db, &mut tree, &mut stack, &mut codes, st, p, it.parent, &b,
+                    open_or_wait(
+                        cx,
+                        db,
+                        &mut tree,
+                        &mut stack,
+                        &mut codes,
+                        st,
+                        &mut waiting,
+                        p,
+                        it.parent,
+                        true,
+                        &b,
+                        0,
                     )?;
-                    tree.child_done(db, it.parent);
                 }
                 Ref::Hash(h) => {
                     let key = done_key(&p.owner, &p.path, h);
@@ -1107,25 +1248,27 @@ async fn sync<S: Source>(
                     match cx.local(db, p, h)? {
                         Some(b) => {
                             st.local += 1;
-                            open_slot(
+                            open_or_wait(
                                 cx,
                                 db,
                                 &mut tree,
                                 &mut stack,
                                 &mut codes,
                                 st,
+                                &mut waiting,
                                 p,
                                 Some(slot),
+                                false,
                                 &b,
+                                0,
                             )?;
-                            tree.opened(db, slot);
                         }
                         None => fetch.push((it.pos, slot, 0)),
                     }
                 }
             }
         }
-        if fetch.is_empty() && codes.is_empty() {
+        if fetch.is_empty() && codes.is_empty() && waiting.is_empty() {
             break;
         }
         if Instant::now() > deadline {
@@ -1160,26 +1303,90 @@ async fn sync<S: Source>(
                 db.put(h, &c).map_err(StepError::Store)?;
             }
         }
+        // The old side, in the same wave: peers at the old root while it is
+        // in their window, then the base in the bucket.
+        if !waiting.is_empty() {
+            let mut olds: Vec<Need> = Vec::new();
+            let mut seen: HashSet<B256> = HashSet::new();
+            for w in &waiting {
+                if seen.insert(w.need.hash)
+                    && !db.contains(&w.need.hash).map_err(StepError::Store)?
+                {
+                    olds.push(w.need.clone());
+                }
+            }
+            st.old_asked += olds.len() as u64;
+            let mut got: HashMap<usize, Bytes> = HashMap::new();
+            if cx.old.peers && !olds.is_empty() {
+                got = src.nodes(cx.old_root, &olds, deadline).await;
+                st.old_peers += got.len() as u64;
+            }
+            if let Some(rb) = cx.old.remote.as_mut() {
+                let rest: Vec<usize> = (0..olds.len()).filter(|i| !got.contains_key(i)).collect();
+                if !rest.is_empty() {
+                    let sub: Vec<Need> = rest.iter().map(|&i| olds[i].clone()).collect();
+                    let from = rb.nodes(&sub).await.map_err(StepError::Store)?;
+                    st.old_bucket += from.len() as u64;
+                    for (j, b) in from {
+                        got.insert(rest[j], b);
+                    }
+                }
+            }
+            for (i, b) in got {
+                db.put(olds[i].hash, &b).map_err(StepError::Store)?;
+            }
+        }
         let mut unresolved = (0usize, 0usize);
         for (p, slot, tries) in std::mem::take(&mut fetch) {
             let Ref::Hash(h) = p.new else { unreachable!() };
             match db.get(&h).map_err(StepError::Store)? {
                 Some(b) => {
-                    open_slot(
+                    open_or_wait(
                         cx,
                         db,
                         &mut tree,
                         &mut stack,
                         &mut codes,
                         st,
+                        &mut waiting,
                         &p,
                         Some(slot),
+                        false,
                         &b,
+                        0,
                     )?;
-                    tree.opened(db, slot);
                 }
                 None if tries + 1 >= MAX_TRIES => unresolved.0 += 1,
                 None => fetch.push((p, slot, tries + 1)),
+            }
+        }
+        // Retry what waited; a node that waits for the same old node again
+        // counts a try (an account walk may wait for several in turn).
+        for w in std::mem::take(&mut waiting) {
+            let before = waiting.len();
+            open_or_wait(
+                cx,
+                db,
+                &mut tree,
+                &mut stack,
+                &mut codes,
+                st,
+                &mut waiting,
+                &w.pos,
+                w.slot,
+                w.inline,
+                &w.rlp,
+                0,
+            )?;
+            if waiting.len() > before {
+                let again = waiting.last_mut().expect("just pushed");
+                if again.need.hash == w.need.hash {
+                    again.tries = w.tries + 1;
+                    if again.tries >= MAX_TRIES {
+                        waiting.pop();
+                        unresolved.0 += 1;
+                    }
+                }
             }
         }
         for (h, (slots, tries)) in std::mem::take(&mut codes) {
@@ -1262,7 +1469,12 @@ fn materialize(
                 b
             }
         };
-        let o = cx.open(&p, &rlp, st)?;
+        // Every old node the sync needed is on disk; one that is not means
+        // the markers lied, as for a missing new node.
+        let o = cx.open(db, &p, &rlp, st).map_err(|e| match e {
+            StepError::Old(_) => StepError::Missing,
+            e => e,
+        })?;
         if o.storage {
             st.storage_tries += 1;
         }
@@ -1317,6 +1529,7 @@ pub async fn track_step<S: Source>(
     sort_dir: &Path,
     sort_budget: u64,
     roots: Option<&mut RootIndex>,
+    old: OldSide<'_>,
 ) -> Result<Tracked, StepError> {
     let lookups0 = store.lookups;
     let mut st = StepStats::default();
@@ -1325,6 +1538,7 @@ pub async fn track_step<S: Source>(
         old_root,
         prefix,
         roots,
+        old,
     };
     let t0 = Instant::now();
     sync(src, &mut cx, db, new_root, deadline, &mut st).await?;
@@ -1337,6 +1551,7 @@ pub async fn track_step<S: Source>(
         st.done_skips,
         st.levels,
         st.old_missing,
+        (st.old_asked, st.old_peers, st.old_bucket),
     );
     let mut sm = StepStats::default();
     let r = materialize(
@@ -1354,6 +1569,7 @@ pub async fn track_step<S: Source>(
             (s.asked, s.fetched, s.local, s.done_skips, s.levels) =
                 (fetched.0, fetched.1, fetched.2, fetched.3, fetched.4);
             s.old_missing += fetched.5;
+            (s.old_asked, s.old_peers, s.old_bucket) = fetched.6;
             s.sync_s = st.sync_s;
             s.materialize_s = t1.elapsed().as_secs_f64();
             s.local_lookups = cx.store.lookups - lookups0;
@@ -1646,6 +1862,15 @@ pub struct Args {
     /// the account table).
     #[arg(long)]
     pub no_root_index: bool,
+    /// Read the base's runs by range from here instead of keeping them
+    /// under `--root`: the bucket's prefix over HTTPS (e.g.
+    /// `https://storage.googleapis.com/csl-eth-demo/full/`) or a
+    /// directory. The root then holds the base's manifest (fetched from
+    /// here when missing), the layers and the head files. A step's old
+    /// side comes from peers at the old root while it is in their window,
+    /// and from here after a gap. There is no storage-root index then.
+    #[arg(long)]
+    pub base_url: Option<String>,
     /// Stop after this many published steps (0: never).
     #[arg(long, default_value_t = 0)]
     pub steps: u64,
@@ -1911,7 +2136,7 @@ impl Tracker {
         self.st.steps += 1;
         let collected = self.collect(&manifest)?;
         self.st.save(&self.state_path)?;
-        self.store = Store::open(&self.root, &manifest)?;
+        self.store = Store::open_with(&self.root, &manifest, self.args.base_url.is_none())?;
         Ok(json!({
             "merges": merges, "runs": self.store.run_counts(), "check": check, "sent": sent,
             "collected": collected, "build_s": built_s, "publish_s": t1.elapsed().as_secs_f64(),
@@ -2105,6 +2330,23 @@ pub async fn run(args: Args) -> Result<(), String> {
     fs::create_dir_all(&args.work).map_err(|e| e.to_string())?;
     let state_path = args.work.join("track.json");
     let root = args.root.clone();
+    let ranges: Option<Arc<dyn crate::remote::RangeGet>> = args.base_url.as_ref().map(|u| {
+        if u.starts_with("http://") || u.starts_with("https://") {
+            Arc::new(crate::remote::HttpRanges::new(u)) as Arc<dyn crate::remote::RangeGet>
+        } else {
+            Arc::new(crate::remote::DirRanges(PathBuf::from(u)))
+        }
+    });
+    // Without a local base, its manifest comes from the bucket once.
+    if let (Some(g), Some(b)) = (&ranges, args.base) {
+        let p = root.join(manifest_path(&b));
+        if !p.exists() {
+            let bytes = g.file(&manifest_path(&b))?;
+            Manifest::from_json(&bytes).map_err(|e| format!("base manifest: {e}"))?;
+            fs::create_dir_all(p.parent().expect("dir")).map_err(|e| e.to_string())?;
+            write_atomic(&p, &bytes)?;
+        }
+    }
     let st = match TrackState::load(&state_path)? {
         Some(st) => {
             if args.base.is_some_and(|b| b != st.base) {
@@ -2184,7 +2426,11 @@ pub async fn run(args: Args) -> Result<(), String> {
             )
             .map_err(|e| e.to_string())?
         };
-        (Store::open(&root, &m)?, m)
+        (Store::open_with(&root, &m, ranges.is_none())?, m)
+    };
+    let mut remote = match &ranges {
+        Some(g) => Some(crate::remote::RemoteBase::new(g.clone(), &base)?),
+        None => None,
     };
     let mut h = Tracker {
         args: args.clone(),
@@ -2209,7 +2455,7 @@ pub async fn run(args: Args) -> Result<(), String> {
     // Fetched nodes, against the held state: kept across re-pivots and
     // restarts, emptied when a step commits.
     let mut db = NodeDb::open(&args.work.join("nodes"), h.st.head.state_root)?;
-    let mut roots = if args.no_root_index {
+    let mut roots = if args.no_root_index || remote.is_some() {
         None
     } else {
         if !args.work.join("roots.idx").exists() {
@@ -2312,6 +2558,12 @@ pub async fn run(args: Args) -> Result<(), String> {
             &args.work.join("sort"),
             args.sort_mib << 20,
             roots.as_mut(),
+            OldSide {
+                // The held head is in the peers' window (with a minute to
+                // spare): ask them for the old side first.
+                peers: remote.is_some() && window_secs(h.st.head.timestamp) >= 60,
+                remote: remote.as_mut(),
+            },
         )
         .await;
         let step_s = t0.elapsed().as_secs_f64();
@@ -2624,6 +2876,8 @@ mod tests {
         stor: HashMap<[u8; 32], Vec<u8>>,
         code: HashMap<B256, Vec<u8>>,
         budget: usize,
+        /// An older root the peers still serve (the old side).
+        older: Option<Box<Mem>>,
     }
 
     impl Mem {
@@ -2634,7 +2888,18 @@ mod tests {
                 stor: r.storage.into_iter().collect(),
                 code: code_of(s),
                 budget: usize::MAX,
+                older: None,
             }
+        }
+
+        fn get(&self, n: &Need) -> Option<&Vec<u8>> {
+            let nk = NodeKey::prefix(&n.path, n.path.len());
+            let b = match n.owner {
+                None => self.acct.get(&nk.table_key().unwrap()),
+                Some(o) => self.stor.get(&nk.storage_table_key(&o).unwrap()),
+            };
+            b.filter(|b| keccak256(b) == n.hash)
+                .or_else(|| self.older.as_ref().and_then(|m| m.get(n)))
         }
     }
 
@@ -2645,12 +2910,7 @@ mod tests {
                 if self.budget == 0 {
                     break;
                 }
-                let nk = NodeKey::prefix(&n.path, n.path.len());
-                let b = match n.owner {
-                    None => self.acct.get(&nk.table_key().unwrap()),
-                    Some(o) => self.stor.get(&nk.storage_table_key(&o).unwrap()),
-                };
-                if let Some(b) = b.filter(|b| keccak256(b) == n.hash) {
+                if let Some(b) = self.get(n) {
                     out.insert(i, Bytes::from(b.clone()));
                     self.budget -= 1;
                 }
@@ -2745,7 +3005,165 @@ mod tests {
         )
         .unwrap();
         read_back(dir, to, h).unwrap();
-        (Store::open(dir, &m).unwrap(), m)
+        // A tracker without a local base keeps only the layers.
+        let local = m
+            .runs(TABLE_ACCOUNT_NODES)
+            .first()
+            .is_some_and(|at| dir.join(&at.path).exists());
+        (Store::open_with(dir, &m, local).unwrap(), m)
+    }
+
+    /// Without the base on disk: across a gap the old side comes from the
+    /// base's runs by range (a directory standing in for the bucket); in
+    /// the window, from peers at the old root. The layers are what a
+    /// tracker with the base on disk writes, and read back without it.
+    #[tokio::test]
+    async fn tracks_without_a_local_base() {
+        use crate::remote::{DirRanges, RemoteBase};
+        let s = states();
+        let heads: Vec<Head> = s
+            .iter()
+            .enumerate()
+            .map(|(i, x)| head_of(x, i as u64))
+            .collect();
+        let bucket = scratch("bucket");
+        let base = produce(&bucket, &heads[0], "", leaves(&s[0]), &code_of(&s[0]))
+            .unwrap()
+            .manifest;
+        let root = scratch("diskless");
+        let mp = manifest_path(&base.block_hash);
+        fs::create_dir_all(root.join(&mp).parent().unwrap()).unwrap();
+        fs::copy(bucket.join(&mp), root.join(&mp)).unwrap();
+        fs::create_dir_all(root.join("runs")).unwrap();
+        let mut store = Store::open_with(&root, &base, false).unwrap();
+        assert_eq!(store.run_counts(), [0, 0, 0]);
+        let mut rb = RemoteBase::new(Arc::new(DirRanges(bucket.clone())), &base).unwrap();
+        let mut db = NodeDb::open(&root.join("nodes"), heads[0].state_root).unwrap();
+        let mut layers = Vec::new();
+        // The same steps with the base on disk, for comparison.
+        let local = scratch("local");
+        let lbase = produce(&local, &heads[0], "", leaves(&s[0]), &code_of(&s[0]))
+            .unwrap()
+            .manifest;
+        let mut lstore = Store::open(&local, &lbase).unwrap();
+        let mut ldb = NodeDb::open(&local.join("nodes"), heads[0].state_root).unwrap();
+        let mut llayers = Vec::new();
+        for i in 1..=2 {
+            let mut lh = step(
+                &mut Mem::of(&s[i], &heads[i]),
+                &mut lstore,
+                &mut ldb,
+                &heads[i - 1],
+                &heads[i],
+                &local,
+                64 << 20,
+            )
+            .await
+            .unwrap();
+            let lgot = lh.rows.collect();
+            (lstore, _) = commit(
+                &local,
+                &lbase,
+                &mut llayers,
+                &heads[i - 1],
+                &heads[i],
+                &mut lh,
+                4,
+                3,
+            );
+            ldb.reset(heads[i].state_root).unwrap();
+            let mut src = Mem::of(&s[i], &heads[i]);
+            // Step 1 crosses a gap: no peer has S0. Step 2 is in the window.
+            let peers = i == 2;
+            if peers {
+                src.older = Some(Box::new(Mem::of(&s[i - 1], &heads[i - 1])));
+            }
+            let before = rb.requests;
+            let mut h = track_step(
+                &mut src,
+                &mut store,
+                &mut db,
+                heads[i - 1].state_root,
+                heads[i].state_root,
+                None,
+                10_000,
+                far(),
+                &root.join("sort"),
+                64 << 20,
+                None,
+                OldSide {
+                    peers,
+                    remote: Some(&mut rb),
+                },
+            )
+            .await
+            .unwrap();
+            eprintln!(
+                "diskless step {i}: {:?}, bucket {} requests",
+                h.stats, rb.requests
+            );
+            if peers {
+                assert!(h.stats.old_peers > 0);
+                assert_eq!(rb.requests, before, "peers served the old side");
+            } else {
+                assert!(h.stats.old_bucket > 0 && rb.requests > before);
+            }
+            assert_eq!(h.stats.old_missing, 0);
+            let want = LayerRows::diff(&rows(&s[i - 1], &heads[i - 1]), &rows(&s[i], &heads[i]));
+            let r = rows(&s[i], &heads[i]);
+            let acct: HashMap<_, _> = r.account.iter().cloned().collect();
+            let stor: HashMap<_, _> = r.storage.iter().cloned().collect();
+            let code = code_of(&s[i]);
+            let got = h.rows.collect();
+            assert_eq!(got.account, lgot.account, "account rows as with the base");
+            assert_eq!(got.storage, lgot.storage, "storage rows as with the base");
+            assert!(want
+                .account
+                .iter()
+                .all(|(k, v)| got.account.get(k) == Some(v)));
+            assert!(want
+                .storage
+                .iter()
+                .all(|(k, v)| got.storage.get(k) == Some(v)));
+            assert!(got.account.iter().all(|(k, v)| acct.get(k) == Some(v)));
+            assert!(got.storage.iter().all(|(k, v)| stor.get(k) == Some(v)));
+            // Code the base holds may be written again (the tracker cannot
+            // see the base's code table); nothing else.
+            assert!(want.code.keys().all(|k| got.code.contains_key(k)));
+            assert!(got.code.keys().all(|k| code.contains_key(&B256::from(*k))));
+            let m;
+            (store, m) = commit(
+                &root,
+                &base,
+                &mut layers,
+                &heads[i - 1],
+                &heads[i],
+                &mut h,
+                4,
+                3,
+            );
+            assert_eq!(store.run_counts()[0], m.runs(TABLE_ACCOUNT_NODES).len() - 1);
+            db.reset(heads[i].state_root).unwrap();
+        }
+        // With the base back in place (its runs and blobs) every key
+        // reads as S2.
+        fn put_back(from: &Path, to: &Path) {
+            for e in fs::read_dir(from).unwrap().flatten() {
+                let t = to.join(e.file_name());
+                if e.file_type().unwrap().is_dir() {
+                    fs::create_dir_all(&t).unwrap();
+                    put_back(&e.path(), &t);
+                } else if !t.exists() {
+                    fs::copy(e.path(), &t).unwrap();
+                }
+            }
+        }
+        put_back(&bucket, &root);
+        let all: Vec<B256> = s.iter().flat_map(|x| x.keys().copied()).collect();
+        reads_as(&root, &s[2], &all, &heads[2]);
+        fs::remove_dir_all(&local).ok();
+        fs::remove_dir_all(&bucket).ok();
+        fs::remove_dir_all(&root).ok();
     }
 
     async fn step(
@@ -2769,6 +3187,7 @@ mod tests {
             &dir.join("sort"),
             budget,
             None,
+            OldSide::default(),
         )
         .await
     }
@@ -3218,6 +3637,7 @@ mod tests {
                 &dir.join("sort"),
                 64 << 20,
                 ix.as_mut(),
+                OldSide::default(),
             )
             .await
             .unwrap();

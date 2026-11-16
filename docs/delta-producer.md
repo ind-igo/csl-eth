@@ -103,9 +103,20 @@ On Sepolia, which has access lists today, option 3 can be prototyped by replayin
 
 **The storage-root → owner index.** When an account appears with a storage root that another owner already holds, the tracker copies that trie locally under the new owner instead of fetching it from peers. The index (`work/roots.idx`, sorted 40-byte records, plus an append log) is built once from the held manifest's account runs, and each committed step appends its new tries. A copy is verified against the root before it is used, and an index entry that has gone stale only means a fetch.
 
+**Without a local base** (`--base-url`). The tracker can run with no copy of the base: the root holds the base's manifest, the layers and the head files, and the base's runs stay in the bucket. A diff still needs the old side, the held state's node at each changed position. The tracker takes it from the node log or the local layers when it can. Otherwise the node waits, and its old node is asked for in the same wave as the new side's nodes:
+
+- **In the window** (the held head is under about 128 blocks old), from peers at the old root. This is what the probe did on every step: about twice the requests, 6.7 s p50 a block with six or more peers. Nodes changed recently are in the local layers and cost nothing.
+- **After a gap**, from the base's runs in the bucket by HTTP range, many requests in flight and each page fetched once per batch. No peer serves a root that old.
+
+Every old node is checked against the hash its parent committed to, so wrong bytes from a peer or the bucket cost a request, never a wrong layer. The rows are the same as with the base on disk (`tracks_without_a_local_base`), and read-back works without it. There is no storage-root index in this mode (a shared storage trie is fetched from peers), and code the base already holds may be written again when an account takes it, which is harmless. From the Mac through the VPN, the real `full/` base answered its first three levels of the account trie (273 nodes) by range in about 63 s and 814 requests, cold. From a VM in the bucket's region, latency should be one to two orders of magnitude lower; measuring it is part of the deploy.
+
+Cost of a gap, estimated: a day's diff is about 7.5 M new nodes, so about as many old-side lookups. At about 1.2 range requests a lookup once model pages are cached, that is about 9 M Class B operations, about $3.60 per day of gap. GCS to a VM in the same region moves no billable egress. Time is set by the peers' side (about 3,000 nodes/s with a few peers, so about 45 minutes a day of gap) as long as the bucket keeps up: at 128 in flight and 30 ms each, about 4,000 lookups/s.
+
+**Disk without the base.** What stays local is the layers and scratch: the since-base layer S twice while it merges (every 256 blocks at the defaults), the lower tiers (under a gigabyte), and during a catch-up the node log (new and old nodes, about 4.6 GB per day of gap) and the sort spill (about 2.3 GB per day of gap). S grows with the base's age: about 2.3 GB a day after the base, 11 GB at a week, 34 GB at a month (from the probe's growth of about blocks^0.79). A 100 GB disk runs a month without rebasing; a rebase (a new base from the base and S, a 344 GiB rewrite) is not built, and would run as a burst with a large disk.
+
 **Not built, against the plan above:**
 
-- The sharded base and base compaction.
+- The sharded base and base compaction (rebasing onto a newer block).
 - Size-triggered tiers. Tiers are count-triggered (`--fanout` per tier, `--tiers` levels, the top tier one layer since the base), and compaction runs inside the step.
 - Access lists.
 
@@ -140,7 +151,7 @@ On mainnet the hint sizes decide which tiers are hinted. A block changes about a
 - **Checks.** Each step read its changed accounts back through the client before publishing, and the fourth merged a tier.
 - **Completeness.** `tracked_dir_is_complete` (ignored test, `crates/snap/src/track.rs`) then read every account of the slice from the published directory at block 26,428,391: 105,253 unchanged, 9 changed, 29,355 slots, 2,218 codes, none insufficient.
 
-**What remains before `full/`.** The three gaps the first run left (the finalized tier, catch-up from a stale base, the read-cost trade) are closed above. What is left is running it: a VM with the base on local disk, a public IP for inbound peers, and a sustained run to measure the peer window and catch-up rate from a multi-day-old base.
+**What remains before `full/`.** The three gaps the first run left (the finalized tier, catch-up from a stale base, the read-cost trade) are closed above. What is left is running it: a small VM without the base (§ Without a local base), a public IP for inbound peers, and a sustained run to measure the peer window, the bucket's range-read rate from the VM, and the catch-up rate from a multi-day-old base.
 
 ## Review: what was set aside
 

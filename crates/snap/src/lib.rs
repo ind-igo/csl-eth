@@ -27,6 +27,7 @@ pub mod track;
 pub mod history;
 pub mod peer;
 pub mod produce;
+pub mod remote;
 pub mod slice;
 pub mod workload;
 

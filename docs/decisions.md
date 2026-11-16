@@ -497,5 +497,7 @@ Later the same day: at MTU 1,420 the path carried 1,420-byte packets to Google c
 
 **Since.** The finalized tier, catch-up from any gap (fetched nodes on disk), per-layer skip hints and the storage-root → owner index are built (see `docs/delta-producer.md` § Built). Hints are unauthenticated and only schedule: a read that skipped a run asks every run before it can be `Insufficient`.
 
-**Open.** Base sharding and compaction; size-triggered tiers; whether a few-read client should skip hint files.
+**Without a local base.** Decided on 2026-11-17: the tracker runs without the 344 GiB base. In the window it asks peers for the old side at the parent root, as the probe did; after a gap it reads the base's runs from the bucket by range, about $3.60 per day of gap. It needs a small spot VM with about 100 GB of disk instead of 500 GiB of pd-balanced, which was most of the $75 a month planned. Old nodes are checked by hash like new ones, so neither source can make a layer wrong.
+
+**Open.** Base sharding and compaction (a rebase, which without a local base needs a burst); size-triggered tiers; whether a few-read client should skip hint files.
 
