@@ -176,6 +176,37 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         timeout_secs: u64,
     },
+    /// Measure state healing over snap/1 `GetTrieNodes`: each cycle diff
+    /// the trie between two recent roots from peers, and ask each peer how
+    /// old a root it still serves. JSON lines to `--out`.
+    HealProbe {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 12)]
+        peers: usize,
+        /// Seconds between cycles (384: one epoch).
+        #[arg(long, default_value_t = 384)]
+        every_secs: u64,
+        /// Stop after this many diffs (0: never).
+        #[arg(long, default_value_t = 0)]
+        cycles: usize,
+        /// Stop after this many seconds (0: never).
+        #[arg(long, default_value_t = 0)]
+        max_secs: u64,
+        /// Paths per request.
+        #[arg(long, default_value_t = 384)]
+        batch: usize,
+        /// Diff only the account trie under this hex prefix.
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long, default_value_t = 15)]
+        timeout_secs: u64,
+        #[arg(long, default_value_t = 30303)]
+        udp_port: u16,
+        /// Give up on one diff after this many seconds.
+        #[arg(long, default_value_t = 1200)]
+        max_cycle_secs: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -555,6 +586,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             summary["chain"] = serde_json::json!(net.name());
             summary["dial_errors"] = serde_json::json!(probed.dial_errors);
             println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        Cmd::HealProbe {
+            out,
+            peers,
+            every_secs,
+            cycles,
+            max_secs,
+            batch,
+            prefix,
+            timeout_secs,
+            udp_port,
+            max_cycle_secs,
+        } => {
+            let prefix = match prefix {
+                Some(p) => Some(Nibbles::from_nibbles(
+                    p.chars().map(|c| c.to_digit(16).map(|d| d as u8).ok_or("prefix: hex nibbles")).collect::<Result<Vec<u8>, _>>()?,
+                )),
+                None => None,
+            };
+            let cfg = csl_eth_snap::heal::Config {
+                peers,
+                udp_port,
+                timeout: Duration::from_secs(timeout_secs),
+                every: Duration::from_secs(every_secs),
+                cycles,
+                max_wall: Duration::from_secs(max_secs),
+                batch,
+                prefix,
+                max_cycle: Duration::from_secs(max_cycle_secs),
+                out,
+                ..Default::default()
+            };
+            csl_eth_snap::heal::run(cfg).await?;
         }
     }
     Ok(())

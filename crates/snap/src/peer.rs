@@ -188,7 +188,31 @@ pub struct Peer {
     next_id: u64,
     /// Bytes received in snap and header responses.
     pub bytes_in: u64,
+    /// The last snap/1 `TrieNodes` frame, held for [`Peer::trie_nodes`].
+    trie_reply: Option<TrieNodesMessage>,
 }
+
+/// snap/1 `GetTrieNodes` (0x06): nodes by path at `root`. Each path set is
+/// either `[compact(path)]` in the account trie or
+/// `[account_hash, compact(path)...]` in that account's storage trie.
+#[derive(Debug, Clone, PartialEq, Eq, alloy_rlp::RlpEncodable, alloy_rlp::RlpDecodable)]
+pub struct GetTrieNodesMessage {
+    pub request_id: u64,
+    pub root: B256,
+    pub paths: Vec<Vec<Bytes>>,
+    pub bytes: u64,
+}
+
+/// snap/1 `TrieNodes` (0x07): the nodes in request order, cut short at the
+/// byte limit; a path the peer cannot resolve comes back empty or not at all.
+#[derive(Debug, Clone, PartialEq, Eq, alloy_rlp::RlpEncodable, alloy_rlp::RlpDecodable)]
+pub struct TrieNodesMessage {
+    pub request_id: u64,
+    pub nodes: Vec<Bytes>,
+}
+
+const GET_TRIE_NODES: u8 = 0x06;
+const TRIE_NODES: u8 = 0x07;
 
 enum Inbound {
     Eth(EthMessage<EthNetworkPrimitives>),
@@ -221,7 +245,20 @@ impl Peer {
         timeout_each: Duration,
         require_snap: bool,
     ) -> Result<Peer, PeerError> {
-        Peer::connect_with(net, record, key, status, fork_filter, timeout_each, require_snap, false).await
+        Peer::connect_with(net, record, key, status, fork_filter, timeout_each, require_snap, false, false).await
+    }
+
+    /// A mainnet connection offering `snap/1` only, for its trie-node
+    /// messages (snap/2 drops them for block access lists): a peer without
+    /// `snap/1` fails with [`PeerError::NoSnap`].
+    pub async fn connect_snap1(
+        record: NodeRecord,
+        key: &SecretKey,
+        status: UnifiedStatus,
+        fork_filter: ForkFilter,
+        timeout_each: Duration,
+    ) -> Result<Peer, PeerError> {
+        Peer::connect_with(Net::Mainnet, record, key, status, fork_filter, timeout_each, true, false, true).await
     }
 
     /// A mainnet connection for history: `eth/68`, `eth/69` and `eth/70`
@@ -235,7 +272,7 @@ impl Peer {
         fork_filter: ForkFilter,
         timeout_each: Duration,
     ) -> Result<Peer, PeerError> {
-        Peer::connect_with(Net::Mainnet, record, key, status, fork_filter, timeout_each, false, true).await
+        Peer::connect_with(Net::Mainnet, record, key, status, fork_filter, timeout_each, false, true, false).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -248,6 +285,7 @@ impl Peer {
         timeout_each: Duration,
         require_snap: bool,
         eth70: bool,
+        snap1_only: bool,
     ) -> Result<Peer, PeerError> {
         let addr = SocketAddr::new(record.address, record.tcp_port);
         let tcp = timeout(timeout_each, TcpStream::connect(addr)).await.map_err(|_| PeerError::Timeout)??;
@@ -261,7 +299,9 @@ impl Peer {
         if net.offers_eth71() {
             hello = hello.protocol(Protocol::eth(EthVersion::Eth71));
         }
-        let hello = hello.protocol(Protocol::new(Capability::new_static("snap", 1), 8)).protocol(Protocol::snap_2()).client_version(CLIENT_VERSION).build();
+        let hello = hello.protocol(Protocol::new(Capability::new_static("snap", 1), 8));
+        let hello = if snap1_only { hello } else { hello.protocol(Protocol::snap_2()) };
+        let hello = hello.client_version(CLIENT_VERSION).build();
         let (mut conn, their_hello) = timeout(timeout_each, UnauthedP2PStream::new(ecies).handshake(hello)).await.map_err(|_| PeerError::Timeout)??;
         let (eth_version, snap_offset, snap_version) = {
             let caps = conn.shared_capabilities();
@@ -286,6 +326,7 @@ impl Peer {
             timeout: timeout_each,
             next_id: 1,
             bytes_in: 0,
+            trie_reply: None,
         })
     }
 
@@ -586,6 +627,53 @@ impl Peer {
         }
     }
 
+    /// snap/1 `GetTrieNodes` at `root`; the reply's nodes in request order
+    /// (see [`TrieNodesMessage`]). Needs a `snap/1` connection.
+    pub async fn trie_nodes(&mut self, root: B256, paths: Vec<Vec<Bytes>>, bytes: u64) -> Result<Vec<Bytes>, PeerError> {
+        if self.snap_version != 1 {
+            return Err(PeerError::Protocol("trie nodes need snap/1"));
+        }
+        let request_id = self.request_id();
+        let req = GetTrieNodesMessage { request_id, root, paths, bytes };
+        self.send_snap_raw(GET_TRIE_NODES, &alloy_rlp::encode(&req)).await?;
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            match self.next_before(deadline).await? {
+                Inbound::Snap(m) => self.service_snap(m).await?,
+                Inbound::Eth(m) => self.service_eth(m).await?,
+                Inbound::Ignored => {}
+            }
+            if let Some(r) = self.trie_reply.take() {
+                if r.request_id == request_id {
+                    return Ok(r.nodes);
+                }
+            }
+        }
+    }
+
+    /// A snap/1 trie-node frame: hold a reply for [`Peer::trie_nodes`],
+    /// answer a request with no nodes (we hold no state).
+    async fn trie_frame(&mut self, rel: u8, mut body: &[u8]) -> Result<Inbound, PeerError> {
+        use alloy_rlp::Decodable;
+        if rel == TRIE_NODES {
+            if let Ok(m) = TrieNodesMessage::decode(&mut body) {
+                self.trie_reply = Some(m);
+            }
+        } else if let Ok(m) = GetTrieNodesMessage::decode(&mut body) {
+            let empty = TrieNodesMessage { request_id: m.request_id, nodes: vec![] };
+            self.send_snap_raw(TRIE_NODES, &alloy_rlp::encode(&empty)).await?;
+        }
+        Ok(Inbound::Ignored)
+    }
+
+    async fn send_snap_raw(&mut self, rel: u8, rlp: &[u8]) -> Result<(), PeerError> {
+        let mut bytes = Vec::with_capacity(rlp.len() + 1);
+        bytes.push(rel + self.snap_offset);
+        bytes.extend_from_slice(rlp);
+        self.conn.send(bytes::Bytes::from(bytes)).await?;
+        Ok(())
+    }
+
     /// The negotiated `eth` version.
     pub fn eth_version(&self) -> u8 {
         self.eth_version as u8
@@ -604,6 +692,9 @@ impl Peer {
         let id = frame[0];
         if id >= self.snap_offset {
             let rel = id - self.snap_offset;
+            if self.snap_version == 1 && (rel == GET_TRIE_NODES || rel == TRIE_NODES) {
+                return self.trie_frame(rel, &frame[1..]).await;
+            }
             return Ok(match SnapProtocolMessage::decode(rel, &mut &frame[1..]) {
                 Ok(m) => Inbound::Snap(m),
                 Err(_) => Inbound::Ignored,
