@@ -50,8 +50,13 @@ impl HttpRanges {
         } else {
             format!("{base}/")
         };
+        // Keep a connection per request in flight: ureq keeps 3 per host by
+        // default, and a fresh TLS handshake for each of the rest cost
+        // enough CPU on a 2-vCPU VM that peers timed the tracker out.
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .max_idle_connections(256)
+            .max_idle_connections_per_host(256)
             .build()
             .into();
         HttpRanges { base, agent }
