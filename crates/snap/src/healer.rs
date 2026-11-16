@@ -1943,14 +1943,22 @@ mod mainnet {
     #[test]
     #[ignore]
     fn healed_dir_is_complete() {
-        let (Ok(s), Ok(d)) = (std::env::var("CSL_HEAL_SLICE"), std::env::var("CSL_HEAL_DIR")) else { return };
+        let (Ok(s), Ok(d)) = (
+            std::env::var("CSL_HEAL_SLICE"),
+            std::env::var("CSL_HEAL_DIR"),
+        ) else {
+            return;
+        };
         let slice = Slice::read(Path::new(&s)).unwrap();
         let dir = PathBuf::from(d);
         let latest = fs::read_to_string(dir.join(LATEST_FILE)).unwrap();
-        let hash: B256 = format!("0x{}", latest.trim().trim_start_matches("0x")).parse().unwrap();
+        let hash: B256 = format!("0x{}", latest.trim().trim_start_matches("0x"))
+            .parse()
+            .unwrap();
         let m = Manifest::from_json(&fs::read(dir.join(manifest_path(&hash))).unwrap()).unwrap();
         let mut snap = Snapshot::open(DirDriver::new(&dir), Some(hash), m.state_root).unwrap();
-        let (mut same, mut changed, mut gone, mut slots, mut slots_changed, mut codes) = (0, 0, 0, 0, 0, 0);
+        let (mut same, mut changed, mut gone, mut slots, mut slots_changed, mut codes) =
+            (0, 0, 0, 0, 0, 0);
         let mut bad = Vec::new();
         for (k, a) in &slice.accounts {
             let now = match snap.account(k).0 {
@@ -1964,7 +1972,11 @@ mod mainnet {
                     continue;
                 }
             };
-            if now == *a { same += 1 } else { changed += 1 }
+            if now == *a {
+                same += 1
+            } else {
+                changed += 1
+            }
             if let Some(ss) = slice.storage.get(&a.storage_root) {
                 for (h, v) in ss.iter().take(50) {
                     match snap.storage_of(&now, k, h).0 {
