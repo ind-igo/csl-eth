@@ -206,6 +206,10 @@ enum Cmd {
         /// Give up on one diff after this many seconds.
         #[arg(long, default_value_t = 1200)]
         max_cycle_secs: u64,
+        /// Heal every block from its parent, back to back, instead of one
+        /// diff per `--every-secs`.
+        #[arg(long)]
+        per_block: bool,
     },
 }
 
@@ -598,6 +602,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             timeout_secs,
             udp_port,
             max_cycle_secs,
+            per_block,
         } => {
             let prefix = match prefix {
                 Some(p) => Some(Nibbles::from_nibbles(
@@ -615,6 +620,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 batch,
                 prefix,
                 max_cycle: Duration::from_secs(max_cycle_secs),
+                per_block,
                 out,
                 ..Default::default()
             };

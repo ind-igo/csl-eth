@@ -4,6 +4,8 @@
 # delete everything it made.
 #
 #   deploy/gcp/heal-probe.sh up [branch]    # VM + firewall rule, starts on boot
+#   deploy/gcp/heal-probe.sh per-block [h]  # pull, rebuild, heal block by block
+#                                           # for h hours (2), then epochs again
 #   deploy/gcp/heal-probe.sh status         # service state and line counts
 #   deploy/gcp/heal-probe.sh fetch <dir>    # copy the JSON lines here
 #   deploy/gcp/heal-probe.sh down           # delete the VM, its disk, the rule
@@ -64,6 +66,18 @@ EOF
     --network default --tags heal-probe --labels purpose=heal-probe \
     --metadata-from-file startup-script="$startup"
   rm -f "$startup"
+  ;;
+per-block)
+  hours="${2:-2}"
+  g compute ssh "$VM" --zone "$ZONE" --command "set -e
+    cd /opt/csl-eth && sudo git pull -q --ff-only
+    sudo env HOME=/root CARGO_NET_GIT_FETCH_WITH_CLI=true nice /root/.cargo/bin/cargo build -q --release -p csl-eth-snap -j 2
+    sudo systemctl stop heal-probe
+    sudo systemd-run --unit heal-probe-blocks --property=Environment=RUST_LOG=info,discv4=warn,reth_dns_discovery=warn,hickory=warn \
+      --property=ExecStopPost='/bin/systemctl start heal-probe' \
+      /opt/csl-eth/target/release/csl-eth heal-probe --per-block --peers 16 --max-cycle-secs 120 \
+      --out /var/lib/heal-probe/blocks-\$(date +%s).jsonl --max-secs \$(( $hours * 3600 )) --udp-port 30303
+    systemctl is-active heal-probe-blocks"
   ;;
 status)
   g compute instances describe "$VM" --zone "$ZONE" --format='value(status)'

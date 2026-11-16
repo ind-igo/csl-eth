@@ -35,6 +35,7 @@ def main(paths):
                 line = line.strip()
                 if line:
                     evs.append(json.loads(line))
+    evs = [e for e in evs if "t" in e]
     t0 = min(e["t"] for e in evs)
     t1 = max(e["t"] for e in evs)
     out = {"hours": round((t1 - t0) / 3600, 2)}
@@ -142,6 +143,45 @@ def main(paths):
             {"to": e["to"], "unservable_new": e["count"]["unservable_new"], "unservable_old": e["count"]["unservable_old"], "secs": round(e["secs"])}
             for e in incomplete
         ][:20]
+    blocks = [e for e in evs if e["ev"] == "block"]
+    if blocks:
+        single = [e for e in blocks if e["blocks"] == 1 and not e["skip"]]
+        done = [e for e in single if e["count"]["complete"]]
+        heal = [e["heal_s"] for e in done]
+        p = lambda xs, q: round(pct(xs, q), 2) if xs else None
+        out["per_block"] = {
+            "blocks": len(blocks),
+            "single_block_steps": len(single),
+            "complete": len(done),
+            "skips": sum(1 for e in blocks if e["skip"]),
+            "reorgs": sum(1 for e in blocks if e["reorg"]),
+            "span_hours": round((blocks[-1]["t"] - blocks[0]["t"]) / 3600, 2),
+            "heal_s": {"p50": p(heal, 50), "p90": p(heal, 90), "p99": p(heal, 99), "max": round(max(heal), 2) if heal else None},
+            "in_slot": round(sum(1 for e in single if e["count"]["complete"] and e["heal_s"] <= 12) / max(1, len(single)), 3),
+            "known_after_slot_s": {"p50": p([e["known_after_slot_s"] for e in single], 50), "p90": p([e["known_after_slot_s"] for e in single], 90)},
+            "done_after_slot_s": {"p50": p([e["done_after_slot_s"] for e in done], 50), "p90": p([e["done_after_slot_s"] for e in done], 90), "p99": p([e["done_after_slot_s"] for e in done], 99)},
+            "levels": stats([e["count"]["levels"] for e in done]),
+            "requests": stats([e["count"]["requests"] for e in done]),
+            "account_nodes": stats([e["count"]["account"]["nodes"] for e in done]),
+            "storage_nodes": stats([e["count"]["storage"]["nodes"] for e in done]),
+            "new_kib": stats([round((e["count"]["account"]["bytes"] + e["count"]["storage"]["bytes"]) / 1024) for e in done]),
+            "peers_used": stats([e["count"]["peers_used"] for e in done]),
+        }
+        by = defaultdict(list)
+        for e in single:
+            n = e["peers"]
+            b = "1" if n <= 1 else "2" if n == 2 else "3-4" if n <= 4 else "5-8" if n <= 8 else "9+"
+            by[b].append(e)
+        out["per_block"]["by_peers_connected"] = {
+            b: {
+                "steps": len(es),
+                "in_slot": round(sum(1 for e in es if e["count"]["complete"] and e["heal_s"] <= 12) / len(es), 3),
+                "heal_s_p50": p([e["heal_s"] for e in es if e["count"]["complete"]], 50),
+                "heal_s_p90": p([e["heal_s"] for e in es if e["count"]["complete"]], 90),
+                "incomplete": sum(1 for e in es if not e["count"]["complete"]),
+            }
+            for b, es in sorted(by.items())
+        }
     notes = defaultdict(int)
     for e in evs:
         if e["ev"] == "note":

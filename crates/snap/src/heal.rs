@@ -75,6 +75,9 @@ pub struct Config {
     pub ages: Vec<u64>,
     /// Give up on a cycle's diff after this long.
     pub max_cycle: Duration,
+    /// Per-block mode: from the head, heal each block's root from the
+    /// one before as soon as its header is out, back to back.
+    pub per_block: bool,
     pub out: PathBuf,
 }
 
@@ -95,6 +98,7 @@ impl Default for Config {
             prefix: None,
             ages: vec![0, 16, 32, 64, 96, 112, 120, 124, 127, 128, 129, 132, 160, 192, 256, 512, 1024],
             max_cycle: Duration::from_secs(1200),
+            per_block: false,
             out: PathBuf::from("heal-probe.jsonl"),
         }
     }
@@ -181,6 +185,7 @@ enum Job {
 }
 
 struct NodesDone {
+    peer: PeerId,
     got: HashMap<usize, Bytes>,
     failed: bool,
 }
@@ -271,7 +276,7 @@ async fn worker_task(mut peer: Peer, shared: Arc<Shared>, idle_tx: mpsc::Sender<
                             empty_streak = 0;
                             served += 1;
                         }
-                        let _ = reply.send(NodesDone { got, failed: false });
+                        let _ = reply.send(NodesDone { peer: id, got, failed: false });
                         // A peer that has answered nothing for many current
                         // roots in a row frees its slot.
                         if empty_streak >= 6 {
@@ -283,7 +288,7 @@ async fn worker_task(mut peer: Peer, shared: Arc<Shared>, idle_tx: mpsc::Sender<
                             "ev": "req", "peer": id.to_string()[..16], "client": client, "kind": kind, "age": age,
                             "asked": needs.len(), "error": error_kind(&e), "ms": ms,
                         }));
-                        let _ = reply.send(NodesDone { got: HashMap::new(), failed: true });
+                        let _ = reply.send(NodesDone { peer: id, got: HashMap::new(), failed: true });
                         if !matches!(e, PeerError::Timeout) {
                             break 'life error_kind(&e);
                         }
@@ -380,6 +385,8 @@ struct Pool {
     shared: Arc<Shared>,
     idle_rx: mpsc::Receiver<Worker>,
     idle: Vec<Worker>,
+    /// Peers that returned nodes since [`Fetch::take_used`].
+    used: HashSet<PeerId>,
 }
 
 struct Chunk {
@@ -411,11 +418,18 @@ pub struct FetchStats {
 pub trait Fetch {
     /// The nodes found, per group and need index.
     fn fetch(&mut self, groups: &[Group], batch: usize, attempts: usize, deadline: Instant) -> impl std::future::Future<Output = (Vec<HashMap<usize, Bytes>>, FetchStats)>;
+    /// Distinct peers that served nodes since the last call.
+    fn take_used(&mut self) -> usize {
+        0
+    }
 }
 
 impl Fetch for Pool {
     async fn fetch(&mut self, groups: &[Group], batch: usize, attempts: usize, deadline: Instant) -> (Vec<HashMap<usize, Bytes>>, FetchStats) {
         self.fetch_from_peers(groups, batch, attempts, deadline).await
+    }
+    fn take_used(&mut self) -> usize {
+        std::mem::take(&mut self.used).len()
     }
 }
 
@@ -437,6 +451,15 @@ impl Pool {
             Ok(Some(w)) => Some(w),
             _ => None,
         }
+    }
+
+    /// One peer's answer for the header at `number`, if a peer comes idle
+    /// within `wait`.
+    async fn header_try(&mut self, number: u64, wait: Duration) -> Option<Header> {
+        let w = self.worker(wait).await?;
+        let (tx, rx) = oneshot::channel();
+        w.tx.send(Job::HeaderAt { number, reply: tx }).await.ok()?;
+        rx.await.ok().flatten()
     }
 
     async fn header_at(&mut self, number: u64) -> Option<Header> {
@@ -492,6 +515,10 @@ impl Pool {
         let mut out: Vec<HashMap<usize, Bytes>> = groups.iter().map(|_| HashMap::new()).collect();
         let mut stats = FetchStats::default();
         let mut pending: VecDeque<Chunk> = VecDeque::new();
+        // Spread a small level over the peers: at most `batch` paths a
+        // request, at least 48, about one request per peer.
+        let total: usize = groups.iter().map(|g| g.needs.len()).sum();
+        let batch = total.div_ceil(self.connected().max(1)).clamp(48, batch.max(48));
         for (g, grp) in groups.iter().enumerate() {
             // Keep a storage trie's paths together: one set per owner.
             let mut idx: Vec<usize> = (0..grp.needs.len()).collect();
@@ -542,7 +569,10 @@ impl Pool {
             }
             tokio::select! {
                 Some((c, r)) = inflight.next(), if !inflight.is_empty() => {
-                    let done = r.unwrap_or(NodesDone { got: HashMap::new(), failed: true });
+                    let done = r.unwrap_or(NodesDone { peer: PeerId::ZERO, got: HashMap::new(), failed: true });
+                    if !done.got.is_empty() {
+                        self.used.insert(done.peer);
+                    }
                     if done.failed {
                         stats.failed += 1;
                     }
@@ -691,6 +721,8 @@ pub struct DiffCount {
     /// Needs no peer served: new side, old side.
     pub unservable_new: u64,
     pub unservable_old: u64,
+    /// Distinct peers that served nodes for this diff.
+    pub peers_used: u64,
     pub complete: bool,
 }
 
@@ -701,155 +733,210 @@ fn compatible(prefix: &Option<Nibbles>, owner: &Option<B256>, path: &Nibbles) ->
     }
 }
 
-/// Diff the state trie at `new_root` against `old_root`.
+/// An account whose old leaf is not at its new leaf's path (moved by an
+/// insert beside it, or new): found by walking the old account trie, one
+/// step per wave alongside the diff, mostly through nodes the diff has
+/// already fetched.
+struct OldWalk {
+    hash: B256,
+    acct: Account,
+    path: Nibbles,
+    at: Ref,
+    asked: bool,
+}
+
+enum Step {
+    Wait(OldWalk),
+    Found(OldWalk, Option<Account>),
+    Lost,
+}
+
+/// Advance `w` through the cache as far as it goes.
+fn step(mut w: OldWalk, cache: &HashMap<Nibbles, Bytes>) -> Step {
+    let key = Nibbles::unpack(w.hash);
+    loop {
+        let rlp = match &w.at {
+            Ref::Inline(b) => b.clone(),
+            Ref::Hash(h) => match cache.get(&w.path).filter(|b| keccak256(b) == *h) {
+                Some(b) => b.clone(),
+                None if w.asked => return Step::Lost,
+                None => return Step::Wait(w),
+            },
+        };
+        match shape(&w.path, &rlp) {
+            Ok(Shape::Inner(kids)) => match kids.into_iter().find(|(q, _)| key.starts_with(q)) {
+                Some((q, r)) => {
+                    w.path = q;
+                    w.at = r;
+                    w.asked = false;
+                }
+                None => return Step::Found(w, None),
+            },
+            Ok(Shape::Leaf { key: k, value }) => {
+                let old = if k == key { Account::decode(&value).ok() } else { None };
+                return Step::Found(w, old);
+            }
+            Ok(Shape::Empty) => return Step::Found(w, None),
+            Err(_) => return Step::Lost,
+        }
+    }
+}
+
+/// Diff the state trie at `new_root` against `old_root`, level by level:
+/// each level is one wave of requests (new side and old side together),
+/// so `levels` is the count of dependent round trips.
 async fn diff<F: Fetch>(pool: &mut F, cfg: &Config, old_root: B256, new_root: B256, ages: (i64, i64), deadline: Instant) -> DiffCount {
     let mut count = DiffCount::default();
     let mut per_owner: HashMap<B256, u64> = HashMap::new();
     let mut old_cache: HashMap<Nibbles, Bytes> = HashMap::new();
     let mut frontier = vec![Pair { owner: None, path: Nibbles::default(), new: Ref::Hash(new_root), old: Some(Ref::Hash(old_root)) }];
-    // Accounts whose old leaf is not at the new leaf's path: resolved by a
-    // walk of the old trie once the account trie is done.
-    let mut moved: Vec<(B256, Account)> = Vec::new();
-    loop {
-        while !frontier.is_empty() {
-            if Instant::now() > deadline {
-                return count;
+    let mut walks: Vec<OldWalk> = Vec::new();
+    while !frontier.is_empty() || !walks.is_empty() {
+        if Instant::now() > deadline {
+            return count;
+        }
+        count.levels += 1;
+        frontier.retain(|p| p.old.as_ref() != Some(&p.new));
+        let mut new_needs = Vec::new();
+        let mut old_needs = Vec::new();
+        let mut new_ix = vec![None; frontier.len()];
+        let mut old_ix = vec![None; frontier.len()];
+        let mut old_paths: HashSet<Nibbles> = HashSet::new();
+        for (i, p) in frontier.iter().enumerate() {
+            if let Ref::Hash(h) = p.new {
+                new_ix[i] = Some(new_needs.len());
+                new_needs.push(Need { owner: p.owner, path: p.path, hash: h });
             }
-            count.levels += 1;
-            frontier.retain(|p| p.old.as_ref() != Some(&p.new));
-            let mut new_needs = Vec::new();
-            let mut old_needs = Vec::new();
-            let mut new_ix = vec![None; frontier.len()];
-            let mut old_ix = vec![None; frontier.len()];
-            for (i, p) in frontier.iter().enumerate() {
-                if let Ref::Hash(h) = p.new {
-                    new_ix[i] = Some(new_needs.len());
-                    new_needs.push(Need { owner: p.owner, path: p.path, hash: h });
+            if let Some(Ref::Hash(h)) = p.old {
+                if p.owner.is_none() && old_cache.get(&p.path).is_some_and(|b| keccak256(b) == h) {
+                    continue;
                 }
-                if let Some(Ref::Hash(h)) = p.old {
-                    if p.owner.is_none() && old_cache.get(&p.path).is_some_and(|b| keccak256(b) == h) {
-                        continue;
-                    }
-                    old_ix[i] = Some(old_needs.len());
-                    old_needs.push(Need { owner: p.owner, path: p.path, hash: h });
-                }
-            }
-            let groups = [
-                Group { root: new_root, kind: "new", age: ages.1, needs: new_needs },
-                Group { root: old_root, kind: "old", age: ages.0, needs: old_needs },
-            ];
-            let (got, st) = pool.fetch(&groups, cfg.batch, 4, deadline).await;
-            count.requests += st.requests;
-            count.failed_requests += st.failed;
-            let unservable_new = groups[0].needs.len() - got[0].len();
-            let unservable_old = groups[1].needs.len() - got[1].len();
-            count.unservable_new += unservable_new as u64;
-            count.unservable_old += unservable_old as u64;
-            for (_, b) in got[1].iter() {
-                count.old_nodes += 1;
-                count.old_bytes += b.len() as u64;
-            }
-            let mut next = Vec::new();
-            for (i, p) in frontier.iter().enumerate() {
-                let new_rlp: Bytes = match (&p.new, new_ix[i]) {
-                    (Ref::Inline(b), _) => b.clone(),
-                    (Ref::Hash(_), Some(j)) => match got[0].get(&j) {
-                        Some(b) => b.clone(),
-                        None => continue,
-                    },
-                    _ => continue,
-                };
-                let old_rlp: Option<Bytes> = match (&p.old, old_ix[i]) {
-                    (None, _) => None,
-                    (Some(Ref::Inline(b)), _) => Some(b.clone()),
-                    (Some(Ref::Hash(h)), None) => old_cache.get(&p.path).filter(|b| keccak256(b) == *h).cloned(),
-                    (Some(Ref::Hash(_)), Some(j)) => got[1].get(&j).cloned(),
-                };
                 if p.owner.is_none() {
-                    if let Some(b) = &old_rlp {
-                        old_cache.insert(p.path, b.clone());
+                    old_paths.insert(p.path);
+                }
+                old_ix[i] = Some(old_needs.len());
+                old_needs.push(Need { owner: p.owner, path: p.path, hash: h });
+            }
+        }
+        for w in walks.iter_mut() {
+            if let Ref::Hash(h) = w.at {
+                w.asked = true;
+                if old_paths.insert(w.path) {
+                    old_needs.push(Need { owner: None, path: w.path, hash: h });
+                }
+            }
+        }
+        let groups = [
+            Group { root: new_root, kind: "new", age: ages.1, needs: new_needs },
+            Group { root: old_root, kind: "old", age: ages.0, needs: old_needs },
+        ];
+        let (got, st) = pool.fetch(&groups, cfg.batch, 4, deadline).await;
+        count.requests += st.requests;
+        count.failed_requests += st.failed;
+        count.unservable_new += (groups[0].needs.len() - got[0].len()) as u64;
+        count.unservable_old += (groups[1].needs.len() - got[1].len()) as u64;
+        for (j, b) in got[1].iter() {
+            count.old_nodes += 1;
+            count.old_bytes += b.len() as u64;
+            let n = &groups[1].needs[*j];
+            if n.owner.is_none() {
+                old_cache.insert(n.path, b.clone());
+            }
+        }
+        let mut next = Vec::new();
+        for (i, p) in frontier.iter().enumerate() {
+            let new_rlp: Bytes = match (&p.new, new_ix[i]) {
+                (Ref::Inline(b), _) => b.clone(),
+                (Ref::Hash(_), Some(j)) => match got[0].get(&j) {
+                    Some(b) => b.clone(),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            let old_rlp: Option<Bytes> = match (&p.old, old_ix[i]) {
+                (None, _) => None,
+                (Some(Ref::Inline(b)), _) => Some(b.clone()),
+                (Some(Ref::Hash(h)), None) => old_cache.get(&p.path).filter(|b| keccak256(b) == *h).cloned(),
+                (Some(Ref::Hash(_)), Some(j)) => got[1].get(&j).cloned(),
+            };
+            let trie = if p.owner.is_none() { &mut count.account } else { &mut count.storage };
+            match p.new {
+                Ref::Hash(_) => {
+                    trie.node(p.path.len(), new_rlp.len());
+                    if let Some(o) = p.owner {
+                        *per_owner.entry(o).or_default() += 1;
                     }
                 }
-                let trie = if p.owner.is_none() { &mut count.account } else { &mut count.storage };
-                match p.new {
-                    Ref::Hash(_) => {
-                        trie.node(p.path.len(), new_rlp.len());
-                        if let Some(o) = p.owner {
-                            *per_owner.entry(o).or_default() += 1;
-                        }
-                    }
-                    Ref::Inline(_) => trie.inline += 1,
-                }
-                let Ok(new_shape) = shape(&p.path, &new_rlp) else { continue };
-                let old_shape = old_rlp.as_ref().and_then(|b| shape(&p.path, b).ok());
-                match new_shape {
-                    Shape::Empty => {}
-                    Shape::Inner(kids) => {
-                        let old_kids: HashMap<Nibbles, Ref> = match &old_shape {
-                            Some(Shape::Inner(k)) => k.iter().cloned().collect(),
-                            _ => HashMap::new(),
-                        };
-                        let new_paths: HashSet<Nibbles> = kids.iter().map(|(q, _)| *q).collect();
-                        trie.dropped += old_kids.keys().filter(|q| !new_paths.contains(q)).count() as u64;
-                        for (q, r) in kids {
-                            if !compatible(&cfg.prefix, &p.owner, &q) {
-                                continue;
-                            }
-                            let o = old_kids.get(&q).cloned();
-                            if o.as_ref() == Some(&r) {
-                                continue;
-                            }
-                            next.push(Pair { owner: p.owner, path: q, new: r, old: o });
-                        }
-                    }
-                    Shape::Leaf { key, value } => {
-                        trie.leaves += 1;
-                        if p.owner.is_some() || key.len() != 64 {
+                Ref::Inline(_) => trie.inline += 1,
+            }
+            let Ok(new_shape) = shape(&p.path, &new_rlp) else { continue };
+            let old_shape = old_rlp.as_ref().and_then(|b| shape(&p.path, b).ok());
+            match new_shape {
+                Shape::Empty => {}
+                Shape::Inner(kids) => {
+                    let old_kids: HashMap<Nibbles, Ref> = match &old_shape {
+                        Some(Shape::Inner(k)) => k.iter().cloned().collect(),
+                        _ => HashMap::new(),
+                    };
+                    let new_paths: HashSet<Nibbles> = kids.iter().map(|(q, _)| *q).collect();
+                    trie.dropped += old_kids.keys().filter(|q| !new_paths.contains(q)).count() as u64;
+                    for (q, r) in kids {
+                        if !compatible(&cfg.prefix, &p.owner, &q) {
                             continue;
                         }
-                        let Ok(acct) = Account::decode(&value) else { continue };
-                        let hash = B256::from_slice(&key.pack());
-                        count.accounts_changed += 1;
-                        let old_acct = match &old_shape {
-                            Some(Shape::Leaf { key: ok, value: ov }) if *ok == key => Account::decode(ov).ok(),
-                            _ => {
-                                moved.push((hash, acct));
-                                continue;
+                        let o = old_kids.get(&q).cloned();
+                        if o.as_ref() == Some(&r) {
+                            continue;
+                        }
+                        next.push(Pair { owner: p.owner, path: q, new: r, old: o });
+                    }
+                }
+                Shape::Leaf { key, value } => {
+                    trie.leaves += 1;
+                    if p.owner.is_some() || key.len() != 64 {
+                        continue;
+                    }
+                    let Ok(acct) = Account::decode(&value) else { continue };
+                    let hash = B256::from_slice(&key.pack());
+                    count.accounts_changed += 1;
+                    match &old_shape {
+                        Some(Shape::Leaf { key: ok, value: ov }) if *ok == key => {
+                            if let Some(pair) = storage_pair(hash, &acct, Account::decode(ov).ok().as_ref()) {
+                                count.storage_tries_changed += 1;
+                                next.push(pair);
                             }
-                        };
-                        if let Some(pair) = storage_pair(hash, &acct, old_acct.as_ref()) {
-                            count.storage_tries_changed += 1;
-                            next.push(pair);
+                        }
+                        _ => {
+                            count.accounts_resolved += 1;
+                            walks.push(OldWalk { hash, acct, path: Nibbles::default(), at: Ref::Hash(old_root), asked: false });
                         }
                     }
                 }
             }
-            frontier = next;
         }
-        if moved.is_empty() {
-            break;
-        }
-        // Moved or created accounts: their old leaf, if any, by walking the
-        // old trie from its root.
-        let batch = std::mem::take(&mut moved);
-        count.accounts_resolved += batch.len() as u64;
-        let olds = resolve_accounts(pool, cfg, old_root, ages.0, &batch, &mut old_cache, deadline, &mut count).await;
-        for ((hash, acct), old) in batch.iter().zip(olds) {
-            match old {
-                Resolved::Absent => count.accounts_created += 1,
-                Resolved::Unknown => continue,
-                Resolved::Found(_) => {}
-            }
-            let old = if let Resolved::Found(a) = old { Some(a) } else { None };
-            if let Some(pair) = storage_pair(*hash, acct, old.as_ref()) {
-                count.storage_tries_changed += 1;
-                frontier.push(pair);
+        // Walks: as far as the cache goes; a resolved one opens its
+        // storage diff in the next wave.
+        for w in std::mem::take(&mut walks) {
+            match step(w, &old_cache) {
+                Step::Wait(w) => walks.push(w),
+                Step::Lost => count.unservable_old += 1,
+                Step::Found(w, old) => {
+                    if old.is_none() {
+                        count.accounts_created += 1;
+                    }
+                    if let Some(pair) = storage_pair(w.hash, &w.acct, old.as_ref()) {
+                        count.storage_tries_changed += 1;
+                        next.push(pair);
+                    }
+                }
             }
         }
+        frontier = next;
     }
     let mut top: Vec<(B256, u64)> = per_owner.into_iter().collect();
     top.sort_by(|a, b| b.1.cmp(&a.1));
     count.top_storage = top.into_iter().take(5).map(|(o, n)| (o.to_string(), n)).collect();
+    count.peers_used = pool.take_used() as u64;
     count.complete = count.unservable_new == 0 && count.unservable_old == 0;
     count
 }
@@ -861,78 +948,6 @@ fn storage_pair(owner: B256, new: &Account, old: Option<&Account>) -> Option<Pai
     }
     let old = (old_root != EMPTY_ROOT).then_some(Ref::Hash(old_root));
     Some(Pair { owner: Some(owner), path: Nibbles::default(), new: Ref::Hash(new.storage_root), old })
-}
-
-#[derive(Clone, Copy)]
-enum Resolved {
-    Found(Account),
-    Absent,
-    Unknown,
-}
-
-/// Each account's leaf in the old trie, walked from `old_root` level by
-/// level with the walks batched together.
-#[allow(clippy::too_many_arguments)]
-async fn resolve_accounts<F: Fetch>(
-    pool: &mut F,
-    cfg: &Config,
-    old_root: B256,
-    age: i64,
-    accounts: &[(B256, Account)],
-    cache: &mut HashMap<Nibbles, Bytes>,
-    deadline: Instant,
-    count: &mut DiffCount,
-) -> Vec<Resolved> {
-    let mut out = vec![Resolved::Unknown; accounts.len()];
-    // (account index, path reached, ref at that path)
-    let mut walks: Vec<(usize, Nibbles, Ref)> = (0..accounts.len()).map(|i| (i, Nibbles::default(), Ref::Hash(old_root))).collect();
-    while !walks.is_empty() && Instant::now() < deadline {
-        let mut needs = Vec::new();
-        let mut seen = HashSet::new();
-        for (_, path, r) in &walks {
-            if let Ref::Hash(h) = r {
-                if cache.get(path).map(|b| keccak256(b) == *h) != Some(true) && seen.insert(*path) {
-                    needs.push(Need { owner: None, path: *path, hash: *h });
-                }
-            }
-        }
-        if !needs.is_empty() {
-            let groups = [Group { root: old_root, kind: "old", age, needs }];
-            let (got, st) = pool.fetch(&groups, cfg.batch, 4, deadline).await;
-            count.requests += st.requests;
-            count.failed_requests += st.failed;
-            count.unservable_old += st.unservable;
-            for (i, b) in got[0].iter() {
-                count.old_nodes += 1;
-                count.old_bytes += b.len() as u64;
-                cache.insert(groups[0].needs[*i].path, b.clone());
-            }
-        }
-        let mut next = Vec::new();
-        for (i, path, r) in walks {
-            let key = Nibbles::unpack(accounts[i].0);
-            let rlp = match &r {
-                Ref::Inline(b) => b.clone(),
-                Ref::Hash(h) => match cache.get(&path).filter(|b| keccak256(b) == *h) {
-                    Some(b) => b.clone(),
-                    None => continue,
-                },
-            };
-            match shape(&path, &rlp) {
-                Ok(Shape::Inner(kids)) => match kids.into_iter().find(|(q, _)| key.starts_with(q)) {
-                    Some((q, r)) => next.push((i, q, r)),
-                    None => out[i] = Resolved::Absent,
-                },
-                Ok(Shape::Leaf { key: k, value }) => {
-                    out[i] = if k == key { Account::decode(&value).map(Resolved::Found).unwrap_or(Resolved::Unknown) } else { Resolved::Absent };
-                }
-                Ok(Shape::Empty) => out[i] = Resolved::Absent,
-                Err(_) => {}
-            }
-        }
-        walks = next;
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -972,7 +987,7 @@ pub async fn run(cfg: Config) -> std::io::Result<()> {
             }
         });
     }
-    let mut pool = Pool { shared: shared.clone(), idle_rx, idle: Vec::new() };
+    let mut pool = Pool { shared: shared.clone(), idle_rx, idle: Vec::new(), used: HashSet::new() };
 
     // Wait for a few peers and a head.
     while pool.connected() == 0 || shared.head_number.load(Ordering::Relaxed) == 0 {
@@ -982,6 +997,11 @@ pub async fn run(cfg: Config) -> std::io::Result<()> {
         }
     }
     info!(peers = pool.connected(), "peers up; starting cycles");
+    if cfg.per_block {
+        run_blocks(&mut pool, &cfg, &log, started).await;
+        log.emit(json!({"ev": "note", "what": "end", "elapsed_s": started.elapsed().as_secs()}));
+        return Ok(());
+    }
     let mut headers: HashMap<u64, Header> = HashMap::new();
     let mut prev: Option<Header> = None;
     let mut cycle = 0usize;
@@ -1062,6 +1082,72 @@ pub async fn run(cfg: Config) -> std::io::Result<()> {
     }
     log.emit(json!({"ev": "note", "what": "end", "elapsed_s": started.elapsed().as_secs()}));
     Ok(())
+}
+
+/// Per-block mode: the base is the head when it starts; then each block's
+/// root is healed from its parent's the moment a peer has its header.
+/// When healing falls more than `MAX_BACKLOG` blocks behind it jumps to
+/// the head in one diff (logged as a skip).
+async fn run_blocks(pool: &mut Pool, cfg: &Config, log: &Log, started: Instant) {
+    const MAX_BACKLOG: u64 = 48;
+    let over = |started: Instant| !cfg.max_wall.is_zero() && started.elapsed() > cfg.max_wall;
+    let mut prev = loop {
+        if over(started) {
+            return;
+        }
+        if let Some(h) = pool.head().await {
+            break h;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    };
+    log.emit(json!({"ev": "note", "what": "base", "number": prev.number, "root": prev.state_root.to_string()}));
+    let mut healed = 0usize;
+    while !over(started) && (cfg.cycles == 0 || healed < cfg.cycles) {
+        let want = prev.number + 1;
+        let asked = unix_f64();
+        let poll_until = Instant::now() + Duration::from_secs(90);
+        let mut next = None;
+        while Instant::now() < poll_until {
+            if let Some(h) = pool.header_try(want, Duration::from_secs(5)).await {
+                next = Some(h);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let Some(mut next) = next else {
+            log.emit(json!({"ev": "note", "what": "no next header", "number": want, "connected": pool.connected()}));
+            continue;
+        };
+        let mut known = unix_f64();
+        let backlog = ((asked - next.timestamp as f64) / 12.0).max(0.0) as u64;
+        let mut skip = false;
+        if backlog > MAX_BACKLOG {
+            if let Some(h) = pool.head().await {
+                if let Some(t) = pool.header_at(h.number.saturating_sub(1)).await {
+                    next = t;
+                    known = unix_f64();
+                    skip = true;
+                }
+            }
+        }
+        let reorg = !skip && next.parent_hash != prev.hash_slow();
+        let span = next.number.saturating_sub(prev.number);
+        let peers = pool.connected();
+        let t0 = Instant::now();
+        let count = diff(pool, cfg, prev.state_root, next.state_root, (span as i64, 0), t0 + cfg.max_cycle).await;
+        let heal_s = t0.elapsed().as_secs_f64();
+        let done = unix_f64();
+        log.emit(json!({
+            "ev": "block", "number": next.number, "blocks": span, "skip": skip, "reorg": reorg,
+            "known_after_slot_s": known - next.timestamp as f64, "heal_s": heal_s, "done_after_slot_s": done - next.timestamp as f64,
+            "in_slot": heal_s <= 12.0, "backlog": backlog, "peers": peers, "count": count,
+        }));
+        if healed % 25 == 0 {
+            info!(number = next.number, heal_s, nodes = count.account.nodes + count.storage.nodes, levels = count.levels, peers, complete = count.complete, "block");
+        }
+        healed += 1;
+        prev = next;
+    }
 }
 
 #[cfg(test)]
