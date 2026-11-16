@@ -48,10 +48,11 @@ report as a named source's claim, which the client does not verify.
 
 ## Numbers
 
-The full state on Cloud Storage, cold, in headless Chromium (2026-11-16):
-the page loads, verifies the head and reads an account in about 2.5 s; an
-account takes 3 to 5 rounds and about 80 KB (650 to 850 ms), a storage slot 7
-rounds (about 1.3 s), an absent account 3 rounds.
+The full state on Cloud Storage, cold, in headless Chromium from Taipei
+(2026-11-16, no VPN): the page loads, verifies the head and reads an account
+in 0.7 s. An account takes 3 to 5 rounds and about 80 KB (about 220 to
+260 ms), a storage slot 7 rounds (540 ms), an absent account 3 rounds
+(230 ms).
 
 Earlier, the slice against Cloudflare R2, from Taipei through a VPN
 (2026-10-31 to 11-01, `results/m1.md`):
@@ -95,11 +96,13 @@ above. Details in `docs/decisions.md`.
   kept (three days). Old headers cost a walk (6.4 MB for a transaction a day
   back) until the beacon accumulator's files are published. History from
   genesis is sized (about 4.9 TB, about $100 a month) but not run.
-- **HTTP/3 through a small-MTU tunnel.** Behind a VPN whose path MTU is
-  below about 1,350 bytes, Chrome's HTTP/3 to storage.googleapis.com stalls
-  (Google's QUIC packets are larger than the path and are dropped without an
-  error), and the page hangs loading. TCP is fine. Seen 2026-11-16 through
-  Mullvad; normal connections are unaffected.
+- **HTTP/3 through a VPN.** Through Mullvad (Manila relay, 2026-11-16) the
+  page hung loading: Chrome's HTTP/3 to storage.googleapis.com stalled, first
+  because the tunnel's MTU (1,320) was below Google's QUIC packets, then, at
+  MTU 1,420, because bulk UDP through the relay crawled (600 KB from
+  Cloudflare in 13 to 18 s over HTTP/3, 0.08 s over TCP). Without the VPN the
+  page opens, verifies the head and reads an account in 0.7 s, all over
+  HTTP/3. Behind such a VPN, turning QUIC off in Chrome fixes it.
 - **The checkpoint.** The default root (slot 15,661,216, 2026-11-15) must be
   replaced before it leaves the weak-subjectivity period, around the end of
   November.
