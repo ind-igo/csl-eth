@@ -1,0 +1,39 @@
+# The tracker on the GCP VM (infra/alchemy.run.ts), installed by
+# deploy/gcp/apply.sh: keeps full/ in the bucket current, one layer per
+# verified head (docs/delta-producer.md § The tracker). It keeps no copy of
+# the base: the base's runs are read from the bucket by range after a gap,
+# and the old side comes from peers otherwise (§ Without a local base).
+#
+# State: /data/track/work/track.json (what is published; the layers held)
+# and /data/track/root (the layers, as published). Losing them leaves
+# orphaned layer runs in the bucket; the base is never touched.
+#
+# Steps: one JSON line each in /data/track/work/track.jsonl.
+[Unit]
+Description=csl-eth tracker (keeps gs://csl-eth-demo/full/ current)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=csl
+Group=csl
+WorkingDirectory=/opt/csl-eth
+Environment=HOME=/data/home
+Environment=CSL_ETH_GCS_BUCKET=csl-eth-demo
+Environment=RUST_LOG=info
+Nice=10
+ExecStart=/opt/csl-eth/target/release/csl-eth track \
+  --root /data/track/root \
+  --work /data/track/work \
+  --base 0xba385d14942f0bf2da3b7222573e90987983b00a67aeeca34eefe5330419f7ff \
+  --base-url https://storage.googleapis.com/csl-eth-demo/full/ \
+  --checkpoint 0x431b33af8452e2d644377405e69d4f382182ab906f31461190ca24cb3401d70b \
+  --publish /opt/csl-eth/scripts/gcs-publish.sh \
+  --key-prefix full/ \
+  --sort-mib 512
+Restart=always
+RestartSec=30
+MemoryMax=3G
+
+[Install]
+WantedBy=multi-user.target

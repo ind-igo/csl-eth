@@ -84,8 +84,9 @@ const el = {
 const params = new URLSearchParams(location.search);
 el.base.value = params.get("bucket") ?? DEFAULT_BASE;
 el.checkpoint.value = params.get("checkpoint") ?? DEFAULT_CHECKPOINT;
-// The full state is published under its finalized head only.
-el.tier.value = params.has("tier") ? tierParam(params) : "finalized";
+// The attested head when it is newer than the finalized one (the tracker
+// publishes both), unless the URL forces a tier.
+el.tier.value = tierParam(params);
 
 // --- state --------------------------------------------------------------------
 

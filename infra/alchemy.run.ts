@@ -1,6 +1,7 @@
 // csl-eth on Google Cloud, everything the demo needs in one stack: a public
 // bucket that holds both the browser page and the files it reads, and one
-// small VM that runs the producer loop and writes to that bucket.
+// small spot VM that runs the tracker (`csl-eth track`, keeping full/
+// current) and writes to that bucket.
 //
 // The stack is "csl-eth" and this is its stage "demo", in the GCP project
 // csl-eth (package.json pins it, whatever gcloud's default project is):
@@ -9,7 +10,7 @@
 //	bun run deploy     make it so
 //	bunx alchemy destroy --stage demo   remove what this stack made (the bucket only if empty)
 //
-// Then deploy/gcp/apply.sh builds and starts the producer on the VM, and
+// Then deploy/gcp/apply.sh builds and starts the tracker on the VM, and
 // deploy/gcp/site.sh uploads the page.
 //
 // The page is served from the bucket itself, at
@@ -17,12 +18,14 @@
 // from its own origin: no CORS, no web server, no second service. The
 // bucket is the only thing readers touch, and they can only read it.
 //
-// The producer needs no Ethereum node: it fetches the 1/4096 slice over
-// devp2p `snap` from mainnet peers each epoch, as it did on fafo-0. A full
-// node for full-state measurements is deliberately not here; it is a burst
-// to add for a few days and destroy (poc-ethereum milestone 4).
+// The tracker needs no Ethereum node: it fetches each verified head's
+// changed trie nodes over devp2p `snap` from mainnet peers, and keeps no
+// copy of the 344 GiB base (it reads the base from the bucket by range
+// after a gap). A full node is deliberately not here; it is a burst to add
+// for a few days and destroy.
 //
-// Nothing on the VM listens to the internet except discv4 on UDP 30399.
+// Nothing on the VM listens to the internet except devp2p on TCP and UDP
+// 30303.
 // SSH comes only through Identity-Aware Proxy, which checks the caller's
 // Google account:
 //
@@ -56,6 +59,7 @@ fi
 mkdir -p /data
 grep -q "$disk" /etc/fstab || echo "$disk /data ext4 discard,defaults,nofail 0 2" >> /etc/fstab
 mountpoint -q /data || mount /data
+resize2fs -f "$disk" >/dev/null 2>&1 || true # after the disk was grown
 if [ ! -f /data/swap ]; then
   fallocate -l 8G /data/swap && chmod 600 /data/swap && mkswap -q /data/swap
 fi
@@ -125,9 +129,8 @@ export default Alchemy.Stack(
       sourceRanges: [iap],
       targetTags: ["producer"],
     });
-    // discv4: the fetcher finds mainnet peers over UDP 30399. Replies to its
-    // own pings would pass the stateful firewall anyway; peers that ping
-    // first need this, as they reached fafo-0's host network.
+    // discv4 for the old slice producer (UDP 30399); the tracker uses
+    // 30303, opened below with the node's rule.
     yield* GCP.Compute.Firewall("discv4", {
       firewallName: "csl-eth-discv4",
       network: netUrl,
@@ -140,36 +143,65 @@ export default Alchemy.Stack(
     // (what is published, which pointer write is pending). On its own disk so
     // replacing the VM keeps it: a lost state.json leaves old snapshots in the
     // bucket that nothing will ever collect.
+    // 100 GB: the tracker's layers, the since-base layer twice while it
+    // merges, the node log and sort spill of a catch-up (see
+    // docs/delta-producer.md § Disk without the base). Grows in place
+    // (the startup script grows the filesystem).
     const data = yield* GCP.Compute.Disk("data", {
       diskName: "csl-eth-producer-data",
       zone,
       type: "pd-balanced",
-      sizeGb: 30,
+      sizeGb: 100,
     });
     const vm = yield* GCP.Compute.Instance("producer", {
       instanceName: "csl-eth-producer",
       zone,
-      // 2 vCPUs, 4 GB: the loop uses well under 1 GB between bursts (it was
-      // limited to 3 GB on fafo-0); the release build is the peak, helped by
-      // 8 GB of swap on /data. Changing it replaces the VM and keeps /data.
+      // 2 vCPUs, 4 GB; the release build is the peak, helped by 8 GB of
+      // swap on /data. Changing it replaces the VM and keeps /data.
       machineType: "e2-medium",
+      // Spot: a preemption stops the VM, and the schedule below starts it
+      // again; the tracker then catches up from where track.json left it.
+      provisioningModel: "SPOT",
+      instanceTerminationAction: "STOP",
       bootDiskType: "pd-balanced",
       diskSizeGb: 30,
       network: netUrl,
       subnetwork: Output.interpolate`regions/${region}/subnetworks/${subnet.subnetworkName}`,
-      associatePublicIp: true, // for mainnet peers and the beacon API; nothing listens but discv4
+      associatePublicIp: true, // for mainnet peers and the beacon API; nothing listens but devp2p
       attachedDisks: [{ source: Output.interpolate`zones/${zone}/disks/${data.diskName}`, deviceName: "data" }],
-      tags: ["producer"],
+      tags: ["producer", "node"],
       serviceAccount: producerSa.email,
       oauthScopes: ["https://www.googleapis.com/auth/devstorage.read_write"],
       metadata: { "enable-oslogin": "TRUE", "startup-script": startup },
       shieldedInstanceConfig: { enableSecureBoot: true, enableVtpm: true, enableIntegrityMonitoring: true },
     });
 
+    // Start the VM every hour (a no-op while it runs; Compute Engine allows
+    // nothing more frequent): a spot preemption leaves it stopped.
+    // Compute Engine's service agent does the start, so it needs the right
+    // to. The stack cannot attach the schedule to the instance, so that was
+    // done by hand (2026-11-17):
+    //   gcloud compute instances add-resource-policies csl-eth-producer \
+    //     --zone asia-east1-b --resource-policies csl-eth-restart
+    // and again after anything replaces the VM.
+    yield* GCP.Compute.ResourcePolicy("restart", {
+      resourcePolicyName: "csl-eth-restart",
+      region,
+      description: "start the spot VM again after a preemption",
+      instanceSchedulePolicy: { vmStartSchedule: { schedule: "0 * * * *" }, timeZone: "UTC" },
+    });
+    yield* GCP.IAM.Member("compute-agent-starts", {
+      kind: "project",
+      name: "csl-eth",
+      role: "roles/compute.instanceAdmin.v1",
+      member: "serviceAccount:service-929770876169@compute-system.iam.gserviceaccount.com",
+    });
+
     // The full-state node is not in this stack: it is a burst VM with
     // local NVMe SSDs (which Alchemy cannot attach, and which no quota here
     // limits), created and deleted by deploy/gcp/full-export.sh on this
-    // network, with the producer's service account and the "node" tag.
+    // network, with the producer's service account and the "node" tag. The
+    // tracker on the producer VM carries the tag too: devp2p on 30303.
     yield* GCP.Compute.Firewall("devp2p", {
       firewallName: "csl-eth-devp2p",
       network: netUrl,
