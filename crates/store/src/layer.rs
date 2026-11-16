@@ -379,9 +379,38 @@ fn run_err(e: csl_run::Error) -> ProduceError {
     ProduceError::Io(std::io::Error::other(e.to_string()))
 }
 
+/// A run file for [`Cursor`]. `csl_run` reads files positionally on unix
+/// only; elsewhere (the browser build compiles this crate but never merges)
+/// a seek and a read.
+struct RunFile(File);
+
+impl csl_run::Source for RunFile {
+    #[cfg(unix)]
+    fn read_at(&self, off: u64, len: usize) -> Result<Vec<u8>, csl_run::Error> {
+        csl_run::Source::read_at(&self.0, off, len)
+    }
+
+    #[cfg(not(unix))]
+    fn read_at(&self, off: u64, len: usize) -> Result<Vec<u8>, csl_run::Error> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = &self.0;
+        f.seek(SeekFrom::Start(off))?;
+        let mut buf = Vec::with_capacity(len);
+        f.take(len as u64).read_to_end(&mut buf)?;
+        if buf.len() < len {
+            return Err(csl_run::Error::ShortRead {
+                off,
+                want: len,
+                got: buf.len(),
+            });
+        }
+        Ok(buf)
+    }
+}
+
 /// A run read front to back, page by page.
 struct Cursor {
-    reader: Reader<File>,
+    reader: Reader<RunFile>,
     pages: u64,
     next_page: u64,
     buf: std::vec::IntoIter<Entry>,
@@ -390,7 +419,7 @@ struct Cursor {
 
 impl Cursor {
     fn open(root: &Path, t: &TableRef, rref: RunRef) -> Result<Cursor, ProduceError> {
-        let f = File::open(root.join(run_path(&t.root)))?;
+        let f = RunFile(File::open(root.join(run_path(&t.root)))?);
         let mut reader = Reader::try_with_format(f, rref, RUN_FORMAT).map_err(run_err)?;
         reader.prepare().map_err(run_err)?;
         let mut c = Cursor {
