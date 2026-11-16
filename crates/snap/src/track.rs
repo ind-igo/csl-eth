@@ -1,4 +1,4 @@
-//! The healer (`csl-eth heal`): keeps a bucket's state current with no node
+//! The tracker (`csl-eth track`): keeps a bucket's state current with no node
 //! and no RPC, one layer per verified attested head
 //! (`docs/delta-producer.md`).
 //!
@@ -687,7 +687,7 @@ impl Rows {
 }
 
 /// A complete step: the layer's rows, and the keys to read back.
-pub struct Healed {
+pub struct Tracked {
     pub rows: Rows,
     /// Changed accounts with their new values.
     pub accounts: Vec<(B256, Account)>,
@@ -1216,7 +1216,7 @@ fn materialize(
     sort_dir: &Path,
     sort_budget: u64,
     st: &mut StepStats,
-) -> Result<Healed, StepError> {
+) -> Result<Tracked, StepError> {
     let mut rows = Rows::new(sort_dir, sort_budget).map_err(StepError::Store)?;
     let mut accounts = Vec::new();
     let mut slots = Vec::new();
@@ -1292,7 +1292,7 @@ fn materialize(
             accounts.push(a);
         }
     }
-    Ok(Healed {
+    Ok(Tracked {
         rows,
         accounts,
         slots,
@@ -1301,11 +1301,11 @@ fn materialize(
     })
 }
 
-/// Heal from the held state at `old_root` to `new_root`: sync what is
+/// Step from the held state at `old_root` to `new_root`: sync what is
 /// missing onto `db` from `src`, then materialize the step's rows locally.
 /// On any error the fetched nodes stay in `db` for the next attempt.
 #[allow(clippy::too_many_arguments)]
-pub async fn heal_step<S: Source>(
+pub async fn track_step<S: Source>(
     src: &mut S,
     store: &mut Store,
     db: &mut NodeDb,
@@ -1317,7 +1317,7 @@ pub async fn heal_step<S: Source>(
     sort_dir: &Path,
     sort_budget: u64,
     roots: Option<&mut RootIndex>,
-) -> Result<Healed, StepError> {
+) -> Result<Tracked, StepError> {
     let lookups0 = store.lookups;
     let mut st = StepStats::default();
     let mut cx = Ctx {
@@ -1594,16 +1594,16 @@ impl Publish for DryRun {
 #[derive(ClapArgs, Debug, Clone)]
 pub struct Args {
     /// The local copy of the published prefix (`full/` of the bucket): the
-    /// base's `snapshots/<hash>/` tables, and the healer's `runs/`,
+    /// base's `snapshots/<hash>/` tables, and the tracker's `runs/`,
     /// `blobs/`, `head/` and manifests, laid out as published.
     #[arg(long)]
     pub root: PathBuf,
-    /// The healer's state (`heal.json`) and log (`heal.jsonl`,
+    /// The tracker's state (`track.json`) and log (`track.jsonl`,
     /// `peers.jsonl`).
     #[arg(long)]
     pub work: PathBuf,
     /// The base snapshot's block hash under `root` (a plain snapshot).
-    /// Only on the first run; `heal.json` remembers it.
+    /// Only on the first run; `track.json` remembers it.
     #[arg(long)]
     pub base: Option<B256>,
     /// The weak-subjectivity checkpoint root the head is verified from.
@@ -1637,7 +1637,7 @@ pub struct Args {
     /// there to pin.
     #[arg(long, default_value_t = 128)]
     pub keep: usize,
-    /// Heal only when the head is at least this many blocks past ours.
+    /// Step only when the head is at least this many blocks past ours.
     #[arg(long, default_value_t = 1)]
     pub every_blocks: u64,
     /// Do not index owners by storage root (a new contract's storage trie
@@ -1687,7 +1687,7 @@ impl HeadRec {
 
 /// What survives a restart.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct HealState {
+struct TrackState {
     base: B256,
     head: HeadRec,
     layers: Vec<Tiered>,
@@ -1710,10 +1710,10 @@ struct HealState {
     optimistic: Option<B256>,
 }
 
-impl HealState {
-    fn load(p: &Path) -> Result<Option<HealState>, String> {
+impl TrackState {
+    fn load(p: &Path) -> Result<Option<TrackState>, String> {
         match fs::read(p) {
-            Ok(b) => serde_json::from_slice::<HealState>(&b)
+            Ok(b) => serde_json::from_slice::<TrackState>(&b)
                 .map(|mut st| {
                     st.published_runs = st.published_runs.iter().map(|r| run_name(r)).collect();
                     for (_, rs) in st.manifests.iter_mut() {
@@ -1803,7 +1803,7 @@ fn run_name(r: &str) -> String {
 
 /// Read back what a step changed, through the client over the local files
 /// at the new root: every changed account, the sampled slots, new code.
-fn read_back(root: &Path, head: &Head, h: &Healed) -> Result<Value, String> {
+fn read_back(root: &Path, head: &Head, h: &Tracked) -> Result<Value, String> {
     let mut snap = Snapshot::open(DirDriver::new(root), Some(head.block_hash), head.state_root)
         .map_err(|e| format!("open: {e}"))?;
     for (k, a) in &h.accounts {
@@ -1827,11 +1827,11 @@ fn read_back(root: &Path, head: &Head, h: &Healed) -> Result<Value, String> {
     Ok(json!({"accounts": h.accounts.len(), "slots": h.slots.len(), "codes": h.rows.code.len()}))
 }
 
-struct Healer {
+struct Tracker {
     args: Args,
     root: PathBuf,
     state_path: PathBuf,
-    st: HealState,
+    st: TrackState,
     base: Manifest,
     prefix: Option<Nibbles>,
     store: Store,
@@ -1839,7 +1839,7 @@ struct Healer {
     log: Log,
 }
 
-impl Healer {
+impl Tracker {
     fn manifest(&self, head: &Head, latest: bool) -> Result<Manifest, String> {
         write_layered_manifest(
             &self.root,
@@ -1857,7 +1857,7 @@ impl Healer {
     /// and leaves `head/optimistic` and `snapshots/latest` alone.
     fn commit(
         &mut self,
-        h: &mut Healed,
+        h: &mut Tracked,
         update: &[u8],
         vh: &VerifiedHead,
         tier: Tier,
@@ -1937,7 +1937,7 @@ impl Healer {
         &mut self,
         head: &Head,
         m: &Manifest,
-        h: &Healed,
+        h: &Tracked,
         update: &[u8],
         tier: Tier,
     ) -> Result<Value, String> {
@@ -2103,13 +2103,13 @@ impl Healer {
 pub async fn run(args: Args) -> Result<(), String> {
     let started = Instant::now();
     fs::create_dir_all(&args.work).map_err(|e| e.to_string())?;
-    let state_path = args.work.join("heal.json");
+    let state_path = args.work.join("track.json");
     let root = args.root.clone();
-    let st = match HealState::load(&state_path)? {
+    let st = match TrackState::load(&state_path)? {
         Some(st) => {
             if args.base.is_some_and(|b| b != st.base) {
                 return Err(format!(
-                    "heal.json is for base {}, not {}",
+                    "track.json is for base {}, not {}",
                     st.base,
                     args.base.unwrap()
                 ));
@@ -2119,13 +2119,13 @@ pub async fn run(args: Args) -> Result<(), String> {
         None => {
             let base = args
                 .base
-                .ok_or("no heal.json yet: name the base with --base")?;
+                .ok_or("no track.json yet: name the base with --base")?;
             let m = Manifest::from_json(
                 &fs::read(root.join(manifest_path(&base)))
                     .map_err(|e| format!("base manifest: {e}"))?,
             )
             .map_err(|e| e.to_string())?;
-            HealState {
+            TrackState {
                 base,
                 head: HeadRec {
                     block_hash: m.block_hash,
@@ -2168,7 +2168,7 @@ pub async fn run(args: Args) -> Result<(), String> {
     let log = Log(File::options()
         .create(true)
         .append(true)
-        .open(args.work.join("heal.jsonl"))
+        .open(args.work.join("track.jsonl"))
         .map_err(|e| e.to_string())?);
     let head = st.head.head();
     let (store, held) = {
@@ -2186,7 +2186,7 @@ pub async fn run(args: Args) -> Result<(), String> {
         };
         (Store::open(&root, &m)?, m)
     };
-    let mut h = Healer {
+    let mut h = Tracker {
         args: args.clone(),
         root: root.clone(),
         state_path,
@@ -2251,8 +2251,8 @@ pub async fn run(args: Args) -> Result<(), String> {
                     } else if fe.block_number > h.st.head.block_number
                         && window_secs(fe.timestamp) >= FINALIZED_MIN_WINDOW
                     {
-                        // Ahead of us with time left in the window: heal a
-                        // step to it first.
+                        // Ahead of us with time left in the window: step
+                        // to it first.
                         fin = Some((fu, fvh));
                     } else if fe.block_number != fin_missed {
                         // Passed over (or too old to reach): the next
@@ -2300,7 +2300,7 @@ pub async fn run(args: Args) -> Result<(), String> {
         let t0 = Instant::now();
         let from = h.st.head.block_number;
         let held_before = db.len();
-        let r = heal_step(
+        let r = track_step(
             &mut pool,
             &mut h.store,
             &mut db,
@@ -2314,7 +2314,7 @@ pub async fn run(args: Args) -> Result<(), String> {
             roots.as_mut(),
         )
         .await;
-        let heal_s = t0.elapsed().as_secs_f64();
+        let step_s = t0.elapsed().as_secs_f64();
         let lag = |t: u64| {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -2327,19 +2327,20 @@ pub async fn run(args: Args) -> Result<(), String> {
                 warn!(from, to = target.block_number, error = %e, held = db.len(), "step failed; re-pivoting");
                 h.log.emit(json!({
                     "ev": "repivot", "attempt": attempt, "from": from, "to": target.block_number, "error": e.to_string(),
-                    "heal_s": heal_s, "held": db.len(), "held_before": held_before, "complete": db.done_len(),
+                    "step_s": step_s, "held": db.len(), "held_before": held_before, "complete": db.done_len(),
                     "log_bytes": db.log_bytes(), "peers": pool.connected(),
                 }));
                 if let StepError::Store(_) | StepError::TooDeep = e {
                     return Err(e.to_string());
                 }
             }
-            Ok(mut healed) => {
-                let res = tokio::task::block_in_place(|| h.commit(&mut healed, &update, &vh, tier));
+            Ok(mut tracked) => {
+                let res =
+                    tokio::task::block_in_place(|| h.commit(&mut tracked, &update, &vh, tier));
                 if res.is_ok() {
                     db.reset(h.st.head.state_root)?;
                     if let Some(ix) = roots.as_mut() {
-                        for (r, o) in &healed.new_tries {
+                        for (r, o) in &tracked.new_tries {
                             ix.note(*r, *o)?;
                         }
                     }
@@ -2350,9 +2351,9 @@ pub async fn run(args: Args) -> Result<(), String> {
                             from,
                             to = target.block_number,
                             blocks = target.block_number - from,
-                            nodes = healed.stats.account_nodes + healed.stats.storage_nodes,
-                            mib = healed.stats.node_bytes as f64 / 1048576.0,
-                            heal_s,
+                            nodes = tracked.stats.account_nodes + tracked.stats.storage_nodes,
+                            mib = tracked.stats.node_bytes as f64 / 1048576.0,
+                            step_s,
                             lag_s = lag(target.timestamp),
                             peers = pool.connected(),
                             "step"
@@ -2360,8 +2361,8 @@ pub async fn run(args: Args) -> Result<(), String> {
                         h.log.emit(json!({
                             "ev": "step", "tier": format!("{tier:?}"), "step": h.st.steps, "attempt": attempt, "from": from, "to": target.block_number,
                             "blocks": target.block_number - from, "block_hash": target.block_hash, "state_root": target.state_root,
-                            "heal_s": heal_s, "lag_s": lag(target.timestamp), "peers": pool.connected(),
-                            "head_lag_s": vh.lag_secs, "participants": vh.participants, "stats": healed.stats, "commit": v,
+                            "step_s": step_s, "lag_s": lag(target.timestamp), "peers": pool.connected(),
+                            "head_lag_s": vh.lag_secs, "participants": vh.participants, "stats": tracked.stats, "commit": v,
                         }));
                     }
                     Err(e) => {
@@ -2666,7 +2667,7 @@ mod tests {
 
     fn scratch(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "csl-eth-healer-{}-{}-{name}",
+            "csl-eth-tracker-{}-{}-{name}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -2708,7 +2709,7 @@ mod tests {
         }
     }
 
-    /// One healed step committed as the healer does, minus heads and
+    /// One step committed as the tracker does, minus heads and
     /// publishing.
     #[allow(clippy::too_many_arguments)]
     fn commit(
@@ -2717,7 +2718,7 @@ mod tests {
         layers: &mut Vec<Tiered>,
         from: &Head,
         to: &Head,
-        h: &mut Healed,
+        h: &mut Tracked,
         fanout: usize,
         top: u8,
     ) -> (Store, Manifest) {
@@ -2755,8 +2756,8 @@ mod tests {
         new: &Head,
         dir: &Path,
         budget: u64,
-    ) -> Result<Healed, StepError> {
-        heal_step(
+    ) -> Result<Tracked, StepError> {
+        track_step(
             src,
             store,
             db,
@@ -2812,7 +2813,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heals_step_by_step_and_across_a_gap() {
+    async fn tracks_step_by_step_and_across_a_gap() {
         let s = states();
         let heads: Vec<Head> = s
             .iter()
@@ -3205,7 +3206,7 @@ mod tests {
                 ix = Some(RootIndex::open(&dir).unwrap());
             }
             let mut src = Mem::of(&s1, &h1);
-            let mut h = heal_step(
+            let mut h = track_step(
                 &mut src,
                 &mut store,
                 &mut db,
@@ -3283,10 +3284,10 @@ mod tests {
             let next = churn(&s, &mut rng);
             let hn = head_of(&next, n);
             let mut src = Mem::of(&next, &hn);
-            let mut healed = step(&mut src, &mut store, &mut db, &h, &hn, &dir, 64 << 20)
+            let mut tracked = step(&mut src, &mut store, &mut db, &h, &hn, &dir, 64 << 20)
                 .await
                 .unwrap();
-            (store, _) = commit(&dir, &base, &mut layers, &h, &hn, &mut healed, 2, 3);
+            (store, _) = commit(&dir, &base, &mut layers, &h, &hn, &mut tracked, 2, 3);
             db.reset(hn.state_root).unwrap();
             max_layers = max_layers.max(layers.len());
             // Tiers never increase toward the newest.
@@ -3306,9 +3307,9 @@ mod tests {
     }
 }
 
-/// A healed directory against the slice its base was built from:
-/// `CSL_HEAL_SLICE=<slice> CSL_HEAL_DIR=<published dir> cargo test
-/// --release -p csl-eth-snap --lib healed_dir_is_complete -- --ignored
+/// A tracked directory against the slice its base was built from:
+/// `CSL_TRACK_SLICE=<slice> CSL_TRACK_DIR=<published dir> cargo test
+/// --release -p csl-eth-snap --lib tracked_dir_is_complete -- --ignored
 /// --nocapture`. Every account, slot and code of the slice must read at
 /// the published head as verified or proven absent; none insufficient.
 #[cfg(test)]
@@ -3318,10 +3319,10 @@ mod mainnet {
 
     #[test]
     #[ignore]
-    fn healed_dir_is_complete() {
+    fn tracked_dir_is_complete() {
         let (Ok(s), Ok(d)) = (
-            std::env::var("CSL_HEAL_SLICE"),
-            std::env::var("CSL_HEAL_DIR"),
+            std::env::var("CSL_TRACK_SLICE"),
+            std::env::var("CSL_TRACK_DIR"),
         ) else {
             return;
         };

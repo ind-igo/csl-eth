@@ -61,7 +61,7 @@ case "${1:-}" in
       *) ct=application/octet-stream ;;
     esac
     case "$rel" in
-      # runs/: layers' runs, named by their blake3 (csl-eth heal).
+      # runs/: layers' runs, named by their blake3 (csl-eth track).
       head/bootstrap/* | snapshots/0x*/* | snapshots/[0-9a-f]*/* | blobs/* | runs/*)
         cc='public, max-age=31536000, immutable' ;;
       # History: runs and packs are named by their blake3, a manifest by

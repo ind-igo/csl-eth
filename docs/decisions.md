@@ -477,23 +477,23 @@ The 1/4096 slice is retired: its producer VM `csl-eth-producer` is stopped (not 
 
 Later the same day: at MTU 1,420 the path carried 1,420-byte packets to Google cleanly (`ping -D`, 3 of 3 at every size), and HTTP/3 still failed. Forced QUIC (`--origin-to-force-quic-on`) completed handshakes with Google and Cloudflare, but bulk transfer crawled: 600 KB from cdnjs in 13 to 18 s, 1.3 MB from the bucket not done in 20 s, against 0.08 to 0.1 s over TCP. So the MTU was one cause and UDP throughput through that relay a second. With the VPN off: the same downloads over HTTP/3 in 18 to 83 ms, and the page from cold to a verified account in 0.7 s (all requests HTTP/3; vitalik.eth 242 ms in 4 rounds, a storage slot 541 ms in 7, an absent account 227 ms in 3).
 
-## 2026-11-16: layers, and a healer that follows the head (branch `healer`)
+## 2026-11-16: layers, and a tracker that follows the head (branch `healer`)
 
 `docs/delta-producer.md` § Built has the detail; this records the choices.
 
 **A layer is a run per table, and the reader picks by hash.** A format-3 manifest names a plain base (another block's tables) and layers at `runs/<blake3>.run`. At each position the client asks every run and takes the candidate that hashes to the parent's reference, never the newest. So a stale node in an old run, a dropped layer or a corrupted one ends in `Insufficient`, never a wrong value (tested by dropping and flipping layers). A format-3 manifest must name a base other than its own block and hold no by-hash table. Plain snapshots read exactly as before: the pinned cost is identical to main's.
 
-**The healer's store is the published runs.** It reads the base's and each layer's runs on local disk by position, as the client does, so there is no second node database to keep consistent. The full base's models are about 2.5 MB, so memory goes to the step's rows.
+**The tracker's store is the published runs.** It reads the base's and each layer's runs on local disk by position, as the client does, so there is no second node database to keep consistent. The full base's models are about 2.5 MB, so memory goes to the step's rows.
 
-**Nothing is published until it reads back.** After writing a layer and merging tiers, the healer reads every changed account, a sample of changed slots and new code through the client at the new root over the local files; a failure leaves the published state as it was. Then hash-named files, the manifest, the head files and the pointer go up in that order.
+**Nothing is published until it reads back.** After writing a layer and merging tiers, the tracker reads every changed account, a sample of changed slots and new code through the client at the new root over the local files; a failure leaves the published state as it was. Then hash-named files, the manifest, the head files and the pointer go up in that order.
 
 **Merges are newest-wins and drop nothing.** For consecutive complete steps, the newest writer of a position reachable in the final state is the final state's node; dropping is where the hazard is (a subtree reachable again through a new extension), so the merge never drops. Unreachable positions stay until a base compaction, which is not built.
 
 **Tiers are counted, and the read cost is the trade.** Per synthetic measurement, each run is one more predicted page per depth: 4 layers cost 2.26× the requests of a fresh build, 16 cost 5.65×, the same layers merged 1.35×. Count tiers bound runs at `(fanout − 1) × tiers + 1`. Twice the base-only read allows about three, which means rewriting the since-base run often. Per-run density hints, so readers skip runs, are the way out and are not built.
 
-**Mainnet, from the Mac.** On a fresh 1/4096 slice the healer closed a 122-block gap in 0.9 s and then followed the head block by block at 0.2 to 0.7 s a step, about 16 s behind each block. Every account of the slice then read at the new head, none insufficient.
+**Mainnet, from the Mac.** On a fresh 1/4096 slice the tracker (then `csl-eth heal`) closed a 122-block gap in 0.9 s and then followed the head block by block at 0.2 to 0.7 s a step, about 16 s behind each block. Every account of the slice then read at the new head, none insufficient.
 
-**Reviewed** once (GPT 6.1 via omp). It found a real bug: nodes were resolved only through the bounded cache, so a full cache dropped nodes peers had served and the step failed (fixed; tested with a zero-size cache). It also found two smaller ones, the loose format-3 check and code traces naming the wrong candidate (both fixed). It found no path to a wrong answer in the client and no omission in the healer's walk or the merge.
+**Reviewed** once (GPT 6.1 via omp). It found a real bug: nodes were resolved only through the bounded cache, so a full cache dropped nodes peers had served and the step failed (fixed; tested with a zero-size cache). It also found two smaller ones, the loose format-3 check and code traces naming the wrong candidate (both fixed). It found no path to a wrong answer in the client and no omission in the tracker's walk or the merge.
 
 **Since.** The finalized tier, catch-up from any gap (fetched nodes on disk), per-layer skip hints and the storage-root → owner index are built (see `docs/delta-producer.md` § Built). Hints are unauthenticated and only schedule: a read that skipped a run asks every run before it can be `Insufficient`.
 

@@ -6,8 +6,8 @@ use clap::{Parser, Subcommand};
 use csl_eth_client::{open_at_head, DirDriver, Hint, Read, Reason, Snapshot, VerifiedHead};
 use csl_eth_snap::{bal, fetch, peer::Net, probe, FetchConfig, Slice};
 use csl_eth_store::{produce_with, ProduceOptions};
-use csl_eth_trie::{Account, Nibbles};
 use csl_eth_trie::KECCAK_EMPTY;
+use csl_eth_trie::{Account, Nibbles};
 use std::{path::PathBuf, time::Duration};
 
 #[derive(Parser)]
@@ -71,10 +71,11 @@ enum Cmd {
     /// files, verify, publish in order, collect old snapshots. One JSON
     /// line per cycle on stdout and in `<work>/produce.log`.
     Produce(csl_eth_snap::produce::Args),
-    /// Keep a published state current: heal it to each verified attested
-    /// head over snap/1 `GetTrieNodes`, one layer per step, merged in
-    /// tiers (`docs/delta-producer.md`). Logs to `<work>/heal.jsonl`.
-    Heal(csl_eth_snap::healer::Args),
+    /// The tracker: keep a published state current by fetching the trie
+    /// nodes that changed up to each verified attested head over snap/1
+    /// `GetTrieNodes`, one layer per step, merged in
+    /// tiers (`docs/delta-producer.md`). Logs to `<work>/track.jsonl`.
+    Track(csl_eth_snap::track::Args),
     /// Build a bucket (snapshot runs, blobs, manifest) from a slice.
     Build {
         #[arg(long)]
@@ -356,8 +357,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Produce(args) => {
             tokio::task::spawn_blocking(move || csl_eth_snap::produce::run(args)).await??;
         }
-        Cmd::Heal(args) => {
-            csl_eth_snap::healer::run(args).await?;
+        Cmd::Track(args) => {
+            csl_eth_snap::track::run(args).await?;
         }
         Cmd::Workload(args) => {
             let out = csl_eth_snap::workload::run(args)?;
@@ -613,7 +614,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let prefix = match prefix {
                 Some(p) => Some(Nibbles::from_nibbles(
-                    p.chars().map(|c| c.to_digit(16).map(|d| d as u8).ok_or("prefix: hex nibbles")).collect::<Result<Vec<u8>, _>>()?,
+                    p.chars()
+                        .map(|c| c.to_digit(16).map(|d| d as u8).ok_or("prefix: hex nibbles"))
+                        .collect::<Result<Vec<u8>, _>>()?,
                 )),
                 None => None,
             };
@@ -694,7 +697,11 @@ struct CheckOpts {
     baseline: bool,
 }
 
-fn read_account<D: csl_eth_client::Driver>(snap: &mut Snapshot<D>, baseline: bool, h: &B256) -> (Read<Account>, csl_eth_client::Cost) {
+fn read_account<D: csl_eth_client::Driver>(
+    snap: &mut Snapshot<D>,
+    baseline: bool,
+    h: &B256,
+) -> (Read<Account>, csl_eth_client::Cost) {
     if baseline {
         snap.account_by_hash(h)
     } else {
@@ -702,7 +709,12 @@ fn read_account<D: csl_eth_client::Driver>(snap: &mut Snapshot<D>, baseline: boo
     }
 }
 
-fn read_slot<D: csl_eth_client::Driver>(snap: &mut Snapshot<D>, baseline: bool, h: &B256, k: &B256) -> (Read<U256>, csl_eth_client::Cost) {
+fn read_slot<D: csl_eth_client::Driver>(
+    snap: &mut Snapshot<D>,
+    baseline: bool,
+    h: &B256,
+    k: &B256,
+) -> (Read<U256>, csl_eth_client::Cost) {
     if baseline {
         snap.storage_by_hash(h, k)
     } else {

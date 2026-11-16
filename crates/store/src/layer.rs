@@ -53,7 +53,7 @@ impl LayerRows {
 
     /// The rows of `new` that `old` does not hold with the same bytes: a
     /// layer from a state to the next, computed from two full row sets
-    /// (tests and small states; the healer computes it from the trie).
+    /// (tests and small states; the tracker computes it from the trie).
     pub fn diff(old: &crate::producer::Rows4, new: &crate::producer::Rows4) -> LayerRows {
         fn d(old: &Rows, new: &Rows) -> BTreeMap<[u8; 32], Vec<u8>> {
             let o: std::collections::HashMap<&[u8; 32], &Vec<u8>> =
