@@ -185,6 +185,9 @@ export function renderChain(scene: Scene | null, cur: Cursor, focusReqs: Set<str
   items.push({ title: "manifest", sub: man.state === "ok" ? `the snapshot at this block and state root · ${kb(man.bytes)}` : man.state === "bad" ? `refused: ${l.error}` : "names the snapshot's run files", state: man.state, reqs: man.reqs });
   if (scene!.tables.length) {
     for (const t of scene!.tables) {
+      // The by-hash table serves only the race; a snapshot without it (the
+      // full export) is complete, so its absence is not a link that failed.
+      if (t.name === "nodes_by_hash" && t.error) continue;
       const s = stateOf(l, li, cur, v, 4, (f, off) => f === t.file && off === 0);
       // The open can succeed with a table it could not read: that table
       // answers nothing, and says why.
