@@ -39,9 +39,10 @@ use csl_eth_head::{
     paths, verify_tier, Chain, DirSource, HeadSource, Tier, VerifiedHead,
 };
 use csl_eth_store::{
-    blob_path, manifest_path, merge_layers, run_path, write_layer, write_layered_manifest, Head,
-    Layer, LayerRows, Manifest, CODE_BLOB_THRESHOLD, EPSILON, LATEST_FILE, RUN_FORMAT,
-    TABLE_ACCOUNT_NODES, TABLE_CODE, TABLE_STORAGE_NODES,
+    blob_path, layer_sorter, manifest_path, merge_layers, run_path, write_layer_sorted,
+    write_layered_manifest, Head, Layer, LayerRows, Manifest, CODE_BLOB_THRESHOLD, EPSILON,
+    LATEST_FILE, RUN_FORMAT, SORT_ACCOUNT, SORT_STORAGE, TABLE_ACCOUNT_NODES, TABLE_CODE,
+    TABLE_STORAGE_NODES,
 };
 use csl_eth_trie::{decode_word, Account, Nibbles, NodeKey, EMPTY_ROOT, KECCAK_EMPTY};
 use csl_run::Reader;
@@ -182,47 +183,252 @@ impl Source for Pool {
     }
 }
 
-/// Nodes fetched and not yet in a layer, by hash: what a re-pivot keeps.
-#[derive(Default)]
-pub struct Cache {
-    map: HashMap<B256, Bytes>,
-    bytes: usize,
-    pub cap: usize,
+// ---------------------------------------------------------------------------
+// Fetched nodes, on disk
+
+/// Every node and code fetched toward a root not yet committed, by hash,
+/// and the subtrees known complete: what survives a re-pivot and a
+/// restart, as snap sync's healing keeps its fetched nodes.
+///
+/// The log holds records `hash ‖ len: u32 LE ‖ bytes`, each checked by
+/// hash on the way in and again when the log is reopened (a torn tail is
+/// cut off). The index keeps eight bytes of each hash and a read checks
+/// the full hash, so the index costs about 20 bytes a node in memory.
+///
+/// A subtree is complete when its node and everything under it, storage
+/// tries and code of its accounts included, is local: in this log, or
+/// unchanged at its position in the held state. Completeness is relative
+/// to that state, so the directory names the root it was built against and
+/// starts empty when the held state is another. A marker is eight bytes of
+/// a hash of (owner, path, node hash); a false match only makes the
+/// materializing walk miss a node, which clears the markers and syncs
+/// again.
+pub struct NodeDb {
+    dir: PathBuf,
+    log: File,
+    end: u64,
+    idx: HashMap<u64, u64>,
+    extra: HashMap<B256, u64>,
+    pending: Vec<u8>,
+    done_f: File,
+    done: HashSet<u64>,
+    done_pending: Vec<u8>,
 }
 
-impl Cache {
-    pub fn new(cap: usize) -> Cache {
-        Cache {
-            cap,
-            ..Cache::default()
+fn prefix8(b: &[u8]) -> u64 {
+    u64::from_le_bytes(b[..8].try_into().expect("8 bytes"))
+}
+
+fn done_key(owner: &Option<B256>, path: &Nibbles, hash: &B256) -> u64 {
+    let mut b = Vec::with_capacity(32 + 33 + 32 + 2);
+    match owner {
+        Some(o) => {
+            b.push(1);
+            b.extend_from_slice(o.as_slice());
+        }
+        None => b.push(0),
+    }
+    b.push(path.len() as u8);
+    b.extend_from_slice(&path.pack());
+    b.extend_from_slice(hash.as_slice());
+    prefix8(keccak256(&b).as_slice())
+}
+
+impl NodeDb {
+    /// The log in `dir`, kept when it was built against `against` and
+    /// started empty otherwise.
+    pub fn open(dir: &Path, against: B256) -> Result<NodeDb, String> {
+        let err = |e: std::io::Error| format!("{}: {e}", dir.display());
+        fs::create_dir_all(dir).map_err(err)?;
+        let tag = dir.join("against");
+        if fs::read_to_string(&tag).ok().as_deref().map(str::trim) != Some(&against.to_string()) {
+            for f in ["log", "done"] {
+                let _ = fs::remove_file(dir.join(f));
+            }
+            write_atomic(&tag, against.to_string().as_bytes())?;
+        }
+        let log = File::options()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(dir.join("log"))
+            .map_err(err)?;
+        let done_f = File::options()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(dir.join("done"))
+            .map_err(err)?;
+        let mut db = NodeDb {
+            dir: dir.to_path_buf(),
+            log,
+            end: 0,
+            idx: HashMap::new(),
+            extra: HashMap::new(),
+            pending: Vec::new(),
+            done_f,
+            done: HashSet::new(),
+            done_pending: Vec::new(),
+        };
+        // The log: every whole record that hashes to its name.
+        let data = fs::read(dir.join("log")).map_err(err)?;
+        let mut at = 0usize;
+        while at + 36 <= data.len() {
+            let len = u32::from_le_bytes(data[at + 32..at + 36].try_into().expect("4")) as usize;
+            if at + 36 + len > data.len() {
+                break;
+            }
+            let h = B256::from_slice(&data[at..at + 32]);
+            if keccak256(&data[at + 36..at + 36 + len]) != h {
+                break;
+            }
+            db.index(h, at as u64);
+            at += 36 + len;
+        }
+        if at < data.len() {
+            db.log.set_len(at as u64).map_err(err)?;
+        }
+        db.end = at as u64;
+        let done = fs::read(dir.join("done")).map_err(err)?;
+        let whole = done.len() / 8 * 8;
+        for c in done[..whole].chunks(8) {
+            db.done.insert(prefix8(c));
+        }
+        if whole < done.len() {
+            db.done_f.set_len(whole as u64).map_err(err)?;
+        }
+        Ok(db)
+    }
+
+    fn index(&mut self, h: B256, off: u64) {
+        match self.idx.entry(prefix8(h.as_slice())) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(off);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                self.extra.insert(h, off);
+            }
         }
     }
-    fn get(&self, h: &B256) -> Option<&Bytes> {
-        self.map.get(h)
+
+    fn read_at(&self, off: u64) -> Result<(B256, Bytes), String> {
+        use std::os::unix::fs::FileExt;
+        let mut head = [0u8; 36];
+        self.log
+            .read_exact_at(&mut head, off)
+            .map_err(|e| format!("node log: {e}"))?;
+        let len = u32::from_le_bytes(head[32..36].try_into().expect("4")) as usize;
+        let mut b = vec![0u8; len];
+        self.log
+            .read_exact_at(&mut b, off + 36)
+            .map_err(|e| format!("node log: {e}"))?;
+        Ok((B256::from_slice(&head[..32]), Bytes::from(b)))
     }
-    /// Keep `b` under `h` unless the cache is full; it is checked by hash
-    /// on the way in, so a cached node is always the node of its hash.
-    fn put(&mut self, h: B256, b: Bytes) {
-        if self.bytes + b.len() > self.cap || keccak256(&b) != h {
-            return;
+
+    /// The node (or code) under `h`, if fetched.
+    pub fn get(&self, h: &B256) -> Result<Option<Bytes>, String> {
+        if let Some(&off) = self.idx.get(&prefix8(h.as_slice())) {
+            if off < self.end {
+                let (got, b) = self.read_at(off)?;
+                if got == *h {
+                    return Ok(Some(b));
+                }
+            }
         }
-        self.bytes += b.len();
-        self.map.insert(h, b);
+        match self.extra.get(h) {
+            Some(&off) => Ok(Some(self.read_at(off)?.1)),
+            None => Ok(None),
+        }
     }
-    pub fn clear(&mut self) {
-        self.map.clear();
-        self.bytes = 0;
+
+    pub fn contains(&self, h: &B256) -> Result<bool, String> {
+        Ok(self.get(h)?.is_some())
     }
+
+    /// Keep `b` under `h` if it hashes to it; written at the next
+    /// [`flush`](Self::flush).
+    pub fn put(&mut self, h: B256, b: &[u8]) -> Result<bool, String> {
+        if keccak256(b) != h || self.contains(&h)? {
+            return Ok(false);
+        }
+        let off = self.end + self.pending.len() as u64;
+        self.pending.extend_from_slice(h.as_slice());
+        self.pending
+            .extend_from_slice(&(b.len() as u32).to_le_bytes());
+        self.pending.extend_from_slice(b);
+        self.flush_log()?;
+        self.index(h, off);
+        Ok(true)
+    }
+
+    fn flush_log(&mut self) -> Result<(), String> {
+        if !self.pending.is_empty() {
+            self.log
+                .write_all(&self.pending)
+                .map_err(|e| format!("node log: {e}"))?;
+            self.end += self.pending.len() as u64;
+            self.pending.clear();
+        }
+        Ok(())
+    }
+
+    pub fn is_done(&self, k: u64) -> bool {
+        self.done.contains(&k)
+    }
+
+    fn mark_done(&mut self, k: u64) {
+        if self.done.insert(k) {
+            self.done_pending.extend_from_slice(&k.to_le_bytes());
+        }
+    }
+
+    /// Write what is buffered.
+    pub fn flush(&mut self) -> Result<(), String> {
+        self.flush_log()?;
+        if !self.done_pending.is_empty() {
+            self.done_f
+                .write_all(&self.done_pending)
+                .map_err(|e| format!("done log: {e}"))?;
+            self.done_pending.clear();
+        }
+        Ok(())
+    }
+
+    /// Forget the completeness markers (the nodes stay).
+    pub fn clear_done(&mut self) -> Result<(), String> {
+        self.done.clear();
+        self.done_pending.clear();
+        self.done_f.set_len(0).map_err(|e| format!("done log: {e}"))
+    }
+
+    /// Start empty, against `against`: the held state moved.
+    pub fn reset(&mut self, against: B256) -> Result<(), String> {
+        self.clear_done()?;
+        self.log.set_len(0).map_err(|e| format!("node log: {e}"))?;
+        self.idx.clear();
+        self.extra.clear();
+        self.pending.clear();
+        self.end = 0;
+        write_atomic(&self.dir.join("against"), against.to_string().as_bytes())
+    }
+
+    /// Nodes held, and bytes of log.
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.idx.len() + self.extra.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.len() == 0
+    }
+    pub fn log_bytes(&self) -> u64 {
+        self.end
+    }
+    pub fn done_len(&self) -> usize {
+        self.done.len()
     }
 }
 
 // ---------------------------------------------------------------------------
-// One step
+// One step: sync, then materialize
 
 #[derive(Default, Debug, Clone, Serialize)]
 pub struct StepStats {
@@ -234,21 +440,77 @@ pub struct StepStats {
     /// Nodes asked of peers, and served by them.
     pub asked: u64,
     pub fetched: u64,
-    /// Nodes found in the cache (fetched by an attempt that re-pivoted).
-    pub cached: u64,
+    /// Nodes the sync found on disk (fetched before a re-pivot or restart,
+    /// or held at the position), and subtrees it skipped as complete.
+    pub local: u64,
+    pub done_skips: u64,
     /// Old nodes the local store did not have: the subtree was fetched
     /// whole instead (more bytes, same result).
     pub old_missing: u64,
     pub accounts_changed: u64,
     pub storage_tries: u64,
+    /// Storage tries copied from another owner with the same root.
+    pub storage_copied: u64,
     /// Waves of requests: dependent round trips.
     pub levels: u32,
     pub local_lookups: u64,
+    pub sync_s: f64,
+    pub materialize_s: f64,
+}
+
+/// A step's rows: nodes streamed into a sorter (spilling under its
+/// budget), code by hash.
+pub struct Rows {
+    pub sort: csl_eth_store::extsort::ExtSort,
+    pub code: BTreeMap<[u8; 32], Vec<u8>>,
+    pub account_rows: u64,
+    pub storage_rows: u64,
+    _scratch: csl_eth_store::extsort::Scratch,
+}
+
+impl Rows {
+    fn new(dir: &Path, budget: u64) -> Result<Rows, String> {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let scratch =
+            csl_eth_store::extsort::Scratch::new(dir).map_err(|e| format!("scratch: {e}"))?;
+        Ok(Rows {
+            sort: layer_sorter(scratch.path(), budget),
+            code: BTreeMap::new(),
+            account_rows: 0,
+            storage_rows: 0,
+            _scratch: scratch,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.account_rows == 0 && self.storage_rows == 0 && self.code.is_empty()
+    }
+
+    /// Every row in memory (tests).
+    pub fn collect(&mut self) -> LayerRows {
+        self.sort.prepare().expect("prepare");
+        let mut out = LayerRows {
+            code: self.code.clone(),
+            ..LayerRows::default()
+        };
+        for (t, m) in [
+            (SORT_ACCOUNT, &mut out.account),
+            (SORT_STORAGE, &mut out.storage),
+        ] {
+            self.sort
+                .merge::<csl_eth_store::extsort::SortError>(t, |k, v| {
+                    m.insert(*k, v.to_vec());
+                    Ok(())
+                })
+                .expect("merge");
+        }
+        out
+    }
 }
 
 /// A complete step: the layer's rows, and the keys to read back.
 pub struct Healed {
-    pub rows: LayerRows,
+    pub rows: Rows,
     /// Changed accounts with their new values.
     pub accounts: Vec<(B256, Account)>,
     /// Changed slots seen: (owner, slot, value), up to the sample size.
@@ -262,6 +524,8 @@ pub enum StepError {
     Unresolved { nodes: usize, codes: usize },
     /// Past the deadline (the root is about to leave the peers' window).
     Deadline,
+    /// The materializing walk missed a node the sync counted as local.
+    Missing,
     /// The local store could not be read.
     Store(String),
     /// A node too deep for a table key.
@@ -275,19 +539,11 @@ impl std::fmt::Display for StepError {
                 write!(f, "{nodes} nodes and {codes} codes no peer served")
             }
             StepError::Deadline => write!(f, "deadline"),
+            StepError::Missing => write!(f, "a node the sync counted as local is missing"),
             StepError::Store(e) => write!(f, "local store: {e}"),
             StepError::TooDeep => write!(f, "a node too deep for a table key"),
         }
     }
-}
-
-#[derive(Clone, Debug)]
-struct Pair {
-    owner: Option<B256>,
-    path: Nibbles,
-    new: Ref,
-    old: Option<Ref>,
-    tries: u8,
 }
 
 /// Paths of the account trie inside a slice base's prefix, or on the way
@@ -297,21 +553,6 @@ fn compatible(prefix: Option<&Nibbles>, owner: &Option<B256>, path: &Nibbles) ->
         (Some(p), None) => path.starts_with(p) || p.starts_with(path),
         _ => true,
     }
-}
-
-fn storage_pair(owner: B256, new: &Account, old: Option<&Account>) -> Option<Pair> {
-    let old_root = old.map(|a| a.storage_root).unwrap_or(EMPTY_ROOT);
-    if new.storage_root == EMPTY_ROOT || new.storage_root == old_root {
-        return None;
-    }
-    let old = (old_root != EMPTY_ROOT).then_some(Ref::Hash(old_root));
-    Some(Pair {
-        owner: Some(owner),
-        path: Nibbles::default(),
-        new: Ref::Hash(new.storage_root),
-        old,
-        tries: 0,
-    })
 }
 
 /// The account under `key` in the trie at `root`, walked through the local
@@ -348,223 +589,547 @@ fn old_account(store: &mut Store, root: B256, key: &Nibbles) -> Result<Option<Ac
     }
 }
 
-/// Heal from the state at `old_root` (in `store`) to `new_root` (from
-/// `src`), level by level. Returns the step's layer rows when every
-/// reference resolved.
+/// A position to diff: the new state's reference there, and the held
+/// state's.
+#[derive(Clone, Debug)]
+struct Pos {
+    owner: Option<B256>,
+    path: Nibbles,
+    new: Ref,
+    old: Option<Ref>,
+}
+
+/// What a node leads to: its children to diff (an account's storage trie
+/// among them), the account or slot it is a leaf of, and new code.
+#[derive(Default)]
+struct Opened {
+    kids: Vec<Pos>,
+    account: Option<(B256, Account)>,
+    slot: Option<(B256, B256, U256)>,
+    code: Option<B256>,
+    storage: bool,
+}
+
+/// What the walks share: the held state, where it is, and the prefix.
+struct Ctx<'a> {
+    store: &'a mut Store,
+    old_root: B256,
+    prefix: Option<&'a Nibbles>,
+}
+
+impl Ctx<'_> {
+    /// The node under `h` at a position: fetched (on disk) or held there.
+    fn local(
+        &mut self,
+        db: &NodeDb,
+        owner: Option<B256>,
+        path: &Nibbles,
+        h: &B256,
+    ) -> Result<Option<Bytes>, StepError> {
+        if let Some(b) = db.get(h).map_err(StepError::Store)? {
+            return Ok(Some(b));
+        }
+        self.store.node(owner, path, h).map_err(StepError::Store)
+    }
+
+    /// The new node `rlp` at `p`, diffed against the held state's.
+    fn open(&mut self, p: &Pos, rlp: &[u8], st: &mut StepStats) -> Result<Opened, StepError> {
+        let mut out = Opened::default();
+        let old_rlp: Option<Bytes> = match &p.old {
+            None => None,
+            Some(Ref::Inline(b)) => Some(b.clone()),
+            Some(Ref::Hash(h)) => {
+                let b = self
+                    .store
+                    .node(p.owner, &p.path, h)
+                    .map_err(StepError::Store)?;
+                if b.is_none() {
+                    st.old_missing += 1;
+                }
+                b
+            }
+        };
+        let Ok(new_shape) = shape(&p.path, rlp) else {
+            return Ok(out);
+        };
+        let old_shape = old_rlp.as_ref().and_then(|b| shape(&p.path, b).ok());
+        match new_shape {
+            Shape::Empty => {}
+            Shape::Inner(kids) => {
+                let old_kids: HashMap<Nibbles, Ref> = match &old_shape {
+                    Some(Shape::Inner(k)) => k.iter().cloned().collect(),
+                    _ => HashMap::new(),
+                };
+                for (q, r) in kids {
+                    if !compatible(self.prefix, &p.owner, &q) {
+                        continue;
+                    }
+                    let o = old_kids.get(&q).cloned();
+                    if o.as_ref() == Some(&r) {
+                        continue;
+                    }
+                    out.kids.push(Pos {
+                        owner: p.owner,
+                        path: q,
+                        new: r,
+                        old: o,
+                    });
+                }
+            }
+            Shape::Leaf { key, value } => {
+                if key.len() != 64 {
+                    return Ok(out);
+                }
+                let hash = B256::from_slice(&key.pack());
+                if let Some(owner) = p.owner {
+                    if let Ok(v) = decode_word(&value) {
+                        out.slot = Some((owner, hash, v));
+                    }
+                    return Ok(out);
+                }
+                let Ok(acct) = Account::decode(&value) else {
+                    return Ok(out);
+                };
+                let old = match &old_shape {
+                    Some(Shape::Leaf { key: ok, value: ov }) if *ok == key => {
+                        Account::decode(ov).ok()
+                    }
+                    _ => old_account(self.store, self.old_root, &key).map_err(StepError::Store)?,
+                };
+                let old_root = old.map(|a| a.storage_root).unwrap_or(EMPTY_ROOT);
+                if acct.storage_root != EMPTY_ROOT && acct.storage_root != old_root {
+                    out.storage = true;
+                    out.kids.push(Pos {
+                        owner: Some(hash),
+                        path: Nibbles::default(),
+                        new: Ref::Hash(acct.storage_root),
+                        old: (old_root != EMPTY_ROOT).then_some(Ref::Hash(old_root)),
+                    });
+                }
+                if acct.code_hash != KECCAK_EMPTY
+                    && old.map(|a| a.code_hash) != Some(acct.code_hash)
+                {
+                    out.code = Some(acct.code_hash);
+                }
+                out.account = Some((hash, acct));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// A node of the sync's tree: complete once opened and every child is.
+struct Pend {
+    key: u64,
+    parent: Option<u32>,
+    deps: u32,
+    opened: bool,
+}
+
+#[derive(Default)]
+struct Tree {
+    v: Vec<Option<Pend>>,
+    free: Vec<u32>,
+}
+
+impl Tree {
+    fn add(&mut self, key: u64, parent: Option<u32>) -> u32 {
+        let p = Pend {
+            key,
+            parent,
+            deps: 0,
+            opened: false,
+        };
+        match self.free.pop() {
+            Some(i) => {
+                self.v[i as usize] = Some(p);
+                i
+            }
+            None => {
+                self.v.push(Some(p));
+                (self.v.len() - 1) as u32
+            }
+        }
+    }
+    fn dep(&mut self, p: Option<u32>) {
+        if let Some(i) = p {
+            self.v[i as usize].as_mut().expect("live").deps += 1;
+        }
+    }
+    /// A child of `p` is complete; so, then, may `p` and its ancestors be.
+    fn child_done(&mut self, db: &mut NodeDb, mut p: Option<u32>) {
+        while let Some(i) = p {
+            let n = self.v[i as usize].as_mut().expect("live");
+            n.deps -= 1;
+            if n.deps > 0 || !n.opened {
+                return;
+            }
+            p = self.finish(db, i);
+        }
+    }
+    /// `i` is complete: mark it, free it, and return its parent.
+    fn finish(&mut self, db: &mut NodeDb, i: u32) -> Option<u32> {
+        let n = self.v[i as usize].take().expect("live");
+        db.mark_done(n.key);
+        self.free.push(i);
+        n.parent
+    }
+    fn opened(&mut self, db: &mut NodeDb, i: u32) {
+        let n = self.v[i as usize].as_mut().expect("live");
+        n.opened = true;
+        if n.deps == 0 {
+            let parent = self.finish(db, i);
+            self.child_done(db, parent);
+        }
+    }
+}
+
+struct Item {
+    pos: Pos,
+    parent: Option<u32>,
+}
+
+/// Needs one wave asks for at most.
+const WAVE: usize = 4096;
+const MAX_TRIES: u8 = 4;
+
+/// Fetch onto disk every node of `new_root`'s trie (and every new code)
+/// that the held state does not have at its position, skipping subtrees
+/// already complete. Depth first, so subtrees complete and leave memory
+/// early; each wave asks for up to [`WAVE`] nodes at once.
+#[allow(clippy::too_many_arguments)]
+async fn sync<S: Source>(
+    src: &mut S,
+    cx: &mut Ctx<'_>,
+    db: &mut NodeDb,
+    new_root: B256,
+    deadline: Instant,
+    st: &mut StepStats,
+) -> Result<(), StepError> {
+    let mut tree = Tree::default();
+    let mut stack = vec![Item {
+        pos: Pos {
+            owner: None,
+            path: Nibbles::default(),
+            new: Ref::Hash(new_root),
+            old: Some(Ref::Hash(cx.old_root)),
+        },
+        parent: None,
+    }];
+    let mut fetch: Vec<(Pos, u32, u8)> = Vec::new();
+    let mut codes: HashMap<B256, (Vec<u32>, u8)> = HashMap::new();
+    let mut steps = 0u64;
+    // Open a node: its children go on the stack, new code waits; then it
+    // is complete if nothing under it is outstanding.
+    fn open_slot(
+        cx: &mut Ctx<'_>,
+        db: &mut NodeDb,
+        tree: &mut Tree,
+        stack: &mut Vec<Item>,
+        codes: &mut HashMap<B256, (Vec<u32>, u8)>,
+        st: &mut StepStats,
+        pos: &Pos,
+        slot: Option<u32>,
+        rlp: &[u8],
+    ) -> Result<(), StepError> {
+        let o = cx.open(pos, rlp, st)?;
+        for k in o.kids {
+            tree.dep(slot);
+            stack.push(Item {
+                pos: k,
+                parent: slot,
+            });
+        }
+        if let Some(c) = o.code {
+            if !cx.store.has_code(&c).map_err(StepError::Store)?
+                && !db.contains(&c).map_err(StepError::Store)?
+            {
+                tree.dep(slot);
+                codes
+                    .entry(c)
+                    .or_default()
+                    .0
+                    .push(slot.expect("an account leaf is hashed"));
+            }
+        }
+        Ok(())
+    }
+    loop {
+        while fetch.len() < WAVE {
+            let Some(it) = stack.pop() else { break };
+            steps += 1;
+            if steps % 65_536 == 0 && Instant::now() > deadline {
+                return Err(StepError::Deadline);
+            }
+            let p = &it.pos;
+            if p.old.as_ref() == Some(&p.new) {
+                tree.child_done(db, it.parent);
+                continue;
+            }
+            match &p.new {
+                Ref::Inline(b) => {
+                    let b = b.clone();
+                    open_slot(
+                        cx, db, &mut tree, &mut stack, &mut codes, st, p, it.parent, &b,
+                    )?;
+                    tree.child_done(db, it.parent);
+                }
+                Ref::Hash(h) => {
+                    let key = done_key(&p.owner, &p.path, h);
+                    if db.is_done(key) {
+                        st.done_skips += 1;
+                        tree.child_done(db, it.parent);
+                        continue;
+                    }
+                    let slot = tree.add(key, it.parent);
+                    match cx.local(db, p.owner, &p.path, h)? {
+                        Some(b) => {
+                            st.local += 1;
+                            open_slot(
+                                cx,
+                                db,
+                                &mut tree,
+                                &mut stack,
+                                &mut codes,
+                                st,
+                                p,
+                                Some(slot),
+                                &b,
+                            )?;
+                            tree.opened(db, slot);
+                        }
+                        None => fetch.push((it.pos, slot, 0)),
+                    }
+                }
+            }
+        }
+        if fetch.is_empty() && codes.is_empty() {
+            break;
+        }
+        if Instant::now() > deadline {
+            return Err(StepError::Deadline);
+        }
+        st.levels += 1;
+        let mut needs = Vec::new();
+        let mut asked: HashSet<(Option<B256>, Nibbles, B256)> = HashSet::new();
+        for (p, _, _) in &fetch {
+            let Ref::Hash(h) = p.new else {
+                unreachable!("only hashed nodes are fetched")
+            };
+            if asked.insert((p.owner, p.path, h)) {
+                needs.push(Need {
+                    owner: p.owner,
+                    path: p.path,
+                    hash: h,
+                });
+            }
+        }
+        if !needs.is_empty() {
+            st.asked += needs.len() as u64;
+            for (i, b) in src.nodes(new_root, &needs, deadline).await {
+                if db.put(needs[i].hash, &b).map_err(StepError::Store)? {
+                    st.fetched += 1;
+                }
+            }
+        }
+        if !codes.is_empty() {
+            let want: Vec<B256> = codes.keys().copied().collect();
+            for (h, c) in src.codes(&want, deadline).await {
+                db.put(h, &c).map_err(StepError::Store)?;
+            }
+        }
+        let mut unresolved = (0usize, 0usize);
+        for (p, slot, tries) in std::mem::take(&mut fetch) {
+            let Ref::Hash(h) = p.new else { unreachable!() };
+            match db.get(&h).map_err(StepError::Store)? {
+                Some(b) => {
+                    open_slot(
+                        cx,
+                        db,
+                        &mut tree,
+                        &mut stack,
+                        &mut codes,
+                        st,
+                        &p,
+                        Some(slot),
+                        &b,
+                    )?;
+                    tree.opened(db, slot);
+                }
+                None if tries + 1 >= MAX_TRIES => unresolved.0 += 1,
+                None => fetch.push((p, slot, tries + 1)),
+            }
+        }
+        for (h, (slots, tries)) in std::mem::take(&mut codes) {
+            if db.contains(&h).map_err(StepError::Store)? {
+                for s in slots {
+                    tree.child_done(db, Some(s));
+                }
+            } else if tries + 1 >= MAX_TRIES {
+                unresolved.1 += 1;
+            } else {
+                codes.insert(h, (slots, tries + 1));
+            }
+        }
+        db.flush().map_err(StepError::Store)?;
+        if unresolved != (0, 0) {
+            return Err(StepError::Unresolved {
+                nodes: unresolved.0,
+                codes: unresolved.1,
+            });
+        }
+    }
+    db.flush().map_err(StepError::Store)?;
+    Ok(())
+}
+
+/// Walk `new_root`'s trie against the held state with every node local,
+/// streaming each hashed node that differs at its position into the rows.
+#[allow(clippy::too_many_arguments)]
+fn materialize(
+    cx: &mut Ctx<'_>,
+    db: &NodeDb,
+    new_root: B256,
+    slot_sample: usize,
+    sort_dir: &Path,
+    sort_budget: u64,
+    st: &mut StepStats,
+) -> Result<Healed, StepError> {
+    let mut rows = Rows::new(sort_dir, sort_budget).map_err(StepError::Store)?;
+    let mut accounts = Vec::new();
+    let mut slots = Vec::new();
+    let mut stack = vec![Pos {
+        owner: None,
+        path: Nibbles::default(),
+        new: Ref::Hash(new_root),
+        old: Some(Ref::Hash(cx.old_root)),
+    }];
+    let sort_err = |e: csl_eth_store::extsort::SortError| StepError::Store(e.to_string());
+    while let Some(p) = stack.pop() {
+        if p.old.as_ref() == Some(&p.new) {
+            continue;
+        }
+        let rlp = match &p.new {
+            Ref::Inline(b) => b.clone(),
+            Ref::Hash(h) => {
+                let b = cx
+                    .local(db, p.owner, &p.path, h)?
+                    .ok_or(StepError::Missing)?;
+                let nk = NodeKey::prefix(&p.path, p.path.len());
+                match p.owner {
+                    None => {
+                        let k = nk.table_key().map_err(|_| StepError::TooDeep)?;
+                        rows.sort.push(SORT_ACCOUNT, &k, &b).map_err(sort_err)?;
+                        rows.account_rows += 1;
+                        st.account_nodes += 1;
+                    }
+                    Some(o) => {
+                        let k = nk.storage_table_key(&o).map_err(|_| StepError::TooDeep)?;
+                        rows.sort.push(SORT_STORAGE, &k, &b).map_err(sort_err)?;
+                        rows.storage_rows += 1;
+                        st.storage_nodes += 1;
+                    }
+                }
+                st.node_bytes += b.len() as u64;
+                b
+            }
+        };
+        let o = cx.open(&p, &rlp, st)?;
+        if o.storage {
+            st.storage_tries += 1;
+        }
+        stack.extend(o.kids);
+        if let Some(s) = o.slot {
+            if slots.len() < slot_sample {
+                slots.push(s);
+            }
+        }
+        if let Some(c) = o.code {
+            if !rows.code.contains_key(&c.0) && !cx.store.has_code(&c).map_err(StepError::Store)? {
+                let b = db
+                    .get(&c)
+                    .map_err(StepError::Store)?
+                    .ok_or(StepError::Missing)?;
+                st.codes += 1;
+                st.code_bytes += b.len() as u64;
+                rows.code.insert(c.0, b.to_vec());
+            }
+        }
+        if let Some(a) = o.account {
+            st.accounts_changed += 1;
+            accounts.push(a);
+        }
+    }
+    Ok(Healed {
+        rows,
+        accounts,
+        slots,
+        stats: std::mem::take(st),
+    })
+}
+
+/// Heal from the held state at `old_root` to `new_root`: sync what is
+/// missing onto `db` from `src`, then materialize the step's rows locally.
+/// On any error the fetched nodes stay in `db` for the next attempt.
 #[allow(clippy::too_many_arguments)]
 pub async fn heal_step<S: Source>(
     src: &mut S,
     store: &mut Store,
-    cache: &mut Cache,
+    db: &mut NodeDb,
     old_root: B256,
     new_root: B256,
     prefix: Option<&Nibbles>,
     slot_sample: usize,
     deadline: Instant,
+    sort_dir: &Path,
+    sort_budget: u64,
 ) -> Result<Healed, StepError> {
-    const MAX_TRIES: u8 = 4;
     let lookups0 = store.lookups;
     let mut st = StepStats::default();
-    let mut rows = LayerRows::default();
-    let mut accounts = Vec::new();
-    let mut slots = Vec::new();
-    let mut want_code: BTreeSet<B256> = BTreeSet::new();
-    let mut frontier = vec![Pair {
-        owner: None,
-        path: Nibbles::default(),
-        new: Ref::Hash(new_root),
-        old: Some(Ref::Hash(old_root)),
-        tries: 0,
-    }];
-    let store_err = StepError::Store;
-    while !frontier.is_empty() {
-        if Instant::now() > deadline {
-            return Err(StepError::Deadline);
+    let mut cx = Ctx {
+        store,
+        old_root,
+        prefix,
+    };
+    let t0 = Instant::now();
+    sync(src, &mut cx, db, new_root, deadline, &mut st).await?;
+    st.sync_s = t0.elapsed().as_secs_f64();
+    let t1 = Instant::now();
+    let fetched = (
+        st.asked,
+        st.fetched,
+        st.local,
+        st.done_skips,
+        st.levels,
+        st.old_missing,
+    );
+    let mut sm = StepStats::default();
+    let r = materialize(
+        &mut cx,
+        db,
+        new_root,
+        slot_sample,
+        sort_dir,
+        sort_budget,
+        &mut sm,
+    );
+    match r {
+        Ok(mut h) => {
+            let s = &mut h.stats;
+            (s.asked, s.fetched, s.local, s.done_skips, s.levels) =
+                (fetched.0, fetched.1, fetched.2, fetched.3, fetched.4);
+            s.old_missing += fetched.5;
+            s.sync_s = st.sync_s;
+            s.materialize_s = t1.elapsed().as_secs_f64();
+            s.local_lookups = cx.store.lookups - lookups0;
+            Ok(h)
         }
-        st.levels += 1;
-        frontier.retain(|p| p.old.as_ref() != Some(&p.new));
-        let mut needs = Vec::new();
-        let mut asked: HashSet<B256> = HashSet::new();
-        let mut wave: HashMap<B256, Bytes> = HashMap::new();
-        for p in &frontier {
-            if let Ref::Hash(h) = p.new {
-                if cache.get(&h).is_none() && asked.insert(h) {
-                    needs.push(Need {
-                        owner: p.owner,
-                        path: p.path,
-                        hash: h,
-                    });
-                }
-            }
+        Err(StepError::Missing) => {
+            db.clear_done().map_err(StepError::Store)?;
+            Err(StepError::Missing)
         }
-        if !needs.is_empty() {
-            st.asked += needs.len() as u64;
-            let got = src.nodes(new_root, &needs, deadline).await;
-            for (i, b) in got {
-                // Checked by hash here, so a full cache never costs a node
-                // a peer served; the cache only decides what outlives a
-                // re-pivot.
-                if keccak256(&b) == needs[i].hash {
-                    st.fetched += 1;
-                    cache.put(needs[i].hash, b.clone());
-                    wave.insert(needs[i].hash, b);
-                }
-            }
-        }
-        let mut next = Vec::new();
-        let mut unresolved = 0usize;
-        for mut p in std::mem::take(&mut frontier) {
-            let new_rlp = match &p.new {
-                Ref::Inline(b) => b.clone(),
-                Ref::Hash(h) => match wave.get(h).or_else(|| cache.get(h)) {
-                    Some(b) => {
-                        if !asked.contains(h) {
-                            st.cached += 1;
-                        }
-                        b.clone()
-                    }
-                    None => {
-                        p.tries += 1;
-                        if p.tries >= MAX_TRIES {
-                            unresolved += 1;
-                        } else {
-                            next.push(p);
-                        }
-                        continue;
-                    }
-                },
-            };
-            if let Ref::Hash(_) = p.new {
-                let nk = NodeKey::prefix(&p.path, p.path.len());
-                match p.owner {
-                    None => {
-                        let k = nk.table_key().map_err(|_| StepError::TooDeep)?;
-                        st.account_nodes += 1;
-                        st.node_bytes += new_rlp.len() as u64;
-                        rows.account.insert(k, new_rlp.to_vec());
-                    }
-                    Some(o) => {
-                        let k = nk.storage_table_key(&o).map_err(|_| StepError::TooDeep)?;
-                        st.storage_nodes += 1;
-                        st.node_bytes += new_rlp.len() as u64;
-                        rows.storage.insert(k, new_rlp.to_vec());
-                    }
-                }
-            }
-            let old_rlp: Option<Bytes> = match &p.old {
-                None => None,
-                Some(Ref::Inline(b)) => Some(b.clone()),
-                Some(Ref::Hash(h)) => {
-                    let b = store.node(p.owner, &p.path, h).map_err(store_err)?;
-                    if b.is_none() {
-                        st.old_missing += 1;
-                    }
-                    b
-                }
-            };
-            let Ok(new_shape) = shape(&p.path, &new_rlp) else {
-                continue;
-            };
-            let old_shape = old_rlp.as_ref().and_then(|b| shape(&p.path, b).ok());
-            match new_shape {
-                Shape::Empty => {}
-                Shape::Inner(kids) => {
-                    let old_kids: HashMap<Nibbles, Ref> = match &old_shape {
-                        Some(Shape::Inner(k)) => k.iter().cloned().collect(),
-                        _ => HashMap::new(),
-                    };
-                    for (q, r) in kids {
-                        if !compatible(prefix, &p.owner, &q) {
-                            continue;
-                        }
-                        let o = old_kids.get(&q).cloned();
-                        if o.as_ref() == Some(&r) {
-                            continue;
-                        }
-                        next.push(Pair {
-                            owner: p.owner,
-                            path: q,
-                            new: r,
-                            old: o,
-                            tries: 0,
-                        });
-                    }
-                }
-                Shape::Leaf { key, value } => {
-                    if key.len() != 64 {
-                        continue;
-                    }
-                    let hash = B256::from_slice(&key.pack());
-                    if let Some(owner) = p.owner {
-                        if slots.len() < slot_sample {
-                            if let Ok(v) = decode_word(&value) {
-                                slots.push((owner, hash, v));
-                            }
-                        }
-                        continue;
-                    }
-                    let Ok(acct) = Account::decode(&value) else {
-                        continue;
-                    };
-                    st.accounts_changed += 1;
-                    let old = match &old_shape {
-                        Some(Shape::Leaf { key: ok, value: ov }) if *ok == key => {
-                            Account::decode(ov).ok()
-                        }
-                        _ => old_account(store, old_root, &key).map_err(store_err)?,
-                    };
-                    if let Some(pair) = storage_pair(hash, &acct, old.as_ref()) {
-                        st.storage_tries += 1;
-                        next.push(pair);
-                    }
-                    if acct.code_hash != KECCAK_EMPTY
-                        && old.map(|a| a.code_hash) != Some(acct.code_hash)
-                        && !rows.code.contains_key(&acct.code_hash.0)
-                        && !store.has_code(&acct.code_hash).map_err(store_err)?
-                    {
-                        want_code.insert(acct.code_hash);
-                    }
-                    accounts.push((hash, acct));
-                }
-            }
-        }
-        if unresolved > 0 {
-            return Err(StepError::Unresolved {
-                nodes: unresolved,
-                codes: 0,
-            });
-        }
-        frontier = next;
+        Err(e) => Err(e),
     }
-    // New code, a few tries.
-    let mut left: Vec<B256> = want_code.into_iter().collect();
-    for _ in 0..3 {
-        if left.is_empty() {
-            break;
-        }
-        let got = src.codes(&left, deadline).await;
-        for (h, c) in got {
-            if keccak256(&c) == h {
-                st.codes += 1;
-                st.code_bytes += c.len() as u64;
-                rows.code.insert(h.0, c.to_vec());
-            }
-        }
-        left.retain(|h| !rows.code.contains_key(&h.0));
-    }
-    if !left.is_empty() {
-        return Err(StepError::Unresolved {
-            nodes: 0,
-            codes: left.len(),
-        });
-    }
-    st.local_lookups = store.lookups - lookups0;
-    Ok(Healed {
-        rows,
-        accounts,
-        slots,
-        stats: st,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -834,9 +1399,10 @@ pub struct Args {
     pub peers: usize,
     #[arg(long, default_value_t = 30303)]
     pub udp_port: u16,
-    /// Bytes of fetched nodes kept across a re-pivot.
-    #[arg(long, default_value_t = 2048)]
-    pub cache_mib: usize,
+    /// Memory for sorting a step's rows; a bigger step spills to
+    /// `<work>/sort/`.
+    #[arg(long, default_value_t = 1024)]
+    pub sort_mib: u64,
     /// Changed slots read back through the client per step.
     #[arg(long, default_value_t = 2000)]
     pub verify_slots: usize,
@@ -968,7 +1534,12 @@ impl Healer {
 
     /// Write the step's layer, merge tiers, write the manifest, read the
     /// changes back through the client, publish, collect, save.
-    fn commit(&mut self, h: &Healed, update: &[u8], vh: &VerifiedHead) -> Result<Value, String> {
+    fn commit(
+        &mut self,
+        h: &mut Healed,
+        update: &[u8],
+        vh: &VerifiedHead,
+    ) -> Result<Value, String> {
         let t0 = Instant::now();
         let e = &vh.execution;
         let head = Head {
@@ -979,11 +1550,12 @@ impl Healer {
         };
         let before = self.st.layers.clone();
         if !h.rows.is_empty() {
-            let layer = write_layer(
+            let layer = write_layer_sorted(
                 &self.root,
                 self.st.head.block_number,
                 head.block_number,
-                &h.rows,
+                &mut h.rows.sort,
+                &h.rows.code,
                 EPSILON,
             )
             .map_err(|e| format!("layer: {e}"))?;
@@ -1244,7 +1816,10 @@ pub async fn run(args: Args) -> Result<(), String> {
         ..heal::Config::default()
     };
     let mut pool = Pool::start(&peer_cfg).map_err(|e| e.to_string())?;
-    let mut cache = Cache::new(args.cache_mib << 20);
+    // Fetched nodes, against the held state: kept across re-pivots and
+    // restarts, emptied when a step commits.
+    let mut db = NodeDb::open(&args.work.join("nodes"), h.st.head.state_root)?;
+    h.log.emit(json!({"ev": "nodes", "held": db.len(), "log_bytes": db.log_bytes(), "complete": db.done_len()}));
     let over = |s: u64| {
         (args.steps > 0 && s >= args.steps)
             || (args.max_wall_mins > 0
@@ -1282,16 +1857,18 @@ pub async fn run(args: Args) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(window);
         let t0 = Instant::now();
         let from = h.st.head.block_number;
-        let cached_before = cache.len();
+        let held_before = db.len();
         let r = heal_step(
             &mut pool,
             &mut h.store,
-            &mut cache,
+            &mut db,
             h.st.head.state_root,
             target.state_root,
             h.prefix.as_ref(),
             args.verify_slots,
             deadline,
+            &args.work.join("sort"),
+            args.sort_mib << 20,
         )
         .await;
         let heal_s = t0.elapsed().as_secs_f64();
@@ -1304,18 +1881,21 @@ pub async fn run(args: Args) -> Result<(), String> {
         };
         match r {
             Err(e) => {
-                warn!(from, to = target.block_number, error = %e, cached = cache.len(), "step failed; re-pivoting");
+                warn!(from, to = target.block_number, error = %e, held = db.len(), "step failed; re-pivoting");
                 h.log.emit(json!({
                     "ev": "repivot", "attempt": attempt, "from": from, "to": target.block_number, "error": e.to_string(),
-                    "heal_s": heal_s, "cached": cache.len(), "cached_before": cached_before, "peers": pool.connected(),
+                    "heal_s": heal_s, "held": db.len(), "held_before": held_before, "complete": db.done_len(),
+                    "log_bytes": db.log_bytes(), "peers": pool.connected(),
                 }));
                 if let StepError::Store(_) | StepError::TooDeep = e {
                     return Err(e.to_string());
                 }
             }
-            Ok(healed) => {
-                let res = tokio::task::block_in_place(|| h.commit(&healed, &update, &vh));
-                cache.clear();
+            Ok(mut healed) => {
+                let res = tokio::task::block_in_place(|| h.commit(&mut healed, &update, &vh));
+                if res.is_ok() {
+                    db.reset(h.st.head.state_root)?;
+                }
                 match res {
                     Ok(v) => {
                         info!(
@@ -1682,22 +2262,28 @@ mod tests {
 
     /// One healed step committed as the healer does, minus heads and
     /// publishing.
+    #[allow(clippy::too_many_arguments)]
     fn commit(
         dir: &Path,
         base: &Manifest,
         layers: &mut Vec<Tiered>,
         from: &Head,
         to: &Head,
-        h: &Healed,
+        h: &mut Healed,
         fanout: usize,
         top: u8,
-    ) -> Store {
+    ) -> (Store, Manifest) {
         if !h.rows.is_empty() {
-            layers.push(Tiered {
-                layer: write_layer(dir, from.block_number, to.block_number, &h.rows, EPSILON)
-                    .unwrap(),
-                tier: 0,
-            });
+            let layer = write_layer_sorted(
+                dir,
+                from.block_number,
+                to.block_number,
+                &mut h.rows.sort,
+                &h.rows.code,
+                EPSILON,
+            )
+            .unwrap();
+            layers.push(Tiered { layer, tier: 0 });
         }
         compact(dir, layers, fanout, top).unwrap();
         let m = write_layered_manifest(
@@ -1709,7 +2295,70 @@ mod tests {
         )
         .unwrap();
         read_back(dir, to, h).unwrap();
-        Store::open(dir, &m).unwrap()
+        (Store::open(dir, &m).unwrap(), m)
+    }
+
+    async fn step(
+        src: &mut Mem,
+        store: &mut Store,
+        db: &mut NodeDb,
+        old: &Head,
+        new: &Head,
+        dir: &Path,
+        budget: u64,
+    ) -> Result<Healed, StepError> {
+        heal_step(
+            src,
+            store,
+            db,
+            old.state_root,
+            new.state_root,
+            None,
+            10_000,
+            far(),
+            &dir.join("sort"),
+            budget,
+        )
+        .await
+    }
+
+    /// Does some run of `m` hold `v` under `k` in table `t`?
+    fn holds(dir: &Path, m: &Manifest, t: u16, k: &[u8; 32], v: &[u8]) -> bool {
+        m.runs(t).into_iter().any(|at| {
+            let f = File::open(dir.join(&at.path)).unwrap();
+            let mut rref = at.table.run_ref(at.block_lo);
+            rref.block_hi = at.block_hi;
+            let mut r = Reader::try_with_format(f, rref, RUN_FORMAT).unwrap();
+            r.prepare().unwrap();
+            r.get_entry(k)
+                .unwrap()
+                .0
+                .is_some_and(|e| e.tag == 0 && e.value == v)
+        })
+    }
+
+    /// Every node of a fresh build of `s` is held, byte for byte, at its
+    /// position by the base or a layer of `m`, and every code is held.
+    fn byte_identical(dir: &Path, m: &Manifest, s: &State, h: &Head) {
+        let r = rows(s, h);
+        for (k, v) in &r.account {
+            assert!(
+                holds(dir, m, TABLE_ACCOUNT_NODES, k, v),
+                "account row {}",
+                hex::encode(k)
+            );
+        }
+        for (k, v) in &r.storage {
+            assert!(
+                holds(dir, m, TABLE_STORAGE_NODES, k, v),
+                "storage row {}",
+                hex::encode(k)
+            );
+        }
+        let mut store = Store::open(dir, m).unwrap();
+        for c in code_of(s).keys() {
+            assert!(store.has_code(c).unwrap(), "code {c}");
+        }
     }
 
     #[tokio::test]
@@ -1725,20 +2374,19 @@ mod tests {
             .unwrap()
             .manifest;
         let mut store = Store::open(&dir, &base).unwrap();
+        let mut db = NodeDb::open(&dir.join("nodes"), heads[0].state_root).unwrap();
         let mut layers = Vec::new();
-        let mut cache = Cache::new(1 << 30);
         let all: Vec<B256> = s.iter().flat_map(|x| x.keys().copied()).collect();
         for i in 1..s.len() {
             let mut src = Mem::of(&s[i], &heads[i]);
-            let h = heal_step(
+            let mut h = step(
                 &mut src,
                 &mut store,
-                &mut cache,
-                heads[i - 1].state_root,
-                heads[i].state_root,
-                None,
-                10_000,
-                far(),
+                &mut db,
+                &heads[i - 1],
+                &heads[i],
+                &dir,
+                64 << 20,
             )
             .await
             .unwrap();
@@ -1748,22 +2396,34 @@ mod tests {
             let r = rows(&s[i], &heads[i]);
             let acct: HashMap<_, _> = r.account.iter().cloned().collect();
             let stor: HashMap<_, _> = r.storage.iter().cloned().collect();
+            let got = h.rows.collect();
             for (k, v) in &want.account {
-                assert_eq!(h.rows.account.get(k), Some(v), "account row missing");
+                assert_eq!(got.account.get(k), Some(v), "account row missing");
             }
             for (k, v) in &want.storage {
-                assert_eq!(h.rows.storage.get(k), Some(v), "storage row missing");
+                assert_eq!(got.storage.get(k), Some(v), "storage row missing");
             }
-            assert!(h.rows.account.iter().all(|(k, v)| acct.get(k) == Some(v)));
-            assert!(h.rows.storage.iter().all(|(k, v)| stor.get(k) == Some(v)));
+            assert!(got.account.iter().all(|(k, v)| acct.get(k) == Some(v)));
+            assert!(got.storage.iter().all(|(k, v)| stor.get(k) == Some(v)));
             assert_eq!(
-                h.rows.code.keys().collect::<BTreeSet<_>>(),
+                got.code.keys().collect::<BTreeSet<_>>(),
                 want.code.keys().collect::<BTreeSet<_>>()
             );
             eprintln!("step {i}: {:?}", h.stats);
-            cache.clear();
-            store = commit(&dir, &base, &mut layers, &heads[i - 1], &heads[i], &h, 4, 3);
+            let m;
+            (store, m) = commit(
+                &dir,
+                &base,
+                &mut layers,
+                &heads[i - 1],
+                &heads[i],
+                &mut h,
+                4,
+                3,
+            );
+            db.reset(heads[i].state_root).unwrap();
             reads_as(&dir, &s[i], &all, &heads[i]);
+            byte_identical(&dir, &m, &s[i], &heads[i]);
         }
         // S0 straight to S2 from the base alone: a gap is a bigger diff.
         let gap = scratch("gap");
@@ -1771,112 +2431,286 @@ mod tests {
             .unwrap()
             .manifest;
         let mut store = Store::open(&gap, &base2).unwrap();
+        let mut db = NodeDb::open(&gap.join("nodes"), heads[0].state_root).unwrap();
         let mut src = Mem::of(&s[2], &heads[2]);
-        let h = heal_step(
+        let mut h = step(
             &mut src,
             &mut store,
-            &mut cache,
-            heads[0].state_root,
-            heads[2].state_root,
-            None,
-            10_000,
-            far(),
+            &mut db,
+            &heads[0],
+            &heads[2],
+            &gap,
+            64 << 20,
         )
         .await
         .unwrap();
         let mut layers = Vec::new();
-        commit(&gap, &base2, &mut layers, &heads[0], &heads[2], &h, 4, 3);
+        let (_, m) = commit(
+            &gap,
+            &base2,
+            &mut layers,
+            &heads[0],
+            &heads[2],
+            &mut h,
+            4,
+            3,
+        );
         reads_as(&gap, &s[2], &all, &heads[2]);
+        byte_identical(&gap, &m, &s[2], &heads[2]);
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&gap).ok();
     }
 
     #[tokio::test]
-    async fn a_step_heals_with_no_cache() {
+    async fn a_step_bigger_than_its_sort_budget_spills() {
         let s = states();
         let heads: Vec<Head> = s
             .iter()
             .enumerate()
             .map(|(i, x)| head_of(x, i as u64))
             .collect();
-        let dir = scratch("nocache");
+        let dir = scratch("spill");
         let base = produce(&dir, &heads[0], "", leaves(&s[0]), &code_of(&s[0]))
             .unwrap()
             .manifest;
         let mut store = Store::open(&dir, &base).unwrap();
-        let mut cache = Cache::new(0);
-        let mut src = Mem::of(&s[1], &heads[1]);
-        let h = heal_step(
+        let mut db = NodeDb::open(&dir.join("nodes"), heads[0].state_root).unwrap();
+        let mut src = Mem::of(&s[2], &heads[2]);
+        let mut h = step(
             &mut src,
             &mut store,
-            &mut cache,
-            heads[0].state_root,
-            heads[1].state_root,
-            None,
-            100,
-            far(),
+            &mut db,
+            &heads[0],
+            &heads[2],
+            &dir,
+            8 << 10,
         )
         .await
         .unwrap();
-        assert!(cache.is_empty());
+        assert!(
+            h.rows.sort.stats(SORT_STORAGE).spills > 0
+                || h.rows.sort.stats(SORT_ACCOUNT).spills > 0
+        );
         let mut layers = Vec::new();
-        commit(&dir, &base, &mut layers, &heads[0], &heads[1], &h, 4, 3);
-        reads_as(&dir, &s[1], &[], &heads[1]);
+        let (_, m) = commit(&dir, &base, &mut layers, &heads[0], &heads[2], &mut h, 4, 3);
+        byte_identical(&dir, &m, &s[2], &heads[2]);
+        reads_as(&dir, &s[2], &[], &heads[2]);
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// A long backlog: each root leaves the window before its step is
+    /// done, the process restarts in the middle (with a torn record at the
+    /// log's end), and the last root completes from what is on disk plus
+    /// the few nodes it adds.
     #[tokio::test]
-    async fn a_repivot_keeps_what_was_fetched() {
+    async fn catch_up_across_pivots_and_a_restart() {
+        let s0 = states().remove(0);
+        let mut rng = ChaCha8Rng::seed_from_u64(5);
+        let mut chain = vec![s0];
+        for _ in 0..6 {
+            let next = churn(chain.last().unwrap(), &mut rng);
+            chain.push(next);
+        }
+        let heads: Vec<Head> = chain
+            .iter()
+            .enumerate()
+            .map(|(i, x)| head_of(x, i as u64))
+            .collect();
+        let last = chain.len() - 1;
+        // What one step from S0 to the last state fetches with nothing on
+        // disk.
+        let fresh = scratch("fresh");
+        let fbase = produce(
+            &fresh,
+            &heads[0],
+            "",
+            leaves(&chain[0]),
+            &code_of(&chain[0]),
+        )
+        .unwrap()
+        .manifest;
+        let mut fstore = Store::open(&fresh, &fbase).unwrap();
+        let mut fdb = NodeDb::open(&fresh.join("nodes"), heads[0].state_root).unwrap();
+        let full = step(
+            &mut Mem::of(&chain[last], &heads[last]),
+            &mut fstore,
+            &mut fdb,
+            &heads[0],
+            &heads[last],
+            &fresh,
+            64 << 20,
+        )
+        .await
+        .unwrap()
+        .stats;
+        fs::remove_dir_all(&fresh).ok();
+
+        let dir = scratch("catchup");
+        let base = produce(&dir, &heads[0], "", leaves(&chain[0]), &code_of(&chain[0]))
+            .unwrap()
+            .manifest;
+        let mut store = Store::open(&dir, &base).unwrap();
+        let nodes = dir.join("nodes");
+        let mut db = NodeDb::open(&nodes, heads[0].state_root).unwrap();
+        let budget = (full.fetched / 4) as usize;
+        let mut fetched = 0;
+        for (i, target) in [2usize, 3].into_iter().enumerate() {
+            let mut src = Mem::of(&chain[target], &heads[target]);
+            src.budget = budget;
+            let e = step(
+                &mut src,
+                &mut store,
+                &mut db,
+                &heads[0],
+                &heads[target],
+                &dir,
+                64 << 20,
+            )
+            .await;
+            assert!(
+                matches!(e, Err(StepError::Unresolved { .. })),
+                "attempt {i}: {:?}",
+                e.as_ref().err()
+            );
+            fetched += budget;
+        }
+        let (held, complete) = (db.len(), db.done_len());
+        assert!(held > 0 && complete > 0, "{held} {complete}");
+        // Restart: the process dies mid-write.
+        drop(db);
+        File::options()
+            .append(true)
+            .open(nodes.join("log"))
+            .unwrap()
+            .write_all(&[7u8; 50])
+            .unwrap();
+        let mut db = NodeDb::open(&nodes, heads[0].state_root).unwrap();
+        assert_eq!((db.len(), db.done_len()), (held, complete));
+        let mut src = Mem::of(&chain[4], &heads[4]);
+        src.budget = budget;
+        assert!(step(
+            &mut src,
+            &mut store,
+            &mut db,
+            &heads[0],
+            &heads[4],
+            &dir,
+            64 << 20
+        )
+        .await
+        .is_err());
+        fetched += budget;
+        // The last root completes.
+        let mut src = Mem::of(&chain[last], &heads[last]);
+        let mut h = step(
+            &mut src,
+            &mut store,
+            &mut db,
+            &heads[0],
+            &heads[last],
+            &dir,
+            64 << 20,
+        )
+        .await
+        .unwrap();
+        eprintln!(
+            "full {} fetched; catch-up {} before, {} in the last attempt: {:?}",
+            full.fetched, fetched, h.stats.fetched, h.stats
+        );
+        assert!(h.stats.local + h.stats.done_skips > 0);
+        assert!(
+            h.stats.fetched < full.fetched,
+            "{} vs {}",
+            h.stats.fetched,
+            full.fetched
+        );
+        let mut layers = Vec::new();
+        let (_, m) = commit(
+            &dir,
+            &base,
+            &mut layers,
+            &heads[0],
+            &heads[last],
+            &mut h,
+            4,
+            3,
+        );
+        byte_identical(&dir, &m, &chain[last], &heads[last]);
+        reads_as(&dir, &chain[last], &[], &heads[last]);
+        // A held state that moved empties the directory.
+        drop(db);
+        let db = NodeDb::open(&nodes, heads[last].state_root).unwrap();
+        assert_eq!((db.len(), db.done_len()), (0, 0));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Markers that claim more than the disk holds (a false eight-byte
+    /// match, or a lost log) make the materializing walk miss a node: the
+    /// markers are dropped and the next attempt completes.
+    #[tokio::test]
+    async fn a_marker_without_its_nodes_is_recovered() {
         let s = states();
         let heads: Vec<Head> = s
             .iter()
             .enumerate()
             .map(|(i, x)| head_of(x, i as u64))
             .collect();
-        let dir = scratch("repivot");
+        let dir = scratch("markers");
         let base = produce(&dir, &heads[0], "", leaves(&s[0]), &code_of(&s[0]))
             .unwrap()
             .manifest;
         let mut store = Store::open(&dir, &base).unwrap();
-        let mut cache = Cache::new(1 << 30);
-        // S1's root leaves the window after 60 nodes.
+        let mut db = NodeDb::open(&dir.join("nodes"), heads[0].state_root).unwrap();
         let mut src = Mem::of(&s[1], &heads[1]);
-        src.budget = 60;
-        let e = heal_step(
+        src.budget = 200;
+        assert!(step(
             &mut src,
             &mut store,
-            &mut cache,
-            heads[0].state_root,
-            heads[1].state_root,
-            None,
-            100,
-            far(),
+            &mut db,
+            &heads[0],
+            &heads[1],
+            &dir,
+            64 << 20
+        )
+        .await
+        .is_err());
+        // Lose the log, keep the markers.
+        let complete = db.done_len();
+        assert!(complete > 0);
+        db.log.set_len(0).unwrap();
+        db.end = 0;
+        db.idx.clear();
+        let mut src = Mem::of(&s[1], &heads[1]);
+        let e = step(
+            &mut src,
+            &mut store,
+            &mut db,
+            &heads[0],
+            &heads[1],
+            &dir,
+            64 << 20,
         )
         .await;
         assert!(
-            matches!(e, Err(StepError::Unresolved { .. })),
+            matches!(e, Err(StepError::Missing)),
             "{:?}",
             e.as_ref().err()
         );
-        assert_eq!(cache.len(), 60);
-        // Re-pivot to S2: nodes S1 and S2 share come from the cache.
-        let mut src = Mem::of(&s[2], &heads[2]);
-        let h = heal_step(
+        assert_eq!(db.done_len(), 0);
+        let mut h = step(
             &mut src,
             &mut store,
-            &mut cache,
-            heads[0].state_root,
-            heads[2].state_root,
-            None,
-            100,
-            far(),
+            &mut db,
+            &heads[0],
+            &heads[1],
+            &dir,
+            64 << 20,
         )
         .await
         .unwrap();
-        assert!(h.stats.cached > 0, "{:?}", h.stats);
         let mut layers = Vec::new();
-        commit(&dir, &base, &mut layers, &heads[0], &heads[2], &h, 4, 3);
-        reads_as(&dir, &s[2], &[], &heads[2]);
+        let (_, m) = commit(&dir, &base, &mut layers, &heads[0], &heads[1], &mut h, 4, 3);
+        byte_identical(&dir, &m, &s[1], &heads[1]);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1890,28 +2724,19 @@ mod tests {
             .unwrap()
             .manifest;
         let mut store = Store::open(&dir, &base).unwrap();
+        let mut db = NodeDb::open(&dir.join("nodes"), h0.state_root).unwrap();
         let mut layers: Vec<Tiered> = Vec::new();
-        let mut cache = Cache::new(1 << 30);
         let (mut s, mut h) = (s0, h0);
         let mut max_layers = 0;
         for n in 1..=20u64 {
             let next = churn(&s, &mut rng);
             let hn = head_of(&next, n);
             let mut src = Mem::of(&next, &hn);
-            let healed = heal_step(
-                &mut src,
-                &mut store,
-                &mut cache,
-                h.state_root,
-                hn.state_root,
-                None,
-                10_000,
-                far(),
-            )
-            .await
-            .unwrap();
-            cache.clear();
-            store = commit(&dir, &base, &mut layers, &h, &hn, &healed, 2, 3);
+            let mut healed = step(&mut src, &mut store, &mut db, &h, &hn, &dir, 64 << 20)
+                .await
+                .unwrap();
+            (store, _) = commit(&dir, &base, &mut layers, &h, &hn, &mut healed, 2, 3);
+            db.reset(hn.state_root).unwrap();
             max_layers = max_layers.max(layers.len());
             // Tiers never increase toward the newest.
             assert!(

@@ -195,6 +195,66 @@ pub fn write_layer(
     })
 }
 
+/// Sorter tables a step's rows stream into: account nodes, storage nodes.
+pub const SORT_ACCOUNT: usize = 0;
+pub const SORT_STORAGE: usize = 1;
+
+/// A sorter for a step's rows, one table each for account and storage
+/// nodes, in `dir` under `budget` bytes; a repeated key must carry the same
+/// node.
+pub fn layer_sorter(dir: &Path, budget: u64) -> crate::extsort::ExtSort {
+    use crate::extsort::{Budget, Dups, ExtSort};
+    ExtSort::new(dir, Budget::new(budget), &[Dups::KeepOne, Dups::KeepOne])
+}
+
+/// [`write_layer`] from rows streamed into a [`layer_sorter`] (any order)
+/// and code by hash: a step too big for memory.
+pub fn write_layer_sorted(
+    root: &Path,
+    from_block: u64,
+    to_block: u64,
+    sort: &mut crate::extsort::ExtSort,
+    code: &BTreeMap<[u8; 32], Vec<u8>>,
+    epsilon: u16,
+) -> Result<Layer, ProduceError> {
+    sort.prepare().map_err(sort_err)?;
+    let mut tables = Vec::new();
+    for (t, s) in [
+        (TABLE_ACCOUNT_NODES, SORT_ACCOUNT),
+        (TABLE_STORAGE_NODES, SORT_STORAGE),
+    ] {
+        let n = sort.stats(s).entries;
+        if n > 0 {
+            tables.push(write_run_with(root, t, epsilon, n, |push| {
+                sort.merge::<ProduceError>(s, |k, v| push(Entry::value(*k, v.to_vec())))
+                    .map(|_| ())
+            })?);
+        }
+    }
+    let rows = LayerRows {
+        code: code.clone(),
+        ..LayerRows::default()
+    };
+    let mut l = write_layer(root, from_block, to_block, &rows, epsilon)?;
+    tables.extend(l.tables.drain(..));
+    tables.sort_by_key(|t| t.table_id);
+    Ok(Layer {
+        from_block,
+        to_block,
+        tables,
+    })
+}
+
+fn sort_err(e: crate::extsort::SortError) -> ProduceError {
+    ProduceError::Io(std::io::Error::other(e.to_string()))
+}
+
+impl From<crate::extsort::SortError> for ProduceError {
+    fn from(e: crate::extsort::SortError) -> Self {
+        sort_err(e)
+    }
+}
+
 /// The manifest of `head`'s state as `base` plus `layers` (oldest first),
 /// written under `root` at `snapshots/<hash>/manifest.json`, and
 /// `snapshots/latest` pointed at it when `latest`.
