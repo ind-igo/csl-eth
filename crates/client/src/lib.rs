@@ -362,11 +362,19 @@ pub(crate) fn check_manifest(
     if manifest.block_hash != hash {
         return Err("manifest names a different block".into());
     }
-    // Version 2 is a plain snapshot, version 3 a base plus layers; a
-    // manifest whose version and shape disagree is refused.
+    // Version 2 is a plain snapshot; version 3 names another block's plain
+    // tables as its base, plus layers (none when nothing changed), and has
+    // no by-hash table. A manifest whose version and shape disagree is
+    // refused.
     let layered = manifest.is_layered();
+    let well_layered = manifest.base.is_some_and(|b| b != hash)
+        && manifest.table(TABLE_NODES_BY_HASH).is_none()
+        && manifest
+            .layers
+            .iter()
+            .all(|l| l.tables.iter().all(|t| t.table_id != TABLE_NODES_BY_HASH));
     if !(manifest.format_version == FORMAT_VERSION && !layered
-        || manifest.format_version == FORMAT_VERSION_LAYERED && layered)
+        || manifest.format_version == FORMAT_VERSION_LAYERED && well_layered)
     {
         return Err(format!(
             "manifest format version {}{}, this client reads {FORMAT_VERSION} (plain) and {FORMAT_VERSION_LAYERED} (layered)",
@@ -1519,7 +1527,7 @@ impl<D: Driver> Snapshot<D> {
                 Ok((page, p, _)) => {
                     first_page.get_or_insert(page);
                     if let Some(e) = p.find(&code_hash.0) {
-                        entries.push(e.clone());
+                        entries.push((page, e.clone()));
                     }
                 }
                 Err(e) if is_pending(&e) => pending = true,
@@ -1544,46 +1552,63 @@ impl<D: Driver> Snapshot<D> {
             });
             return Ok((Read::Insufficient(r), self.cost(0, 0)));
         }
+        // The trace names the candidate that answered, or else the first
+        // that failed.
         let mut why: Option<Reason> = None;
-        for e in entries {
+        let mut failed: Option<(u64, Option<String>)> = None;
+        for (page, e) in entries {
+            let blob = (e.tag == 2).then(|| {
+                let h: [u8; 32] = e.value.as_slice().try_into().expect("tag 2 is 32 bytes");
+                blob_path(&h)
+            });
+            let mut fail = |why: &mut Option<Reason>, r: Reason| {
+                why.get_or_insert(r);
+                failed.get_or_insert((page, blob.clone()));
+            };
             let bytes = match e.tag {
                 0 => e.value,
                 2 => {
                     let h: [u8; 32] = e.value.as_slice().try_into().expect("tag 2 is 32 bytes");
-                    if let Some(c) = self.trace.code.as_mut() {
-                        c.blob = Some(blob_path(&h));
-                    }
                     match self.store.file(&blob_path(&h))? {
                         Ok(Some(b)) if *blake3::hash(&b).as_bytes() == h => b,
                         Ok(Some(_)) => {
-                            why.get_or_insert(Reason::Blob(
-                                "blob does not hash to its name".into(),
-                            ));
+                            fail(
+                                &mut why,
+                                Reason::Blob("blob does not hash to its name".into()),
+                            );
                             continue;
                         }
                         Ok(None) => {
-                            why.get_or_insert(Reason::Blob(format!(
-                                "{} is not in the bucket",
-                                blob_path(&h)
-                            )));
+                            fail(
+                                &mut why,
+                                Reason::Blob(format!("{} is not in the bucket", blob_path(&h))),
+                            );
                             continue;
                         }
                         Err(e) => {
-                            why.get_or_insert(Reason::Blob(e));
+                            fail(&mut why, Reason::Blob(e));
                             continue;
                         }
                     }
                 }
                 _ => {
-                    why.get_or_insert(Reason::Code("tombstone in the code table"));
+                    fail(&mut why, Reason::Code("tombstone in the code table"));
                     continue;
                 }
             };
             if keccak256(&bytes) != *code_hash {
-                why.get_or_insert(Reason::Code("bytecode does not hash to codeHash"));
+                fail(&mut why, Reason::Code("bytecode does not hash to codeHash"));
                 continue;
             }
+            if let Some(c) = self.trace.code.as_mut() {
+                c.page = Some(page);
+                c.blob = blob;
+            }
             return Ok((Read::Verified(bytes), self.cost(0, 0)));
+        }
+        if let (Some(c), Some((page, blob))) = (self.trace.code.as_mut(), failed) {
+            c.page = Some(page);
+            c.blob = blob;
         }
         Ok((
             Read::Insufficient(why.expect("a candidate failed")),

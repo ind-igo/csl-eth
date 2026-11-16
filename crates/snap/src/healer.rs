@@ -385,6 +385,7 @@ pub async fn heal_step<S: Source>(
         frontier.retain(|p| p.old.as_ref() != Some(&p.new));
         let mut needs = Vec::new();
         let mut asked: HashSet<B256> = HashSet::new();
+        let mut wave: HashMap<B256, Bytes> = HashMap::new();
         for p in &frontier {
             if let Ref::Hash(h) = p.new {
                 if cache.get(&h).is_none() && asked.insert(h) {
@@ -400,8 +401,14 @@ pub async fn heal_step<S: Source>(
             st.asked += needs.len() as u64;
             let got = src.nodes(new_root, &needs, deadline).await;
             for (i, b) in got {
-                st.fetched += 1;
-                cache.put(needs[i].hash, b);
+                // Checked by hash here, so a full cache never costs a node
+                // a peer served; the cache only decides what outlives a
+                // re-pivot.
+                if keccak256(&b) == needs[i].hash {
+                    st.fetched += 1;
+                    cache.put(needs[i].hash, b.clone());
+                    wave.insert(needs[i].hash, b);
+                }
             }
         }
         let mut next = Vec::new();
@@ -409,7 +416,7 @@ pub async fn heal_step<S: Source>(
         for mut p in std::mem::take(&mut frontier) {
             let new_rlp = match &p.new {
                 Ref::Inline(b) => b.clone(),
-                Ref::Hash(h) => match cache.get(h) {
+                Ref::Hash(h) => match wave.get(h).or_else(|| cache.get(h)) {
                     Some(b) => {
                         if !asked.contains(h) {
                             st.cached += 1;
@@ -1782,6 +1789,40 @@ mod tests {
         reads_as(&gap, &s[2], &all, &heads[2]);
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&gap).ok();
+    }
+
+    #[tokio::test]
+    async fn a_step_heals_with_no_cache() {
+        let s = states();
+        let heads: Vec<Head> = s
+            .iter()
+            .enumerate()
+            .map(|(i, x)| head_of(x, i as u64))
+            .collect();
+        let dir = scratch("nocache");
+        let base = produce(&dir, &heads[0], "", leaves(&s[0]), &code_of(&s[0]))
+            .unwrap()
+            .manifest;
+        let mut store = Store::open(&dir, &base).unwrap();
+        let mut cache = Cache::new(0);
+        let mut src = Mem::of(&s[1], &heads[1]);
+        let h = heal_step(
+            &mut src,
+            &mut store,
+            &mut cache,
+            heads[0].state_root,
+            heads[1].state_root,
+            None,
+            100,
+            far(),
+        )
+        .await
+        .unwrap();
+        assert!(cache.is_empty());
+        let mut layers = Vec::new();
+        commit(&dir, &base, &mut layers, &heads[0], &heads[1], &h, 4, 3);
+        reads_as(&dir, &s[1], &[], &heads[1]);
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
