@@ -76,6 +76,11 @@ export default Alchemy.Stack(
     // The bucket: page and data side by side (index.html, viz.html, dist/,
     // pkg/ beside head/, snapshots/, blobs/; no key collides). Readable by
     // anyone; uniform access, so no object carries its own ACL.
+    // Soft delete is off (retention 0), set by hand since this resource has
+    // no prop for it: `gcloud storage buckets update gs://csl-eth-demo
+    // --clear-soft-delete` (2026-11-16). Merged-away delta layers would
+    // otherwise stay billable for Google's default seven days. Everything in
+    // the bucket can be rebuilt; a deleted object is gone at once.
     const bucket = yield* GCP.Storage.Bucket("bucket", {
       bucketName,
       location: region.toUpperCase(),
