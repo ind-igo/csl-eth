@@ -31,7 +31,9 @@
 use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{Nibbles, EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use csl_eth_store::{
-    blob_path, manifest_path, table_path, Manifest, D_ACCOUNT, D_STORAGE, FORMAT_VERSION,
+    blob_path,
+    hints::{hints_path, top8, Holds},
+    manifest_path, table_path, Manifest, D_ACCOUNT, D_STORAGE, FORMAT_VERSION,
     FORMAT_VERSION_LAYERED, LATEST_FILE, RUN_FORMAT, TABLE_COUNT,
 };
 use csl_eth_trie::{
@@ -39,7 +41,12 @@ use csl_eth_trie::{
     Outcome, Shape, Step,
 };
 use csl_run::{Reader, PAGE};
-use std::{cell::RefCell, collections::HashMap, fmt, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 pub mod store;
 /// The trie crate the trace's steps come from.
@@ -158,6 +165,9 @@ pub struct Cost {
     /// Model pages this read fetched (page 0 is the open's): the cold part
     /// of a read, zero once the key's neighbourhoods are known.
     pub model_pages: u64,
+    /// Layer runs this read asked for anything (the base not counted):
+    /// what the layers' hints save.
+    pub layers: u32,
 }
 
 /// Which trie a traced walk is in.
@@ -444,7 +454,7 @@ impl<D: Driver> Opener<D> {
                 Err(e) => return Ok(Err(e)),
             },
         };
-        let manifest = match self.store.file(&manifest_path(&hash))? {
+        let mut manifest = match self.store.file(&manifest_path(&hash))? {
             Ok(Some(m)) => match check_manifest(&m, hash, self.state_root) {
                 Ok(m) => m,
                 Err(e) => return Ok(Err(e)),
@@ -452,6 +462,23 @@ impl<D: Driver> Opener<D> {
             Ok(None) => return Ok(Err(format!("no snapshot at {hash}"))),
             Err(e) => return Ok(Err(e)),
         };
+        // Hints too large for the manifest, in one round with the page 0s
+        // below. They only schedule: one that is missing or does not hash
+        // leaves its layer asked for everything.
+        let mut pending = false;
+        for l in manifest.layers.iter_mut() {
+            let Some(name) = l.hints_file else { continue };
+            l.hints = Default::default();
+            match self.store.file(&hints_path(&name)) {
+                Err(Pending) => pending = true,
+                Ok(Ok(Some(b))) => {
+                    if let Ok(h) = csl_eth_store::hints::Hints::from_file(&b, &name) {
+                        l.hints = h;
+                    }
+                }
+                Ok(_) => {}
+            }
+        }
         // Every table's page 0 (the top model and the model tree's root) in
         // one round: each is a range the store may lack, and a reader's
         // `prepare` is the read that wants it. A table that fails here (a
@@ -463,7 +490,6 @@ impl<D: Driver> Opener<D> {
         // layer that changed it; each is opened the same way, and one that
         // fails only takes its own candidates away.
         let mut runs: Vec<Vec<RunSlot>> = Vec::with_capacity(TABLE_COUNT);
-        let mut pending = false;
         for t in 0..TABLE_COUNT as u16 {
             let mut slots = Vec::new();
             for at in manifest.runs(t) {
@@ -491,6 +517,7 @@ impl<D: Driver> Opener<D> {
                 slots.push(RunSlot {
                     rel: at.path,
                     reader,
+                    layer: at.layer,
                 });
             }
             runs.push(slots);
@@ -514,6 +541,7 @@ impl<D: Driver> Opener<D> {
             attempts: 0,
             checked: HashMap::new(),
             round_keys: Vec::new(),
+            asked: HashSet::new(),
             tracing: false,
         }))
     }
@@ -524,6 +552,16 @@ impl<D: Driver> Opener<D> {
 struct RunSlot {
     rel: String,
     reader: Result<Reader<RunView>, Reason>,
+    /// Its layer's index in the manifest; `None` for the base.
+    layer: Option<usize>,
+}
+
+/// Which trie a walk reads, for the layers' hints: the account trie at a
+/// path (its first eight nibbles), or an owner's storage trie.
+#[derive(Clone, Copy)]
+enum Scope {
+    Account { top8: u32 },
+    Storage { owner: B256 },
 }
 
 /// What every run of a table holds at one key: the candidates, each with
@@ -562,6 +600,8 @@ pub struct Snapshot<D> {
     checked: HashMap<(Trie, bool, NodeKey), u32>,
     /// The table keys the current attempt asked for.
     round_keys: Vec<RoundKey>,
+    /// Layer runs (table, run) the current read asked.
+    asked: HashSet<(u16, usize)>,
     /// Keep a [`Trace`] of each read's final walk(s) and the attempt's
     /// table keys (off by default). Tracing only records: what is fetched,
     /// every answer and every [`Cost`] are the same either way.
@@ -680,6 +720,7 @@ impl<D: Driver> Snapshot<D> {
     pub fn begin_read(&mut self) {
         self.store.begin_read();
         self.model_at_begin = self.model_requests();
+        self.asked.clear();
         self.attempts = 0;
         self.checked.clear();
         self.trace = Trace::default();
@@ -869,6 +910,7 @@ impl<D: Driver> Snapshot<D> {
             repairs,
             nodes,
             model_pages: self.model_requests().saturating_sub(self.model_at_begin),
+            layers: self.asked.len() as u32,
         }
     }
 
@@ -880,7 +922,12 @@ impl<D: Driver> Snapshot<D> {
     /// Every run is asked before a `Pending`, so one round wants them all.
     /// A run that cannot answer gives no candidate; its reason is the
     /// answer only when no run gives one.
-    fn fetch(&mut self, table: u16, key: &[u8; 32]) -> Result<Result<Found, Reason>, Pending> {
+    fn fetch(
+        &mut self,
+        table: u16,
+        key: &[u8; 32],
+        ask: Option<&[bool]>,
+    ) -> Result<Result<Found, Reason>, Pending> {
         let slots = &mut self.runs[table as usize];
         if slots.is_empty() {
             return Ok(Err(Reason::NoTable(table)));
@@ -892,6 +939,12 @@ impl<D: Driver> Snapshot<D> {
         let mut err: Option<Reason> = None;
         let mut pending = false;
         for (i, slot) in slots.iter_mut().enumerate() {
+            if ask.is_some_and(|a| !a[i]) {
+                continue;
+            }
+            if slot.layer.is_some() {
+                self.asked.insert((table, i));
+            }
             let r = match slot.reader.as_mut() {
                 Ok(r) => r,
                 Err(why) => {
@@ -1024,9 +1077,15 @@ impl<D: Driver> Snapshot<D> {
     /// come in the next round: a cold neighbourhood is two rounds, a warm
     /// one is one.
     fn want_pages(&mut self, table: u16, keys: &[[u8; 32]]) {
+        self.want_pages_of(table, keys, None)
+    }
+
+    /// [`Self::want_pages`] in the runs `asks[i]` names for `keys[i]`
+    /// (`None`: every run).
+    fn want_pages_of(&mut self, table: u16, keys: &[[u8; 32]], asks: Option<&[Vec<bool>]>) {
         let h = self.hint;
         let store = &self.store;
-        for slot in self.runs[table as usize].iter_mut() {
+        for (si, slot) in self.runs[table as usize].iter_mut().enumerate() {
             let Ok(reader) = slot.reader.as_mut() else {
                 continue;
             };
@@ -1034,7 +1093,10 @@ impl<D: Driver> Snapshot<D> {
                 continue;
             };
             let len = layout.record_bytes as usize;
-            for k in keys {
+            for (ki, k) in keys.iter().enumerate() {
+                if asks.is_some_and(|a| !a[ki][si]) {
+                    continue;
+                }
                 let Ok(p) = reader.predict_page(csl_run::k64(k)) else {
                     continue;
                 };
@@ -1078,6 +1140,46 @@ impl<D: Driver> Snapshot<D> {
 
     /// The depths of `path` the speculative round asks `table` for: every
     /// depth up to `max_depth` the cache does not answer.
+    /// The runs of `table` a position at `depth` is asked of, by the
+    /// layers' hints, newest first: a layer that may hold it is asked; one
+    /// that holds it for sure ends the search, older runs then holding
+    /// nothing newer; the base is asked unless that happened. A layer
+    /// without a hint for the table is always asked.
+    fn plan(&self, table: u16, scope: Scope, depth: usize) -> Vec<bool> {
+        let slots = &self.runs[table as usize];
+        let mut ask = vec![false; slots.len()];
+        for i in (0..slots.len()).rev() {
+            let Some(li) = slots[i].layer else {
+                ask[i] = true;
+                break;
+            };
+            let h = &self.manifest.layers[li].hints;
+            let v = match scope {
+                Scope::Account { top8 } => h
+                    .account
+                    .as_ref()
+                    .map_or(Holds::Maybe, |p| p.holds(top8, depth)),
+                // An owner's storage changed in a layer: its root is there.
+                Scope::Storage { owner } => h.storage.as_ref().map_or(Holds::Maybe, |s| {
+                    match (s.contains(&owner.0), depth) {
+                        (false, _) => Holds::No,
+                        (true, 0) => Holds::Yes,
+                        (true, _) => Holds::Maybe,
+                    }
+                }),
+            };
+            match v {
+                Holds::No => {}
+                Holds::Maybe => ask[i] = true,
+                Holds::Yes => {
+                    ask[i] = true;
+                    break;
+                }
+            }
+        }
+        ask
+    }
+
     fn speculative(&self, path: &Nibbles, max_depth: usize, cache: bool) -> (Vec<NodeKey>, Nodes) {
         let mut wanted = Vec::with_capacity(max_depth + 1);
         let mut nodes = Nodes::new();
@@ -1106,6 +1208,7 @@ impl<D: Driver> Snapshot<D> {
         root: B256,
         key: B256,
         path: &Nibbles,
+        scope: Scope,
         key_of: impl Fn(&NodeKey) -> [u8; 32],
         max_depth: usize,
         cache: bool,
@@ -1125,13 +1228,28 @@ impl<D: Driver> Snapshot<D> {
         for (nk, tk) in wanted.iter().zip(&keys) {
             self.note_key(table, trie, nk.depth(), *tk);
         }
-        self.want_pages(table, &keys);
+        // Each depth asks the runs the hints name; a position whose plan
+        // skipped a run is asked of every run before the walk gives up on
+        // it.
+        let asks: Vec<Vec<bool>> = wanted
+            .iter()
+            .map(|nk| self.plan(table, scope, nk.depth()))
+            .collect();
+        let mut fetched: HashSet<NodeKey> = wanted.iter().copied().collect();
+        // Positions asked of only some runs so far.
+        let mut partial: HashSet<NodeKey> = wanted
+            .iter()
+            .zip(&asks)
+            .filter(|(_, a)| a.iter().any(|x| !x))
+            .map(|(nk, _)| *nk)
+            .collect();
+        self.want_pages_of(table, &keys, Some(&asks));
         // Every depth of the round, errors deferred to the repair that
         // would need the node; a depth the store cannot answer yet does
         // not stop the others from being wanted in the same round.
         let mut pending = false;
-        for (nk, tk) in wanted.into_iter().zip(&keys) {
-            match self.fetch(table, tk) {
+        for ((nk, tk), a) in wanted.into_iter().zip(&keys).zip(&asks) {
+            match self.fetch(table, tk, Some(a)) {
                 Ok(Ok(f)) if !f.cands.is_empty() => {
                     nodes.insert(nk, f.cands);
                 }
@@ -1171,6 +1289,37 @@ impl<D: Driver> Snapshot<D> {
             match w.outcome {
                 Outcome::Present(v) => break (Read::Verified(v), walked),
                 Outcome::Absent(by) => break (Read::VerifiedAbsent(by), walked),
+                // A position whose candidates came from only some runs (a
+                // stale node there, say, and the right one in a run the
+                // hints skipped) is asked of every run before it fails.
+                // This is not charged to the repair budget: it happens at
+                // most once a position (it leaves `partial`), so it is
+                // bounded by the walk's length, and a budget spent on
+                // hint-scheduled asks must not stop a needed widening.
+                Outcome::Invalid(nk, _) | Outcome::Missing(nk) if partial.contains(&nk) => {
+                    let tk = key_of(&nk);
+                    self.note_key(table, trie, nk.depth(), tk);
+                    self.want_pages(table, &[tk]);
+                    match self.fetch(table, &tk, None)? {
+                        Ok(f) if !f.cands.is_empty() => {
+                            partial.remove(&nk);
+                            nodes.insert(nk, f.cands);
+                        }
+                        Ok(f) => {
+                            missed.insert(
+                                nk,
+                                Origin::NotServed {
+                                    searched: f.searched,
+                                },
+                            );
+                            break (
+                                Read::Insufficient(Reason::Missing { table, key: tk }),
+                                walked,
+                            );
+                        }
+                        Err(r) => break (Read::Insufficient(r), walked),
+                    }
+                }
                 Outcome::Invalid(nk, what) => {
                     let r = Reason::Invalid {
                         table,
@@ -1186,8 +1335,29 @@ impl<D: Driver> Snapshot<D> {
                     repairs += 1;
                     let tk = key_of(&nk);
                     self.note_key(table, trie, nk.depth(), tk);
+                    // A position not yet asked: the runs its plan names
+                    // first, then, if none has it, every run. One asked of
+                    // only some: every run now.
+                    let mut got = None;
+                    if fetched.insert(nk) {
+                        let a = self.plan(table, scope, nk.depth());
+                        if a.iter().any(|x| !x) {
+                            self.want_pages_of(table, &[tk], Some(std::slice::from_ref(&a)));
+                            match self.fetch(table, &tk, Some(&a))? {
+                                Ok(f) if !f.cands.is_empty() => {
+                                    partial.insert(nk);
+                                    got = Some(f.cands);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if let Some(c) = got {
+                        nodes.insert(nk, c);
+                        continue;
+                    }
                     self.want_pages(table, &[tk]);
-                    match self.fetch(table, &tk)? {
+                    match self.fetch(table, &tk, None)? {
                         Ok(f) if !f.cands.is_empty() => {
                             nodes.insert(nk, f.cands);
                         }
@@ -1230,6 +1400,9 @@ impl<D: Driver> Snapshot<D> {
             self.state_root(),
             *hashed,
             &path,
+            Scope::Account {
+                top8: top8(&hashed.0),
+            },
             |nk| nk.table_key().expect("walk depth ≤ 62"),
             d,
             true,
@@ -1256,6 +1429,7 @@ impl<D: Driver> Snapshot<D> {
             account.storage_root,
             *hashed_slot,
             &path,
+            Scope::Storage { owner },
             |nk| nk.storage_table_key(&owner).expect("walk depth ≤ 62"),
             d,
             false,
@@ -1339,7 +1513,7 @@ impl<D: Driver> Snapshot<D> {
                     fetched += 1;
                     self.note_key(table, trie, nk.depth(), h.0);
                     self.want_pages(TABLE_NODES_BY_HASH, &[h.0]);
-                    match self.fetch(TABLE_NODES_BY_HASH, &h.0)? {
+                    match self.fetch(TABLE_NODES_BY_HASH, &h.0, None)? {
                         Ok(f) if !f.cands.is_empty() => {
                             nodes.insert(nk, f.cands);
                         }
@@ -1449,7 +1623,10 @@ impl<D: Driver> Snapshot<D> {
         for (d, k) in skeys.iter().enumerate() {
             self.note_key(TABLE_STORAGE_NODES, Trie::Storage, d, *k);
         }
-        self.want_pages(TABLE_STORAGE_NODES, &skeys);
+        let asks: Vec<Vec<bool>> = (0..skeys.len())
+            .map(|d| self.plan(TABLE_STORAGE_NODES, Scope::Storage { owner }, d))
+            .collect();
+        self.want_pages_of(TABLE_STORAGE_NODES, &skeys, Some(&asks));
         let (acct, ar, an) = self.account_walk(hashed)?;
         let acct = match acct {
             Read::Verified(a) => a,
@@ -1487,7 +1664,47 @@ impl<D: Driver> Snapshot<D> {
         r
     }
 
+    /// The code table's runs to ask for `code_hash`, newest first: the
+    /// newest layer whose hint names it (any copy that hashes is the
+    /// code), else every layer without a hint, and the base.
+    fn code_plan(&self, code_hash: &B256) -> Vec<bool> {
+        let slots = &self.runs[TABLE_CODE as usize];
+        let mut ask = vec![false; slots.len()];
+        for i in (0..slots.len()).rev() {
+            let Some(li) = slots[i].layer else {
+                ask[i] = true;
+                break;
+            };
+            match &self.manifest.layers[li].hints.code {
+                None => ask[i] = true,
+                Some(k) if k.contains(&code_hash.0) => {
+                    ask[i] = true;
+                    break;
+                }
+                Some(_) => {}
+            }
+        }
+        ask
+    }
+
+    /// The runs the hints name first; if none of them gives the code,
+    /// every run.
     fn code_inner(&mut self, code_hash: &B256) -> Result<(Read<Vec<u8>>, Cost), Pending> {
+        let ask = self.code_plan(code_hash);
+        if ask.iter().all(|a| *a) {
+            return self.code_pass(code_hash, None);
+        }
+        match self.code_pass(code_hash, Some(&ask))? {
+            (Read::Verified(b), c) => Ok((Read::Verified(b), c)),
+            _ => self.code_pass(code_hash, None),
+        }
+    }
+
+    fn code_pass(
+        &mut self,
+        code_hash: &B256,
+        ask: Option<&[bool]>,
+    ) -> Result<(Read<Vec<u8>>, Cost), Pending> {
         if self.tracing {
             self.trace.code = Some(CodeTrace {
                 code_hash: *code_hash,
@@ -1500,7 +1717,10 @@ impl<D: Driver> Snapshot<D> {
             return Ok((Read::Verified(Vec::new()), self.cost(0, 0)));
         }
         self.note_key(TABLE_CODE, Trie::Account, 0, code_hash.0);
-        self.want_pages(TABLE_CODE, &[code_hash.0]);
+        match ask {
+            Some(a) => self.want_pages_of(TABLE_CODE, &[code_hash.0], Some(&[a.to_vec()])),
+            None => self.want_pages(TABLE_CODE, &[code_hash.0]),
+        }
         // Every run of the code table: a layer adds code the base lacks,
         // and any copy that hashes to `codeHash` is the code.
         let slots = &mut self.runs[TABLE_CODE as usize];
@@ -1514,7 +1734,13 @@ impl<D: Driver> Snapshot<D> {
         let mut err: Option<Reason> = None;
         let mut first_page = None;
         let mut pending = false;
-        for slot in slots.iter_mut() {
+        for (i, slot) in slots.iter_mut().enumerate() {
+            if ask.is_some_and(|a| !a[i]) {
+                continue;
+            }
+            if slot.layer.is_some() {
+                self.asked.insert((TABLE_CODE, i));
+            }
             let reader = match slot.reader.as_mut() {
                 Ok(r) => r,
                 Err(why) => {

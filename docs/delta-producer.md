@@ -95,13 +95,19 @@ On Sepolia, which has access lists today, option 3 can be prototyped by replayin
 - `heal.json` holds the base, the head, the tiers and what is published, so a restart resumes.
 - Publishing goes to `scripts/gcs-publish.sh` (runs are cached as immutable), to a directory, or to a dry run.
 
+**Catch-up from any gap.** A step is two walks. The sync fetches onto disk (`work/nodes`: a log of hash-checked records and an index of eight bytes per hash) every node of the new root that the held state lacks at its position, depth first, and marks a subtree complete once it and everything under it is local. Nodes and markers survive re-pivots and restarts, so a re-pivot re-walks from the newest root and skips what is complete, as snap sync's healing does. The materializing walk then runs locally with no deadline and streams each changed node into an external sorter (`--sort-mib`, spilling under `work/sort`). A multi-day backlog therefore needs neither the peers' window for its local work nor memory for its rows. Test: four pivots and a restart with a torn log tail publish what one uninterrupted step does, byte for byte.
+
+**The finalized tier.** Every 30 s the healer checks the light client's finalized header. If a manifest for that block is published, it pins it: `head/finality` is written, and collection keeps the last two pinned manifests and every run they reach, whatever `--keep` says. If the finalized block is ahead of the held head (a catch-up), the healer steps to the finalized root first, so the first manifest after a gap is a finalized one. If it is behind the head and was never a step, the event is `finalized_missed` and the next one is pinned. On mainnet (2026-11-16, the Mac's slice) an earlier run missed two finalized heads (each fell between steps below the held head); on the next run three in a row (blocks 26,428,472, 26,428,504 and 26,428,535) were pinned as the light client reported them.
+
+**Per-layer skip hints** (`crates/store/src/hints.rs`). Each layer carries, per table, what it may hold: account positions cut to the shallowest depth at which they cover at most 1% of that depth's prefixes, storage owners, and code hashes (eight-byte prefixes). A table over 65,536 entries gets no hint. Hints up to 4 KiB sit in the manifest; larger ones go to `runs/<blake3>.hints`, which the client fetches with the page 0s when it opens the snapshot. The client asks a position only of the runs whose hint says Maybe or Yes, newest first, and stops at the first Yes. Hints are not authenticated, so they only schedule. A position whose walk fails (Missing or Invalid) after some runs were skipped is asked of every run before the read can be `Insufficient`; a lying, missing or non-hashing hint costs repair rounds, never an answer (tested).
+
+**The storage-root → owner index.** When an account appears with a storage root that another owner already holds, the healer copies that trie locally under the new owner instead of fetching it from peers. The index (`work/roots.idx`, sorted 40-byte records, plus an append log) is built once from the held manifest's account runs, and each committed step appends its new tries. A copy is verified against the root before it is used, and an index entry that has gone stale only means a fetch.
+
 **Not built, against the plan above:**
 
-- The storage-root → owner index (a new owner whose storage root another already has is fetched whole from peers).
 - The sharded base and base compaction.
-- Size-triggered tiers. Tiers are count-triggered (`--fanout` per tier, `--tiers` levels, the top tier one run since the base), and compaction runs inside the step.
-- Per-run density hints, so a reader still asks every run.
-- Access lists, and the sustained snap/1 probe.
+- Size-triggered tiers. Tiers are count-triggered (`--fanout` per tier, `--tiers` levels, the top tier one layer since the base), and compaction runs inside the step.
+- Access lists.
 
 **Tests.** The client has three layer tests: a base plus two layers answers every key as a fresh build of the last state; a dropped or corrupted layer yields only `Insufficient`; plain cost is pinned. They run over a crafted transition table: an extension split, a branch collapse, an owner sharing another's storage root, deletion then recreation with new code, and embedded↔hashed. The healer has four tests on the same table:
 
@@ -112,15 +118,19 @@ On Sepolia, which has access lists today, option 3 can be prototyped by replayin
 
 **Read cost over layers** (synthetic: about 4% of accounts change per step, so each layer is dense; `read_cost_over_n_layers_and_merged`):
 
-| layers | requests | bytes | rounds | the same layers merged into one |
-|---|---|---|---|---|
-| 1 | 1.32× | 1.35× | 2.12 vs 2.00 | 1.32×, 1.35× |
-| 2 | 1.60× | 1.66× | 2.14 vs 2.04 | 1.35×, 1.34× |
-| 4 | 2.26× | 2.37× | 2.17 vs 1.98 | 1.34×, 1.41× |
-| 8 | 3.38× | 3.60× | 2.31 vs 2.10 | 1.33×, 1.44× |
-| 16 | 5.65× | 6.07× | 2.31 vs 2.21 | 1.40×, 1.49× |
+Costs are relative to a fresh plain build of the same state; "layers/read" is the distinct layer runs a read asked.
 
-Rounds barely move; requests and bytes grow about linearly with runs, because each run is one more predicted page per depth. Merging restores the cost to about 1.35×. The success bar (twice the base-only read) is therefore a bound of about three layers, unless density hints let readers skip runs. With count tiers the worst case is `(fanout − 1) × tiers + 1` layers: 16 at the defaults (fanout 4, 5 tiers), 3 at fanout 2 and 2 tiers, which rewrites the since-base run every four steps. Choosing between read cost and rewrite volume is what the mainnet run is for; density hints are the way out of the trade.
+| layers | hinted: requests, bytes, layers/read | unhinted: requests, bytes, layers/read | merged into one | manifest |
+|---|---|---|---|---|
+| 1 | 1.01×, 1.01×, 1.00 | 1.32×, 1.35×, 1.14 | 1.01×, 1.01× | 2.5 KB |
+| 2 | 1.00×, 1.00×, 1.12 | 1.60×, 1.66×, 2.28 | 1.03×, 1.01× | 3.6 KB |
+| 4 | 1.05×, 1.03×, 1.38 | 2.26×, 2.37×, 4.51 | 1.01×, 1.00× | 5.7 KB |
+| 8 | 1.09×, 1.08×, 1.66 | 3.38×, 3.60×, 8.96 | 1.02×, 1.04× | 9.7 KB |
+| 16 | 1.11×, 1.08×, 2.05 | 5.65×, 6.07×, 18.00 | 1.07×, 1.07× | 18.3 KB |
+
+Rounds stay between 2.0 and 2.3 throughout. Without hints, requests and bytes grow about linearly with runs, because each run is one more predicted page per depth. With hints a read asks about two layers even at sixteen, and the merged layer now costs nearly what a fresh build does, because a key the layer did not change skips it. The success bar (twice the base-only read) holds at the default tiers (fanout 4, 5 tiers: at most 13 hinted layers plus the since-base layer).
+
+On mainnet the hint sizes decide which tiers are hinted. A block changes about a thousand accounts, so a 64-block layer holds about 50,000 and fits under the cap, while a 256-block layer would not. At five tiers the hinted tiers are the 1-, 4-, 16- and 64-block ones, and the top tier (since the base) is asked with the base. The price is the hint files: about 2 MB in all when every tier is full, fetched once when a snapshot is opened. A reader that makes only a few reads would do better skipping them; the client fetches them always for now.
 
 **On mainnet, from the Mac (2026-11-16).**
 
@@ -130,11 +140,7 @@ Rounds barely move; requests and bytes grow about linearly with runs, because ea
 - **Checks.** Each step read its changed accounts back through the client before publishing, and the fourth merged a tier.
 - **Completeness.** `healed_dir_is_complete` (ignored test, `crates/snap/src/healer.rs`) then read every account of the slice from the published directory at block 26,428,391: 105,253 unchanged, 9 changed, 29,355 slots, 2,218 codes, none insufficient.
 
-**What remains before `full/`.**
-
-- **The finalized tier.** The healer publishes `head/optimistic` and period updates, not `head/finality`, and its manifests (`--keep 64`, about 13 minutes at one block a step) do not reach back to the finalized block.
-- **Catch-up from a stale base.** A step holds its rows in memory and must finish within the peers' window; a re-pivot keeps at most `--cache-mib` of fetched nodes. A backlog whose diff exceeds that does not converge, so `full/` (block 26,422,083, a day and more behind) needs a fresh burst (about $7) and the healer started within hours of it. A disk-backed node cache would lift this.
-- **The read-cost trade**, above.
+**What remains before `full/`.** The three gaps the first run left (the finalized tier, catch-up from a stale base, the read-cost trade) are closed above. What is left is running it: a VM with the base on local disk, a public IP for inbound peers, and a sustained run to measure the peer window and catch-up rate from a multi-day-old base.
 
 ## Review: what was set aside
 

@@ -495,5 +495,7 @@ Later the same day: at MTU 1,420 the path carried 1,420-byte packets to Google c
 
 **Reviewed** once (GPT 6.1 via omp). It found a real bug: nodes were resolved only through the bounded cache, so a full cache dropped nodes peers had served and the step failed (fixed; tested with a zero-size cache). It also found two smaller ones, the loose format-3 check and code traces naming the wrong candidate (both fixed). It found no path to a wrong answer in the client and no omission in the healer's walk or the merge.
 
-**Open.** The finalized tier (`head/finality`, manifests back to the finalized block); catch-up from a stale base (needs a fresh burst, or a disk-backed node cache); the storage-root → owner index; base sharding and compaction; density hints.
+**Since.** The finalized tier, catch-up from any gap (fetched nodes on disk), per-layer skip hints and the storage-root → owner index are built (see `docs/delta-producer.md` § Built). Hints are unauthenticated and only schedule: a read that skipped a run asks every run before it can be `Insufficient`.
+
+**Open.** Base sharding and compaction; size-triggered tiers; whether a few-read client should skip hint files.
 

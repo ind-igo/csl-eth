@@ -20,6 +20,7 @@
 pub mod beacon;
 pub mod export;
 pub mod extsort;
+pub mod hints;
 pub mod history;
 pub mod layer;
 pub mod producer;
@@ -35,8 +36,8 @@ pub use export::{
     MIN_WORKER_BYTES,
 };
 pub use layer::{
-    layer_sorter, merge_layers, write_layer, write_layer_sorted, write_layered_manifest, LayerRows,
-    SORT_ACCOUNT, SORT_STORAGE,
+    layer_hints, layer_sorter, merge_layers, write_layer, write_layer_sorted,
+    write_layered_manifest, LayerRows, SORT_ACCOUNT, SORT_STORAGE,
 };
 pub use producer::{
     build_rows, produce, produce_with, AccountLeaf, Head, Options as ProduceOptions, ProduceError,
@@ -183,6 +184,14 @@ pub struct Layer {
     pub from_block: u64,
     pub to_block: u64,
     pub tables: Vec<TableRef>,
+    /// Which keys it may hold, for scheduling reads only
+    /// ([`hints`]); absent for a table, every key is asked of it.
+    #[serde(default, skip_serializing_if = "hints::Hints::is_empty")]
+    pub hints: hints::Hints,
+    /// Hints too large for the manifest: the `blake3` of the file at
+    /// [`hints::hints_path`]. The client reads `hints` from it.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "hex32_opt")]
+    pub hints_file: Option<[u8; 32]>,
 }
 
 /// One run a table is read from: its path in the bucket and its ref.
@@ -193,6 +202,9 @@ pub struct RunAt {
     /// The blocks its contents come from (the base's: its own block).
     pub block_lo: u64,
     pub block_hi: u64,
+    /// The index of its layer in [`Manifest::layers`]; `None` for the
+    /// base.
+    pub layer: Option<usize>,
 }
 
 impl Manifest {
@@ -227,15 +239,17 @@ impl Manifest {
                 table: *t,
                 block_lo: base_block,
                 block_hi: base_block,
+                layer: None,
             });
         }
-        for l in &self.layers {
+        for (i, l) in self.layers.iter().enumerate() {
             if let Some(t) = l.tables.iter().find(|t| t.table_id == table_id) {
                 out.push(RunAt {
                     path: run_path(&t.root),
                     table: *t,
                     block_lo: l.from_block,
                     block_hi: l.to_block,
+                    layer: Some(i),
                 });
             }
         }
@@ -248,6 +262,27 @@ impl Manifest {
 
     pub fn from_json(bytes: &[u8]) -> Result<Manifest, serde_json::Error> {
         serde_json::from_slice(bytes)
+    }
+}
+
+pub(crate) mod hex32_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<[u8; 32]>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(v) => s.serialize_str(&hex::encode(v)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 32]>, D::Error> {
+        let s = Option::<String>::deserialize(d)?;
+        s.map(|s| {
+            let v = hex::decode(&s).map_err(serde::de::Error::custom)?;
+            v.try_into()
+                .map_err(|_| serde::de::Error::custom("expected 32 bytes"))
+        })
+        .transpose()
     }
 }
 
@@ -308,6 +343,8 @@ mod tests {
                 root: [8; 32],
                 ..m.tables[0]
             }],
+            hints: Default::default(),
+            hints_file: None,
         });
         let j = l.to_json();
         assert_eq!(Manifest::from_json(j.as_bytes()).unwrap(), l);

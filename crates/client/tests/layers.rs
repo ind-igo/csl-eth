@@ -19,7 +19,7 @@ use csl_eth_trie::{encode_word, path_of, Account};
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -363,6 +363,20 @@ fn scratch(name: &str) -> PathBuf {
     p
 }
 
+/// The owners whose storage nodes a layer from `old` to `new` holds:
+/// those with storage whose root changed or who are new.
+fn owners(old: &State, new: &State) -> BTreeSet<[u8; 32]> {
+    new.iter()
+        .filter(|(k, a)| {
+            !a.storage.is_empty()
+                && old
+                    .get(*k)
+                    .is_none_or(|o| storage_root(&o.storage) != storage_root(&a.storage))
+        })
+        .map(|(k, _)| k.0)
+        .collect()
+}
+
 /// A bucket with the base S0, layers L1 (S0→S1) and L2 (S1→S2), the
 /// layered manifests of S1 and S2, and a fresh plain build of S2 in
 /// another directory.
@@ -389,8 +403,10 @@ fn fixture(name: &str) -> Fixture {
         rows(&s1, &heads[1]),
         rows(&s2, &heads[2]),
     ];
-    let d1 = LayerRows::diff(&r[0], &r[1]);
-    let d2 = LayerRows::diff(&r[1], &r[2]);
+    let mut d1 = LayerRows::diff(&r[0], &r[1]);
+    let mut d2 = LayerRows::diff(&r[1], &r[2]);
+    d1.owners = Some(owners(&s0, &s1));
+    d2.owners = Some(owners(&s1, &s2));
     assert!(
         !d1.storage.is_empty()
             && !d1.code.is_empty()
@@ -542,6 +558,7 @@ struct Tally {
     bytes: u64,
     rounds: u64,
     max_rounds: u32,
+    layers: u64,
 }
 
 impl Tally {
@@ -551,6 +568,7 @@ impl Tally {
         self.bytes += c.bytes;
         self.rounds += c.rounds as u64;
         self.max_rounds = self.max_rounds.max(c.rounds);
+        self.layers += c.layers as u64;
     }
     fn line(&self) -> String {
         let n = self.reads.max(1) as f64;
@@ -794,6 +812,45 @@ fn layer_faults_never_become_false_answers() {
     let (ins, _) = check(&f.dir, &f, &ps, &want, false, 3, "foreign layer");
     assert_eq!(ins, 0);
 
+    // Hints only schedule. Hints that say No to everything a layer holds,
+    // in the manifest or in a hint file, cost repair rounds; a hint file
+    // that does not hash, or is gone, costs the hints. No answer changes.
+    use csl_eth_store::hints::{hints_path, Hints, KeySet, PathHint};
+    let lie = Hints {
+        account: Some(PathHint {
+            depth: 8,
+            cut: vec![],
+            short: vec![],
+        }),
+        storage: Some(KeySet(vec![])),
+        code: Some(KeySet(vec![])),
+    };
+    let lying = |file: Option<[u8; 32]>| {
+        let mut l = f.l2.clone();
+        l.hints = if file.is_some() {
+            Hints::default()
+        } else {
+            lie.clone()
+        };
+        l.hints_file = file;
+        claim(&f, vec![f.l1.clone(), l]);
+    };
+    lying(None);
+    let (ins, _) = check(&f.dir, &f, &ps, &want, false, 0, "lying hints");
+    assert_eq!(ins, 0);
+    let bytes = lie.to_bytes();
+    let name = *blake3::hash(&bytes).as_bytes();
+    std::fs::write(f.dir.join(hints_path(&name)), &bytes).unwrap();
+    lying(Some(name));
+    let (ins, _) = check(&f.dir, &f, &ps, &want, false, 0, "lying hint file");
+    assert_eq!(ins, 0);
+    std::fs::write(f.dir.join(hints_path(&name)), b"{}").unwrap();
+    let (ins, _) = check(&f.dir, &f, &ps, &want, false, 0, "hint file not hashing");
+    assert_eq!(ins, 0);
+    std::fs::remove_file(f.dir.join(hints_path(&name))).unwrap();
+    let (ins, _) = check(&f.dir, &f, &ps, &want, false, 0, "hint file gone");
+    assert_eq!(ins, 0);
+
     // A manifest that says it is plain but lists layers is refused.
     let mut m: Manifest = Manifest::from_json(
         &std::fs::read(f.dir.join(manifest_path(&f.heads[2].block_hash))).unwrap(),
@@ -894,12 +951,14 @@ fn read_cost_over_n_layers_and_merged() {
         let next = churn(&s, &mut rng);
         let h = head_of(&next, n);
         let r = rows(&next, &h);
+        let mut d = LayerRows::diff(&r_prev, &r);
+        d.owners = Some(owners(&s, &next));
         layers.push(
             write_layer(
                 &dir,
                 h0.block_number + n as u64 - 1,
                 h.block_number,
-                &LayerRows::diff(&r_prev, &r),
+                &d,
                 EPSILON,
             )
             .unwrap(),
@@ -932,11 +991,31 @@ fn read_cost_over_n_layers_and_merged() {
             l2: layers[0].clone(),
             keys: states().3,
         };
-        write_layered_manifest(&dir, &h, &base, layers.clone(), true).unwrap();
+        let bare: Vec<csl_eth_store::Layer> = layers
+            .iter()
+            .map(|l| csl_eth_store::Layer {
+                hints: Default::default(),
+                ..l.clone()
+            })
+            .collect();
+        write_layered_manifest(&dir, &h, &base, bare, true).unwrap();
+        let (ins, unhinted) = check(
+            &dir,
+            &f,
+            &ps,
+            &want,
+            false,
+            0,
+            &format!("{n} layers, no hints"),
+        );
+        assert_eq!(ins, 0);
+        let m = write_layered_manifest(&dir, &h, &base, layers.clone(), true).unwrap();
+        let mbytes = m.to_json().len();
         let (ins, layered) = check(&dir, &f, &ps, &want, false, 0, &format!("{n} layers"));
         assert_eq!(ins, 0);
         let (_, plain) = check(&fresh, &f, &ps, &want, false, 0, "fresh");
         let merged = merge_layers(&dir, &layers, EPSILON).unwrap();
+        let hint_file = merged.hints_file.is_some();
         write_layered_manifest(&dir, &h, &base, vec![merged], true).unwrap();
         let (ins, one) = check(
             &dir,
@@ -948,14 +1027,23 @@ fn read_cost_over_n_layers_and_merged() {
             &format!("{n} layers merged"),
         );
         assert_eq!(ins, 0);
+        let x = |t: &Tally| {
+            format!(
+                "{:.2}x requests, {:.2}x bytes, {:.2} rounds, {:.2} layers/read",
+                t.requests as f64 / plain.requests as f64,
+                t.bytes as f64 / plain.bytes as f64,
+                t.rounds as f64 / t.reads as f64,
+                t.layers as f64 / t.reads as f64,
+            )
+        };
         lines.push(format!(
-            "{n:>2} layers: {:.2}x requests, {:.2}x bytes, {:.2} vs {:.2} rounds; merged: {:.2}x requests, {:.2}x bytes",
-            layered.requests as f64 / plain.requests as f64,
-            layered.bytes as f64 / plain.bytes as f64,
-            layered.rounds as f64 / layered.reads as f64,
+            "{n:>2} layers: hinted {} | unhinted {} | merged {} (hint file {hint_file}) | fresh {:.2} rounds | manifest {} B, depths {:?}",
+            x(&layered),
+            x(&unhinted),
+            x(&one),
             plain.rounds as f64 / plain.reads as f64,
-            one.requests as f64 / plain.requests as f64,
-            one.bytes as f64 / plain.bytes as f64,
+            mbytes,
+            layers.iter().map(|l| l.hints.account.as_ref().map(|a| a.depth)).collect::<Vec<_>>(),
         ));
         std::fs::remove_dir_all(&fresh).ok();
     }

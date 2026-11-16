@@ -10,6 +10,7 @@
 //! to, so a stale node in an older run is never accepted, a missing one is
 //! `Insufficient`, and nothing ever needs deleting for a read to be right.
 
+use crate::hints::{hints_path, Hints, KeySet, PathHintBuilder, HINT_INLINE};
 use crate::producer::Head;
 use crate::{
     blob_path, manifest_path, producer::write_atomic, profile_id, run_path, Layer, Manifest,
@@ -18,7 +19,7 @@ use crate::{
 };
 use csl_run::{Config, Entry, Reader, RunRef, Writer};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     path::Path,
 };
@@ -31,6 +32,9 @@ pub struct LayerRows {
     pub account: BTreeMap<[u8; 32], Vec<u8>>,
     pub storage: BTreeMap<[u8; 32], Vec<u8>>,
     pub code: BTreeMap<[u8; 32], Vec<u8>>,
+    /// The owners (`keccak(address)`) of the storage nodes, for the
+    /// layer's hint; `None` when not known (no storage hint then).
+    pub owners: Option<BTreeSet<[u8; 32]>>,
 }
 
 impl LayerRows {
@@ -68,6 +72,7 @@ impl LayerRows {
                 .filter(|(k, _)| !old.code.contains_key(*k))
                 .map(|(k, v)| (*k, v.clone()))
                 .collect(),
+            owners: None,
         }
     }
 }
@@ -188,11 +193,19 @@ pub fn write_layer(
         tables.push(write_run(root, TABLE_CODE, epsilon, entries.into_iter())?);
     }
     tables.sort_by_key(|t| t.table_id);
-    Ok(Layer {
+    let mut account = PathHintBuilder::default();
+    rows.account.keys().for_each(|k| account.push(k));
+    with_hints(
+        root,
         from_block,
         to_block,
         tables,
-    })
+        Hints {
+            account: account.finish(),
+            storage: rows.owners.as_ref().and_then(|o| KeySet::of(o.iter())),
+            code: KeySet::of(rows.code.keys()),
+        },
+    )
 }
 
 /// Sorter tables a step's rows stream into: account nodes, storage nodes.
@@ -208,26 +221,36 @@ pub fn layer_sorter(dir: &Path, budget: u64) -> crate::extsort::ExtSort {
 }
 
 /// [`write_layer`] from rows streamed into a [`layer_sorter`] (any order)
-/// and code by hash: a step too big for memory.
+/// and code by hash: a step too big for memory. `owners`: the storage
+/// nodes' owners, for the hint (`None`: not known, no storage hint).
+#[allow(clippy::too_many_arguments)]
 pub fn write_layer_sorted(
     root: &Path,
     from_block: u64,
     to_block: u64,
     sort: &mut crate::extsort::ExtSort,
     code: &BTreeMap<[u8; 32], Vec<u8>>,
+    owners: Option<&BTreeSet<[u8; 32]>>,
     epsilon: u16,
 ) -> Result<Layer, ProduceError> {
     sort.prepare().map_err(sort_err)?;
     let mut tables = Vec::new();
+    let mut account = PathHintBuilder::default();
     for (t, s) in [
         (TABLE_ACCOUNT_NODES, SORT_ACCOUNT),
         (TABLE_STORAGE_NODES, SORT_STORAGE),
     ] {
         let n = sort.stats(s).entries;
         if n > 0 {
+            let hint = &mut account;
             tables.push(write_run_with(root, t, epsilon, n, |push| {
-                sort.merge::<ProduceError>(s, |k, v| push(Entry::value(*k, v.to_vec())))
-                    .map(|_| ())
+                sort.merge::<ProduceError>(s, |k, v| {
+                    if t == TABLE_ACCOUNT_NODES {
+                        hint.push(k);
+                    }
+                    push(Entry::value(*k, v.to_vec()))
+                })
+                .map(|_| ())
             })?);
         }
     }
@@ -238,11 +261,61 @@ pub fn write_layer_sorted(
     let mut l = write_layer(root, from_block, to_block, &rows, epsilon)?;
     tables.extend(l.tables.drain(..));
     tables.sort_by_key(|t| t.table_id);
+    with_hints(
+        root,
+        from_block,
+        to_block,
+        tables,
+        Hints {
+            account: account.finish(),
+            storage: owners.and_then(|o| KeySet::of(o.iter())),
+            code: KeySet::of(code.keys()),
+        },
+    )
+}
+
+/// A layer with `hints` in the manifest, or, past [`HINT_INLINE`] bytes,
+/// in a hint file under `root`.
+fn with_hints(
+    root: &Path,
+    from_block: u64,
+    to_block: u64,
+    tables: Vec<TableRef>,
+    hints: Hints,
+) -> Result<Layer, ProduceError> {
+    let bytes = hints.to_bytes();
+    if bytes.len() <= HINT_INLINE {
+        return Ok(Layer {
+            from_block,
+            to_block,
+            tables,
+            hints,
+            hints_file: None,
+        });
+    }
+    let name = *blake3::hash(&bytes).as_bytes();
+    let p = root.join(hints_path(&name));
+    if !p.exists() {
+        write_atomic(&p, &bytes)?;
+    }
     Ok(Layer {
         from_block,
         to_block,
         tables,
+        hints: Hints::default(),
+        hints_file: Some(name),
     })
+}
+
+/// A layer's hints, from the manifest or its hint file under `root`.
+pub fn layer_hints(root: &Path, l: &Layer) -> Hints {
+    match &l.hints_file {
+        None => l.hints.clone(),
+        Some(n) => fs::read(root.join(hints_path(n)))
+            .ok()
+            .and_then(|b| Hints::from_file(&b, n).ok())
+            .unwrap_or_default(),
+    }
 }
 
 fn sort_err(e: crate::extsort::SortError) -> ProduceError {
@@ -397,6 +470,8 @@ pub fn merge_layers(root: &Path, layers: &[Layer], epsilon: u16) -> Result<Layer
         return Err(ProduceError::Io(std::io::Error::other("nothing to merge")));
     };
     let mut tables = Vec::new();
+    let mut account = PathHintBuilder::default();
+    let mut codes: Option<BTreeSet<[u8; 32]>> = Some(BTreeSet::new());
     for t in [TABLE_ACCOUNT_NODES, TABLE_STORAGE_NODES, TABLE_CODE] {
         let open = || -> Result<Vec<Cursor>, ProduceError> {
             layers
@@ -416,13 +491,86 @@ pub fn merge_layers(root: &Path, layers: &[Layer], epsilon: u16) -> Result<Layer
         }
         // Two passes, streamed: the writer needs the count first.
         let cursors = open()?;
+        let (account, codes) = (&mut account, &mut codes);
         tables.push(write_run_with(root, t, epsilon, count, |push| {
-            merged(cursors, |e| push(e)).map(|_| ())
+            merged(cursors, |e| {
+                if t == TABLE_ACCOUNT_NODES {
+                    account.push(&e.key);
+                } else if t == TABLE_CODE {
+                    if let Some(c) = codes.as_mut() {
+                        c.insert(e.key);
+                        if c.len() > crate::hints::HINT_CAP {
+                            *codes = None;
+                        }
+                    }
+                }
+                push(e)
+            })
+            .map(|_| ())
         })?);
     }
-    Ok(Layer {
-        from_block: first.from_block,
-        to_block: last.to_block,
+    // Owners are not in the storage table's hashed keys: the union of the
+    // layers' sets.
+    let storage = layers
+        .iter()
+        .map(|l| layer_hints(root, l).storage)
+        .reduce(|a, b| KeySet::union(a.as_ref(), b.as_ref()))
+        .flatten();
+    with_hints(
+        root,
+        first.from_block,
+        last.to_block,
         tables,
-    })
+        Hints {
+            account: account.finish(),
+            storage,
+            code: codes.and_then(|c| KeySet::of(c.iter())),
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{RngCore, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
+
+    /// Hints past [`HINT_INLINE`] go to a hint file named by its hash, and
+    /// read back the same; small ones stay in the manifest.
+    #[test]
+    fn big_hints_go_to_a_file() {
+        let dir = std::env::temp_dir().join(format!("csl-hints-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("runs")).unwrap();
+        let mut rng = ChaCha8Rng::seed_from_u64(5);
+        let rows = |n: usize, rng: &mut ChaCha8Rng| {
+            let mut r = LayerRows::default();
+            for _ in 0..n {
+                let mut k = [0u8; 32];
+                rng.fill_bytes(&mut k[..31]);
+                k[31] = 12;
+                r.account.insert(k, vec![1, 2, 3]);
+            }
+            r
+        };
+        let small = write_layer(&dir, 1, 1, &rows(20, &mut rng), 64).unwrap();
+        assert!(small.hints_file.is_none());
+        assert!(small.hints.account.is_some());
+        let big_rows = rows(3000, &mut rng);
+        let big = write_layer(&dir, 2, 2, &big_rows, 64).unwrap();
+        let name = big.hints_file.expect("a hint file");
+        assert!(big.hints.is_empty());
+        assert!(dir.join(hints_path(&name)).exists());
+        let mut b = PathHintBuilder::default();
+        big_rows.account.keys().for_each(|k| b.push(k));
+        assert_eq!(layer_hints(&dir, &big).account, b.finish());
+        // A hint file that does not hash is no hints.
+        fs::write(dir.join(hints_path(&name)), b"{}").unwrap();
+        assert!(layer_hints(&dir, &big).is_empty());
+        // It round-trips through the manifest JSON.
+        let j = serde_json::to_string(&big).unwrap();
+        let back: Layer = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.hints_file, Some(name));
+        fs::remove_dir_all(&dir).ok();
+    }
 }

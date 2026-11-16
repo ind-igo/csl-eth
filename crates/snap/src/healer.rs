@@ -39,7 +39,7 @@ use csl_eth_head::{
     paths, verify_tier, Chain, DirSource, HeadSource, Tier, VerifiedHead,
 };
 use csl_eth_store::{
-    blob_path, layer_sorter, manifest_path, merge_layers, run_path, write_layer_sorted,
+    blob_path, layer_sorter, manifest_path, merge_layers, write_layer_sorted,
     write_layered_manifest, Head, Layer, LayerRows, Manifest, CODE_BLOB_THRESHOLD, EPSILON,
     LATEST_FILE, RUN_FORMAT, SORT_ACCOUNT, SORT_STORAGE, TABLE_ACCOUNT_NODES, TABLE_CODE,
     TABLE_STORAGE_NODES,
@@ -51,11 +51,174 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs::{self, File},
-    io::Write,
+    io::{Read as _, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{info, warn};
+
+// ---------------------------------------------------------------------------
+// Owners by storage root
+
+/// Owners by storage root, so a storage trie another owner already holds
+/// is copied locally, not fetched: `roots.idx`, built from the held
+/// state's account leaves (40-byte records, the root's first eight bytes
+/// then the owner, sorted), and `roots.log`, the tries steps have created
+/// since (root ‖ owner). A hit is a lead the caller checks against the
+/// store; a stale one costs a lookup.
+pub struct RootIndex {
+    file: Option<(File, u64)>,
+    recent: HashMap<B256, B256>,
+    log: File,
+}
+
+const ROOT_REC: u64 = 40;
+/// Owners tried per root.
+const ROOT_TRIES: usize = 4;
+
+impl RootIndex {
+    pub fn open(dir: &Path) -> Result<RootIndex, String> {
+        let file = match File::open(dir.join("roots.idx")) {
+            Ok(f) => {
+                let n = f.metadata().map_err(|e| e.to_string())?.len() / ROOT_REC;
+                Some((f, n))
+            }
+            Err(_) => None,
+        };
+        let lp = dir.join("roots.log");
+        let mut recent = HashMap::new();
+        if let Ok(b) = fs::read(&lp) {
+            for r in b.chunks_exact(64) {
+                recent.insert(B256::from_slice(&r[..32]), B256::from_slice(&r[32..]));
+            }
+        }
+        let log = File::options()
+            .create(true)
+            .append(true)
+            .open(&lp)
+            .map_err(|e| format!("{}: {e}", lp.display()))?;
+        Ok(RootIndex { file, recent, log })
+    }
+
+    /// Indexed owners and tries noted since.
+    pub fn len(&self) -> (u64, usize) {
+        (self.file.as_ref().map_or(0, |f| f.1), self.recent.len())
+    }
+
+    /// Owners that had storage root `r`, the newest first.
+    pub fn find(&mut self, r: &B256) -> Result<Vec<B256>, String> {
+        use std::os::unix::fs::FileExt;
+        let mut out: Vec<B256> = self.recent.get(r).copied().into_iter().collect();
+        let Some((f, n)) = &self.file else {
+            return Ok(out);
+        };
+        let want = &r[..8];
+        let read = |i: u64| -> Result<[u8; 40], String> {
+            let mut b = [0u8; 40];
+            f.read_exact_at(&mut b, i * ROOT_REC)
+                .map_err(|e| format!("roots.idx: {e}"))?;
+            Ok(b)
+        };
+        let (mut lo, mut hi) = (0u64, *n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if &read(mid)?[..8] < want {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        while lo < *n && out.len() < ROOT_TRIES {
+            let b = read(lo)?;
+            if &b[..8] != want {
+                break;
+            }
+            let o = B256::from_slice(&b[8..]);
+            if !out.contains(&o) {
+                out.push(o);
+            }
+            lo += 1;
+        }
+        Ok(out)
+    }
+
+    /// A storage trie created with root `r` under `owner`.
+    pub fn note(&mut self, r: B256, owner: B256) -> Result<(), String> {
+        if self.recent.insert(r, owner) == Some(owner) {
+            return Ok(());
+        }
+        let mut b = [0u8; 64];
+        b[..32].copy_from_slice(r.as_slice());
+        b[32..].copy_from_slice(owner.as_slice());
+        self.log
+            .write_all(&b)
+            .map_err(|e| format!("roots.log: {e}"))
+    }
+}
+
+/// Build `dir/roots.idx` from every account leaf with storage in the
+/// account runs of `manifest` under `root`. Returns the records written.
+pub fn build_root_index(
+    root: &Path,
+    manifest: &Manifest,
+    dir: &Path,
+    budget: u64,
+) -> Result<u64, String> {
+    use csl_eth_store::extsort::{Budget, Dups, ExtSort, Scratch};
+    let scratch = Scratch::new(dir).map_err(|e| format!("scratch: {e}"))?;
+    let mut sort = ExtSort::new(scratch.path(), Budget::new(budget), &[Dups::KeepOne]);
+    for at in manifest.runs(TABLE_ACCOUNT_NODES) {
+        let f = File::open(root.join(&at.path)).map_err(|e| format!("{}: {e}", at.path))?;
+        let mut rref = at.table.run_ref(at.block_lo);
+        rref.block_hi = at.block_hi;
+        let mut r = Reader::try_with_format(f, rref, RUN_FORMAT).map_err(|e| e.to_string())?;
+        r.prepare().map_err(|e| e.to_string())?;
+        for page in 1..=at.table.page_count {
+            let p = r
+                .fetch_page(page)
+                .map_err(|e| format!("{}: {e}", at.path))?;
+            for e in p.entries {
+                if e.tag != 0 {
+                    continue;
+                }
+                let depth = (e.key[31] as usize).min(62);
+                let path = Nibbles::unpack(&e.key[..31]).slice(..depth);
+                let Ok(Shape::Leaf { key, value }) = shape(&path, &e.value) else {
+                    continue;
+                };
+                if key.len() != 64 {
+                    continue;
+                }
+                let Ok(a) = Account::decode(&value) else {
+                    continue;
+                };
+                if a.storage_root == EMPTY_ROOT {
+                    continue;
+                }
+                let owner = key.pack();
+                let mut k = [0u8; 32];
+                k[..24].copy_from_slice(&a.storage_root[..24]);
+                k[24..].copy_from_slice(&owner[..8]);
+                sort.push(0, &k, &owner)
+                    .map_err(|e| format!("root index: {e}"))?;
+            }
+        }
+    }
+    sort.prepare().map_err(|e| format!("root index: {e}"))?;
+    let tmp = dir.join("roots.idx.tmp");
+    let mut w = std::io::BufWriter::new(File::create(&tmp).map_err(|e| e.to_string())?);
+    let n = sort
+        .merge::<csl_eth_store::extsort::SortError>(0, |k, v| {
+            w.write_all(&k[..8])?;
+            w.write_all(v)?;
+            Ok(())
+        })
+        .map_err(|e| format!("root index: {e}"))?;
+    w.flush().map_err(|e| e.to_string())?;
+    drop(w);
+    fs::rename(&tmp, dir.join("roots.idx")).map_err(|e| e.to_string())?;
+    Ok(n)
+}
 
 // ---------------------------------------------------------------------------
 // The local store
@@ -270,25 +433,35 @@ impl NodeDb {
             done: HashSet::new(),
             done_pending: Vec::new(),
         };
-        // The log: every whole record that hashes to its name.
-        let data = fs::read(dir.join("log")).map_err(err)?;
-        let mut at = 0usize;
-        while at + 36 <= data.len() {
-            let len = u32::from_le_bytes(data[at + 32..at + 36].try_into().expect("4")) as usize;
-            if at + 36 + len > data.len() {
+        // The log: every whole record that hashes to its name, read
+        // through a buffer so a log bigger than memory still reopens.
+        let size = fs::metadata(dir.join("log")).map_err(err)?.len();
+        let mut r =
+            std::io::BufReader::with_capacity(1 << 20, File::open(dir.join("log")).map_err(err)?);
+        let (mut at, mut head, mut body) = (0u64, [0u8; 36], Vec::new());
+        while at + 36 <= size {
+            if r.read_exact(&mut head).is_err() {
                 break;
             }
-            let h = B256::from_slice(&data[at..at + 32]);
-            if keccak256(&data[at + 36..at + 36 + len]) != h {
+            let len = u32::from_le_bytes(head[32..36].try_into().expect("4")) as u64;
+            if at + 36 + len > size {
                 break;
             }
-            db.index(h, at as u64);
+            body.resize(len as usize, 0);
+            if r.read_exact(&mut body).is_err() {
+                break;
+            }
+            let h = B256::from_slice(&head[..32]);
+            if keccak256(&body) != h {
+                break;
+            }
+            db.index(h, at);
             at += 36 + len;
         }
-        if at < data.len() {
-            db.log.set_len(at as u64).map_err(err)?;
+        if at < size {
+            db.log.set_len(at).map_err(err)?;
         }
-        db.end = at as u64;
+        db.end = at;
         let done = fs::read(dir.join("done")).map_err(err)?;
         let whole = done.len() / 8 * 8;
         for c in done[..whole].chunks(8) {
@@ -465,6 +638,9 @@ pub struct Rows {
     pub code: BTreeMap<[u8; 32], Vec<u8>>,
     pub account_rows: u64,
     pub storage_rows: u64,
+    /// Owners with storage rows, for the layer's hint; `None` past the
+    /// hint's cap.
+    pub owners: Option<BTreeSet<[u8; 32]>>,
     _scratch: csl_eth_store::extsort::Scratch,
 }
 
@@ -478,6 +654,7 @@ impl Rows {
             code: BTreeMap::new(),
             account_rows: 0,
             storage_rows: 0,
+            owners: Some(BTreeSet::new()),
             _scratch: scratch,
         })
     }
@@ -491,6 +668,7 @@ impl Rows {
         self.sort.prepare().expect("prepare");
         let mut out = LayerRows {
             code: self.code.clone(),
+            owners: self.owners.clone(),
             ..LayerRows::default()
         };
         for (t, m) in [
@@ -515,6 +693,8 @@ pub struct Healed {
     pub accounts: Vec<(B256, Account)>,
     /// Changed slots seen: (owner, slot, value), up to the sample size.
     pub slots: Vec<(B256, B256, U256)>,
+    /// Storage tries the step created: (root, owner).
+    pub new_tries: Vec<(B256, B256)>,
     pub stats: StepStats,
 }
 
@@ -597,6 +777,9 @@ struct Pos {
     path: Nibbles,
     new: Ref,
     old: Option<Ref>,
+    /// Another owner whose held storage trie has the new root: nodes the
+    /// held state lacks for `owner` are copied from it, not fetched.
+    src: Option<B256>,
 }
 
 /// What a node leads to: its children to diff (an account's storage trie
@@ -608,6 +791,10 @@ struct Opened {
     slot: Option<(B256, B256, U256)>,
     code: Option<B256>,
     storage: bool,
+    /// The storage trie under it is copied from another owner's.
+    copied: bool,
+    /// A storage trie where the account had none: (root, owner).
+    new_trie: Option<(B256, B256)>,
 }
 
 /// What the walks share: the held state, where it is, and the prefix.
@@ -615,21 +802,48 @@ struct Ctx<'a> {
     store: &'a mut Store,
     old_root: B256,
     prefix: Option<&'a Nibbles>,
+    roots: Option<&'a mut RootIndex>,
 }
 
 impl Ctx<'_> {
     /// The node under `h` at a position: fetched (on disk) or held there.
-    fn local(
-        &mut self,
-        db: &NodeDb,
-        owner: Option<B256>,
-        path: &Nibbles,
-        h: &B256,
-    ) -> Result<Option<Bytes>, StepError> {
+    fn local(&mut self, db: &NodeDb, p: &Pos, h: &B256) -> Result<Option<Bytes>, StepError> {
         if let Some(b) = db.get(h).map_err(StepError::Store)? {
             return Ok(Some(b));
         }
-        self.store.node(owner, path, h).map_err(StepError::Store)
+        if let Some(b) = self
+            .store
+            .node(p.owner, &p.path, h)
+            .map_err(StepError::Store)?
+        {
+            return Ok(Some(b));
+        }
+        match p.src {
+            Some(o) => self
+                .store
+                .node(Some(o), &p.path, h)
+                .map_err(StepError::Store),
+            None => Ok(None),
+        }
+    }
+
+    /// An owner other than `owner` whose held storage trie has root `r`.
+    fn copy_source(&mut self, r: &B256, owner: &B256) -> Result<Option<B256>, StepError> {
+        let Some(ix) = self.roots.as_mut() else {
+            return Ok(None);
+        };
+        for o in ix.find(r).map_err(StepError::Store)? {
+            if o != *owner
+                && self
+                    .store
+                    .node(Some(o), &Nibbles::default(), r)
+                    .map_err(StepError::Store)?
+                    .is_some()
+            {
+                return Ok(Some(o));
+            }
+        }
+        Ok(None)
     }
 
     /// The new node `rlp` at `p`, diffed against the held state's.
@@ -673,6 +887,7 @@ impl Ctx<'_> {
                         path: q,
                         new: r,
                         old: o,
+                        src: p.src,
                     });
                 }
             }
@@ -699,11 +914,17 @@ impl Ctx<'_> {
                 let old_root = old.map(|a| a.storage_root).unwrap_or(EMPTY_ROOT);
                 if acct.storage_root != EMPTY_ROOT && acct.storage_root != old_root {
                     out.storage = true;
+                    let src = self.copy_source(&acct.storage_root, &hash)?;
+                    out.copied = src.is_some();
+                    if old_root == EMPTY_ROOT {
+                        out.new_trie = Some((acct.storage_root, hash));
+                    }
                     out.kids.push(Pos {
                         owner: Some(hash),
                         path: Nibbles::default(),
                         new: Ref::Hash(acct.storage_root),
                         old: (old_root != EMPTY_ROOT).then_some(Ref::Hash(old_root)),
+                        src,
                     });
                 }
                 if acct.code_hash != KECCAK_EMPTY
@@ -813,6 +1034,7 @@ async fn sync<S: Source>(
             path: Nibbles::default(),
             new: Ref::Hash(new_root),
             old: Some(Ref::Hash(cx.old_root)),
+            src: None,
         },
         parent: None,
     }];
@@ -882,7 +1104,7 @@ async fn sync<S: Source>(
                         continue;
                     }
                     let slot = tree.add(key, it.parent);
-                    match cx.local(db, p.owner, &p.path, h)? {
+                    match cx.local(db, p, h)? {
                         Some(b) => {
                             st.local += 1;
                             open_slot(
@@ -998,11 +1220,13 @@ fn materialize(
     let mut rows = Rows::new(sort_dir, sort_budget).map_err(StepError::Store)?;
     let mut accounts = Vec::new();
     let mut slots = Vec::new();
+    let mut new_tries = Vec::new();
     let mut stack = vec![Pos {
         owner: None,
         path: Nibbles::default(),
         new: Ref::Hash(new_root),
         old: Some(Ref::Hash(cx.old_root)),
+        src: None,
     }];
     let sort_err = |e: csl_eth_store::extsort::SortError| StepError::Store(e.to_string());
     while let Some(p) = stack.pop() {
@@ -1012,9 +1236,7 @@ fn materialize(
         let rlp = match &p.new {
             Ref::Inline(b) => b.clone(),
             Ref::Hash(h) => {
-                let b = cx
-                    .local(db, p.owner, &p.path, h)?
-                    .ok_or(StepError::Missing)?;
+                let b = cx.local(db, &p, h)?.ok_or(StepError::Missing)?;
                 let nk = NodeKey::prefix(&p.path, p.path.len());
                 match p.owner {
                     None => {
@@ -1027,6 +1249,12 @@ fn materialize(
                         let k = nk.storage_table_key(&o).map_err(|_| StepError::TooDeep)?;
                         rows.sort.push(SORT_STORAGE, &k, &b).map_err(sort_err)?;
                         rows.storage_rows += 1;
+                        if let Some(s) = rows.owners.as_mut() {
+                            s.insert(o.0);
+                            if s.len() > csl_eth_store::hints::HINT_CAP {
+                                rows.owners = None;
+                            }
+                        }
                         st.storage_nodes += 1;
                     }
                 }
@@ -1038,6 +1266,10 @@ fn materialize(
         if o.storage {
             st.storage_tries += 1;
         }
+        if o.copied {
+            st.storage_copied += 1;
+        }
+        new_tries.extend(o.new_trie);
         stack.extend(o.kids);
         if let Some(s) = o.slot {
             if slots.len() < slot_sample {
@@ -1064,6 +1296,7 @@ fn materialize(
         rows,
         accounts,
         slots,
+        new_tries,
         stats: std::mem::take(st),
     })
 }
@@ -1083,6 +1316,7 @@ pub async fn heal_step<S: Source>(
     deadline: Instant,
     sort_dir: &Path,
     sort_budget: u64,
+    roots: Option<&mut RootIndex>,
 ) -> Result<Healed, StepError> {
     let lookups0 = store.lookups;
     let mut st = StepStats::default();
@@ -1090,6 +1324,7 @@ pub async fn heal_step<S: Source>(
         store,
         old_root,
         prefix,
+        roots,
     };
     let t0 = Instant::now();
     sync(src, &mut cx, db, new_root, deadline, &mut st).await?;
@@ -1188,13 +1423,22 @@ pub fn compact(
 /// update: the local mirror, with that one file replaced.
 struct Overlay<'a> {
     dir: &'a Path,
-    optimistic: &'a [u8],
+    rel: &'a str,
+    bytes: &'a [u8],
+}
+
+/// The head file a tier is verified from.
+fn tier_file(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Finalized => paths::FINALITY,
+        Tier::Attested => paths::OPTIMISTIC,
+    }
 }
 
 impl HeadSource for Overlay<'_> {
     fn read_head(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
-        if rel == paths::OPTIMISTIC {
-            return Ok(Some(self.optimistic.to_vec()));
+        if rel == self.rel {
+            return Ok(Some(self.bytes.to_vec()));
         }
         DirSource(self.dir.to_path_buf()).read_head(rel)
     }
@@ -1266,24 +1510,26 @@ impl Heads {
         Ok(())
     }
 
-    /// The newest attested head, verified from the checkpoint over the
-    /// mirror's files: the optimistic update's bytes and what they prove.
-    pub fn latest(&self) -> Result<(Vec<u8>, VerifiedHead), String> {
+    /// The newest head of `tier`, verified from the checkpoint over the
+    /// mirror's files: the update's bytes (optimistic or finality) and what
+    /// they prove.
+    pub fn latest(&self, tier: Tier) -> Result<(Vec<u8>, VerifiedHead), String> {
         let first = self.bootstrap_period()?;
-        let upd = self.beacon.head_update(Tier::Attested)?;
-        let named = named_of(Tier::Attested, &upd)?;
+        let upd = self.beacon.head_update(tier)?;
+        let named = named_of(tier, &upd)?;
         let current = csl_eth_head::period_of(named.signature_slot);
         self.updates(first, current, false)?;
         let verify = || {
             verify_tier(
                 &Overlay {
                     dir: &self.root,
-                    optimistic: &upd,
+                    rel: tier_file(tier),
+                    bytes: &upd,
                 },
                 &self.chain,
                 self.checkpoint,
                 SystemTime::now(),
-                Tier::Attested,
+                tier,
             )
             .map_err(|e| e.to_string())
         };
@@ -1379,15 +1625,27 @@ pub struct Args {
     /// Layers of a tier merged into one of the next.
     #[arg(long, default_value_t = 4)]
     pub fanout: usize,
-    /// The top tier (one layer, everything since the base).
+    /// The top tier (one layer, everything since the base). At 5 and
+    /// fanout 4 the tiers below hold 1, 4, 16 and 64 blocks a layer, all
+    /// small enough to carry hints (see `HINT_CAP`), and the since-base
+    /// layer is rewritten every 256 blocks.
     #[arg(long, default_value_t = 5)]
     pub tiers: u8,
     /// Manifests kept published; runs only they reach are collected.
-    #[arg(long, default_value_t = 64)]
+    /// At one block a step, 128 reaches back past the finalized block
+    /// (two to three epochs), so that block's manifest is usually still
+    /// there to pin.
+    #[arg(long, default_value_t = 128)]
     pub keep: usize,
     /// Heal only when the head is at least this many blocks past ours.
     #[arg(long, default_value_t = 1)]
     pub every_blocks: u64,
+    /// Do not index owners by storage root (a new contract's storage trie
+    /// another owner already holds is then fetched, not copied). The
+    /// index is built from the held state at the first start (a scan of
+    /// the account table).
+    #[arg(long)]
+    pub no_root_index: bool,
     /// Stop after this many published steps (0: never).
     #[arg(long, default_value_t = 0)]
     pub steps: u64,
@@ -1441,13 +1699,28 @@ struct HealState {
     bootstrap_published: bool,
     /// Published manifests, oldest first, with the runs each reaches.
     manifests: VecDeque<(B256, Vec<String>)>,
+    /// The finalized block `head/finality` names, and the last two such
+    /// blocks, whose manifests collection keeps.
+    #[serde(default)]
+    finalized: Option<HeadRec>,
+    #[serde(default)]
+    pinned: VecDeque<B256>,
+    /// The block `head/optimistic` and `snapshots/latest` name.
+    #[serde(default)]
+    optimistic: Option<B256>,
 }
 
 impl HealState {
     fn load(p: &Path) -> Result<Option<HealState>, String> {
         match fs::read(p) {
-            Ok(b) => serde_json::from_slice(&b)
-                .map(Some)
+            Ok(b) => serde_json::from_slice::<HealState>(&b)
+                .map(|mut st| {
+                    st.published_runs = st.published_runs.iter().map(|r| run_name(r)).collect();
+                    for (_, rs) in st.manifests.iter_mut() {
+                        *rs = rs.iter().map(|r| run_name(r)).collect();
+                    }
+                    Some(st)
+                })
                 .map_err(|e| format!("{}: {e}", p.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.to_string()),
@@ -1475,11 +1748,57 @@ impl Log {
     }
 }
 
+/// Seconds until a root of a block at `ts` is about to leave the peers'
+/// window (about 128 blocks; stop at 110).
+fn window_secs(ts: u64) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (ts + 110 * 12).saturating_sub(now)
+}
+
+/// A finalized block is stepped onto only with this much of its window
+/// left; a catch-up longer than that targets the attested head instead.
+const FINALIZED_MIN_WINDOW: u64 = 300;
+
+/// Manifests to collect: the oldest past `keep`, never a pinned one.
+fn collectable(
+    manifests: &VecDeque<(B256, Vec<String>)>,
+    keep: usize,
+    protected: &HashSet<B256>,
+) -> Vec<B256> {
+    let newest = manifests.back().map(|(h, _)| *h);
+    let over = manifests.len().saturating_sub(keep);
+    manifests
+        .iter()
+        .map(|(h, _)| *h)
+        .filter(|h| !protected.contains(h) && Some(*h) != newest)
+        .take(over)
+        .collect()
+}
+
+/// The files under `runs/` a manifest reaches: its layers' runs
+/// (`<root>.run`) and hint files (`<blake3>.hints`).
 fn manifest_runs(m: &Manifest) -> Vec<String> {
     m.layers
         .iter()
-        .flat_map(|l| l.tables.iter().map(|t| hex::encode(t.root)))
+        .flat_map(|l| {
+            l.tables
+                .iter()
+                .map(|t| format!("{}.run", hex::encode(t.root)))
+                .chain(l.hints_file.map(|n| format!("{}.hints", hex::encode(n))))
+        })
         .collect()
+}
+
+/// A state saved before hint files named runs by their bare root.
+fn run_name(r: &str) -> String {
+    if r.contains('.') {
+        r.to_string()
+    } else {
+        format!("{r}.run")
+    }
 }
 
 /// Read back what a step changed, through the client over the local files
@@ -1521,24 +1840,27 @@ struct Healer {
 }
 
 impl Healer {
-    fn manifest(&self, head: &Head) -> Result<Manifest, String> {
+    fn manifest(&self, head: &Head, latest: bool) -> Result<Manifest, String> {
         write_layered_manifest(
             &self.root,
             head,
             &self.base,
             self.st.layers.iter().map(|l| l.layer.clone()).collect(),
-            true,
+            latest,
         )
         .map_err(|e| format!("manifest: {e}"))
     }
 
     /// Write the step's layer, merge tiers, write the manifest, read the
     /// changes back through the client, publish, collect, save.
+    /// A finalized step publishes `head/finality` and pins its manifest,
+    /// and leaves `head/optimistic` and `snapshots/latest` alone.
     fn commit(
         &mut self,
         h: &mut Healed,
         update: &[u8],
         vh: &VerifiedHead,
+        tier: Tier,
     ) -> Result<Value, String> {
         let t0 = Instant::now();
         let e = &vh.execution;
@@ -1556,6 +1878,7 @@ impl Healer {
                 head.block_number,
                 &mut h.rows.sort,
                 &h.rows.code,
+                h.rows.owners.as_ref(),
                 EPSILON,
             )
             .map_err(|e| format!("layer: {e}"))?;
@@ -1567,7 +1890,7 @@ impl Healer {
             self.args.fanout,
             self.args.tiers,
         )?;
-        let manifest = self.manifest(&head)?;
+        let manifest = self.manifest(&head, tier == Tier::Attested)?;
         let check = match read_back(&self.root, &head, h) {
             Ok(v) => v,
             Err(err) => {
@@ -1578,7 +1901,7 @@ impl Healer {
         };
         let built_s = t0.elapsed().as_secs_f64();
         let t1 = Instant::now();
-        let sent = self.publish_step(&head, &manifest, h, update)?;
+        let sent = self.publish_step(&head, &manifest, h, update, tier)?;
         self.st.head = HeadRec {
             block_hash: head.block_hash,
             block_number: head.block_number,
@@ -1616,13 +1939,12 @@ impl Healer {
         m: &Manifest,
         h: &Healed,
         update: &[u8],
+        tier: Tier,
     ) -> Result<Value, String> {
         let mut sent = (0u64, 0u64);
         for r in manifest_runs(m) {
             if !self.st.published_runs.contains(&r) {
-                let mut root = [0u8; 32];
-                hex::decode_to_slice(&r, &mut root).map_err(|e| e.to_string())?;
-                self.put(&run_path(&root), &mut sent)?;
+                self.put(&format!("runs/{r}"), &mut sent)?;
                 self.st.published_runs.insert(r);
             }
         }
@@ -1635,9 +1957,27 @@ impl Healer {
             self.put(&blob_path(blake3::hash(c).as_bytes()), &mut sent)?;
         }
         self.put(&manifest_path(&head.block_hash), &mut sent)?;
+        self.publish_updates(&mut sent)?;
+        self.st
+            .manifests
+            .push_back((head.block_hash, manifest_runs(m)));
+        match tier {
+            Tier::Attested => {
+                write_atomic(&self.root.join(paths::OPTIMISTIC), update)?;
+                self.put(paths::OPTIMISTIC, &mut sent)?;
+                self.put(LATEST_FILE, &mut sent)?;
+                self.st.optimistic = Some(head.block_hash);
+            }
+            Tier::Finalized => self.publish_finality(head, update, &mut sent)?,
+        }
+        Ok(json!({"files": sent.0, "bytes": sent.1}))
+    }
+
+    /// The bootstrap once, and each period update whose bytes changed.
+    fn publish_updates(&mut self, sent: &mut (u64, u64)) -> Result<(), String> {
         let cp = paths::bootstrap(&self.args.checkpoint);
         if !self.st.bootstrap_published {
-            self.put(&cp, &mut sent)?;
+            self.put(&cp, sent)?;
             self.st.bootstrap_published = true;
         }
         let dir = self.root.join("head/updates");
@@ -1649,17 +1989,57 @@ impl Healer {
                 let b = fs::read(e.path()).map_err(|e| e.to_string())?;
                 let hx = blake3::hash(&b).to_hex().to_string();
                 if self.st.published_updates.get(&p) != Some(&hx) {
-                    self.put(&paths::update(p), &mut sent)?;
+                    self.put(&paths::update(p), sent)?;
                     self.st.published_updates.insert(p, hx);
                 }
             }
         }
-        write_atomic(&self.root.join(paths::OPTIMISTIC), update)?;
-        self.put(paths::OPTIMISTIC, &mut sent)?;
-        self.put(LATEST_FILE, &mut sent)?;
-        self.st
-            .manifests
-            .push_back((head.block_hash, manifest_runs(m)));
+        Ok(())
+    }
+
+    /// Pin the finalized block's published manifest and point
+    /// `head/finality` at it.
+    fn publish_finality(
+        &mut self,
+        head: &Head,
+        update: &[u8],
+        sent: &mut (u64, u64),
+    ) -> Result<(), String> {
+        // The pin is saved before the pointer moves, so a crash between
+        // the two never leaves a published `head/finality` unprotected;
+        // the block the old pointer names stays the other pin.
+        if !self.st.pinned.contains(&head.block_hash) {
+            self.st.pinned.push_back(head.block_hash);
+            while self.st.pinned.len() > 2 {
+                self.st.pinned.pop_front();
+            }
+        }
+        self.st.save(&self.state_path)?;
+        write_atomic(&self.root.join(paths::FINALITY), update)?;
+        self.put(paths::FINALITY, sent)?;
+        self.st.finalized = Some(HeadRec {
+            block_hash: head.block_hash,
+            block_number: head.block_number,
+            timestamp: head.timestamp,
+            state_root: head.state_root,
+        });
+        Ok(())
+    }
+
+    /// The finalized block's manifest is already published (a step landed
+    /// on it): pin it and publish `head/finality`.
+    fn pin_finalized(&mut self, update: &[u8], vh: &VerifiedHead) -> Result<Value, String> {
+        let e = &vh.execution;
+        let head = Head {
+            block_hash: e.block_hash,
+            block_number: e.block_number,
+            timestamp: e.timestamp,
+            state_root: e.state_root,
+        };
+        let mut sent = (0, 0);
+        self.publish_updates(&mut sent)?;
+        self.publish_finality(&head, update, &mut sent)?;
+        self.st.save(&self.state_path)?;
         Ok(json!({"files": sent.0, "bytes": sent.1}))
     }
 
@@ -1667,8 +2047,18 @@ impl Healer {
     /// from the bucket and the local copy.
     fn collect(&mut self, current: &Manifest) -> Result<Value, String> {
         let mut gone_manifests = 0;
-        while self.st.manifests.len() > self.args.keep.max(2) {
-            let (h, _) = self.st.manifests.pop_front().expect("len");
+        // Never what a public pointer names: the pinned finalized blocks
+        // (`head/finality`), the attested head (`head/optimistic`,
+        // `snapshots/latest`) and the newest manifest, whatever `keep`.
+        let protected: HashSet<B256> = self
+            .st
+            .pinned
+            .iter()
+            .copied()
+            .chain(self.st.optimistic)
+            .collect();
+        for h in collectable(&self.st.manifests, self.args.keep.max(2), &protected) {
+            self.st.manifests.retain(|(m, _)| *m != h);
             self.publish.delete(&self.key(&manifest_path(&h)))?;
             let _ = fs::remove_file(self.root.join(manifest_path(&h)));
             let _ = fs::remove_dir(self.root.join(manifest_path(&h)).parent().expect("dir"));
@@ -1689,10 +2079,9 @@ impl Healer {
             .cloned()
             .collect();
         for r in &dead {
-            let mut root = [0u8; 32];
-            hex::decode_to_slice(r, &mut root).map_err(|e| e.to_string())?;
-            self.publish.delete(&self.key(&run_path(&root)))?;
-            let _ = fs::remove_file(self.root.join(run_path(&root)));
+            let rel = format!("runs/{r}");
+            self.publish.delete(&self.key(&rel))?;
+            let _ = fs::remove_file(self.root.join(&rel));
             self.st.published_runs.remove(r);
         }
         // Runs merged away before they were ever published.
@@ -1701,11 +2090,9 @@ impl Healer {
         if let Ok(rd) = fs::read_dir(self.root.join("runs")) {
             for e in rd.flatten() {
                 let n = e.file_name().to_string_lossy().to_string();
-                if let Some(hx) = n.strip_suffix(".run") {
-                    if !known.contains(hx) {
-                        let _ = fs::remove_file(e.path());
-                        local += 1;
-                    }
+                if (n.ends_with(".run") || n.ends_with(".hints")) && !known.contains(&n) {
+                    let _ = fs::remove_file(e.path());
+                    local += 1;
                 }
             }
         }
@@ -1752,6 +2139,9 @@ pub async fn run(args: Args) -> Result<(), String> {
                 published_updates: BTreeMap::new(),
                 bootstrap_published: false,
                 manifests: VecDeque::new(),
+                finalized: None,
+                pinned: VecDeque::new(),
+                optimistic: None,
             }
         }
     };
@@ -1781,7 +2171,7 @@ pub async fn run(args: Args) -> Result<(), String> {
         .open(args.work.join("heal.jsonl"))
         .map_err(|e| e.to_string())?);
     let head = st.head.head();
-    let store = {
+    let (store, held) = {
         let m = if st.layers.is_empty() {
             base.clone()
         } else {
@@ -1794,7 +2184,7 @@ pub async fn run(args: Args) -> Result<(), String> {
             )
             .map_err(|e| e.to_string())?
         };
-        Store::open(&root, &m)?
+        (Store::open(&root, &m)?, m)
     };
     let mut h = Healer {
         args: args.clone(),
@@ -1819,6 +2209,19 @@ pub async fn run(args: Args) -> Result<(), String> {
     // Fetched nodes, against the held state: kept across re-pivots and
     // restarts, emptied when a step commits.
     let mut db = NodeDb::open(&args.work.join("nodes"), h.st.head.state_root)?;
+    let mut roots = if args.no_root_index {
+        None
+    } else {
+        if !args.work.join("roots.idx").exists() {
+            let t = Instant::now();
+            let n = tokio::task::block_in_place(|| {
+                build_root_index(&h.root, &held, &args.work, args.sort_mib << 20)
+            })?;
+            h.log
+                .emit(json!({"ev": "root_index", "owners": n, "secs": t.elapsed().as_secs_f64()}));
+        }
+        Some(RootIndex::open(&args.work)?)
+    };
     h.log.emit(json!({"ev": "nodes", "held": db.len(), "log_bytes": db.log_bytes(), "complete": db.done_len()}));
     let over = |s: u64| {
         (args.steps > 0 && s >= args.steps)
@@ -1826,8 +2229,52 @@ pub async fn run(args: Args) -> Result<(), String> {
                 && started.elapsed() > Duration::from_secs(args.max_wall_mins * 60))
     };
     let mut attempt = 0u64;
+    let mut fin_checked: Option<Instant> = None;
+    let mut fin_missed = 0u64;
     while !over(h.st.steps) {
-        let (update, vh) = match tokio::task::block_in_place(|| heads.latest()) {
+        // The finalized tier, checked every 30 s (it moves once an epoch).
+        let mut fin = None;
+        if fin_checked.is_none_or(|t| t.elapsed() > Duration::from_secs(30)) {
+            fin_checked = Some(Instant::now());
+            match tokio::task::block_in_place(|| heads.latest(Tier::Finalized)) {
+                Ok((fu, fvh)) => {
+                    let fe = fvh.execution;
+                    let newer =
+                        h.st.finalized
+                            .as_ref()
+                            .is_none_or(|r| fe.block_number > r.block_number);
+                    if !newer {
+                    } else if h.st.manifests.iter().any(|(m, _)| *m == fe.block_hash) {
+                        // A step landed on it: pin its manifest.
+                        let v = tokio::task::block_in_place(|| h.pin_finalized(&fu, &fvh))?;
+                        h.log.emit(json!({"ev": "finalized", "block": fe.block_number, "block_hash": fe.block_hash, "how": "pinned", "commit": v}));
+                    } else if fe.block_number > h.st.head.block_number
+                        && window_secs(fe.timestamp) >= FINALIZED_MIN_WINDOW
+                    {
+                        // Ahead of us with time left in the window: heal a
+                        // step to it first.
+                        fin = Some((fu, fvh));
+                    } else if fe.block_number != fin_missed {
+                        // Passed over (or too old to reach): the next
+                        // epoch's, about 6.4 minutes on, is stepped onto
+                        // or pinned.
+                        fin_missed = fe.block_number;
+                        h.log.emit(json!({"ev": "finalized_missed", "block": fe.block_number, "head": h.st.head.block_number}));
+                    }
+                }
+                Err(e) => h.log.emit(json!({"ev": "no_finalized", "error": e})),
+            }
+        }
+        let tier = if fin.is_some() {
+            Tier::Finalized
+        } else {
+            Tier::Attested
+        };
+        let latest = match fin {
+            Some(x) => Ok(x),
+            None => tokio::task::block_in_place(|| heads.latest(Tier::Attested)),
+        };
+        let (update, vh) = match latest {
             Ok(x) => x,
             Err(e) => {
                 warn!(error = %e, "no verified head");
@@ -1849,12 +2296,7 @@ pub async fn run(args: Args) -> Result<(), String> {
         }
         attempt += 1;
         // Peers keep about 128 blocks of roots; stop a little short.
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let window = (target.timestamp + 110 * 12).saturating_sub(now).max(60);
-        let deadline = Instant::now() + Duration::from_secs(window);
+        let deadline = Instant::now() + Duration::from_secs(window_secs(target.timestamp).max(60));
         let t0 = Instant::now();
         let from = h.st.head.block_number;
         let held_before = db.len();
@@ -1869,6 +2311,7 @@ pub async fn run(args: Args) -> Result<(), String> {
             deadline,
             &args.work.join("sort"),
             args.sort_mib << 20,
+            roots.as_mut(),
         )
         .await;
         let heal_s = t0.elapsed().as_secs_f64();
@@ -1892,9 +2335,14 @@ pub async fn run(args: Args) -> Result<(), String> {
                 }
             }
             Ok(mut healed) => {
-                let res = tokio::task::block_in_place(|| h.commit(&mut healed, &update, &vh));
+                let res = tokio::task::block_in_place(|| h.commit(&mut healed, &update, &vh, tier));
                 if res.is_ok() {
                     db.reset(h.st.head.state_root)?;
+                    if let Some(ix) = roots.as_mut() {
+                        for (r, o) in &healed.new_tries {
+                            ix.note(*r, *o)?;
+                        }
+                    }
                 }
                 match res {
                     Ok(v) => {
@@ -1910,7 +2358,7 @@ pub async fn run(args: Args) -> Result<(), String> {
                             "step"
                         );
                         h.log.emit(json!({
-                            "ev": "step", "step": h.st.steps, "attempt": attempt, "from": from, "to": target.block_number,
+                            "ev": "step", "tier": format!("{tier:?}"), "step": h.st.steps, "attempt": attempt, "from": from, "to": target.block_number,
                             "blocks": target.block_number - from, "block_hash": target.block_hash, "state_root": target.state_root,
                             "heal_s": heal_s, "lag_s": lag(target.timestamp), "peers": pool.connected(),
                             "head_lag_s": vh.lag_secs, "participants": vh.participants, "stats": healed.stats, "commit": v,
@@ -2280,6 +2728,7 @@ mod tests {
                 to.block_number,
                 &mut h.rows.sort,
                 &h.rows.code,
+                h.rows.owners.as_ref(),
                 EPSILON,
             )
             .unwrap();
@@ -2318,6 +2767,7 @@ mod tests {
             far(),
             &dir.join("sort"),
             budget,
+            None,
         )
         .await
     }
@@ -2712,6 +3162,107 @@ mod tests {
         let (_, m) = commit(&dir, &base, &mut layers, &heads[0], &heads[1], &mut h, 4, 3);
         byte_identical(&dir, &m, &s[1], &heads[1]);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A new account whose storage another account already holds: with
+    /// the root index the trie is copied from the store, nothing of it
+    /// fetched, and the layer is the same as without.
+    #[tokio::test]
+    async fn a_new_trie_another_owner_holds_is_copied() {
+        let s0 = states().remove(0);
+        let (_, big) = s0
+            .iter()
+            .max_by_key(|(_, a)| a.storage.len())
+            .map(|(k, a)| (*k, a.clone()))
+            .unwrap();
+        let mut s1 = s0.clone();
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
+        let fresh = key(&mut rng);
+        s1.insert(
+            fresh,
+            Acct {
+                balance: U256::from(5u64),
+                storage: big.storage.clone(),
+                code: None,
+            },
+        );
+        let (h0, h1) = (head_of(&s0, 0), head_of(&s1, 1));
+        let mut got = Vec::new();
+        for with_index in [false, true] {
+            let dir = scratch(if with_index { "copy-ix" } else { "copy" });
+            let base = produce(&dir, &h0, "", leaves(&s0), &code_of(&s0))
+                .unwrap()
+                .manifest;
+            let mut store = Store::open(&dir, &base).unwrap();
+            let mut db = NodeDb::open(&dir.join("nodes"), h0.state_root).unwrap();
+            let mut ix = None;
+            if with_index {
+                let n = build_root_index(&dir, &base, &dir, 16 << 20).unwrap();
+                assert_eq!(
+                    n as usize,
+                    s0.values().filter(|a| !a.storage.is_empty()).count()
+                );
+                ix = Some(RootIndex::open(&dir).unwrap());
+            }
+            let mut src = Mem::of(&s1, &h1);
+            let mut h = heal_step(
+                &mut src,
+                &mut store,
+                &mut db,
+                h0.state_root,
+                h1.state_root,
+                None,
+                10_000,
+                far(),
+                &dir.join("sort"),
+                64 << 20,
+                ix.as_mut(),
+            )
+            .await
+            .unwrap();
+            eprintln!("index {with_index}: {:?}", h.stats);
+            assert_eq!(h.stats.storage_copied, with_index as u64);
+            assert_eq!(h.new_tries, vec![(account_of(&big).storage_root, fresh)]);
+            let mut layers = Vec::new();
+            let (_, m) = commit(&dir, &base, &mut layers, &h0, &h1, &mut h, 4, 3);
+            byte_identical(&dir, &m, &s1, &h1);
+            if let Some(ix) = ix.as_mut() {
+                ix.note(account_of(&big).storage_root, fresh).unwrap();
+                assert_eq!(ix.find(&account_of(&big).storage_root).unwrap()[0], fresh);
+                assert_eq!(RootIndex::open(&dir).unwrap().len().1, 1);
+            }
+            got.push((h.stats.fetched, h.rows.collect()));
+            fs::remove_dir_all(&dir).ok();
+        }
+        assert!(
+            got[1].0 + big.storage.len() as u64 <= got[0].0,
+            "{} vs {}",
+            got[1].0,
+            got[0].0
+        );
+        assert_eq!(got[0].1, got[1].1);
+    }
+
+    #[test]
+    fn collection_keeps_pinned_manifests() {
+        let m: VecDeque<(B256, Vec<String>)> = (1..=6u8)
+            .map(|i| (B256::with_last_byte(i), vec![]))
+            .collect();
+        let pinned: HashSet<B256> = [B256::with_last_byte(1), B256::with_last_byte(3)].into();
+        // Three over the three kept: the oldest three that are not pinned.
+        let gone = collectable(&m, 3, &pinned);
+        assert_eq!(
+            gone,
+            vec![
+                B256::with_last_byte(2),
+                B256::with_last_byte(4),
+                B256::with_last_byte(5)
+            ]
+        );
+        assert!(collectable(&m, 6, &pinned).is_empty());
+        // The newest is kept even when everything else is pinned.
+        let all_but_newest: HashSet<B256> = (1..=5u8).map(B256::with_last_byte).collect();
+        assert!(collectable(&m, 2, &all_but_newest).is_empty());
     }
 
     #[tokio::test]
