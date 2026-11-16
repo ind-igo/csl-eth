@@ -1,6 +1,6 @@
 # Keeping full state current: the delta producer
 
-Design note, 2026-11-16. Not built; reviewed once (GPT 6.1 via omp, same day; what it changed is folded in, what was set aside is at the end). `full/` holds all of mainnet's state at block 26,422,083 and nothing moves it forward. A re-export is a burst (about $7 of VM and 8.7 hours), so a daily one costs about $210 a month and is always a day old. An always-on full node was ruled out on cost. This note is how the files follow the chain without either.
+Design note, 2026-11-16. Layers in the client and the healer (`csl-eth heal`) are built on branch `healer` and tested on synthetic states (§ Built, at the end); not yet run on mainnet. Reviewed once (GPT 6.1 via omp, same day; what it changed is folded in, what was set aside is at the end). `full/` holds all of mainnet's state at block 26,422,083 and nothing moves it forward. A re-export is a burst (about $7 of VM and 8.7 hours), so a daily one costs about $210 a month and is always a day old. An always-on full node was ruled out on cost. This note is how the files follow the chain without either.
 
 ## What has to happen per step
 
@@ -75,6 +75,66 @@ The healer's disk holds the base for position lookups (an estimated few hundred 
 Success is every step complete (every changed key and a random sample verified through the client against R1), heals inside the epoch, recovery from a five-epoch gap, and read cost within twice the base-only read.
 
 On Sepolia, which has access lists today, option 3 can be prototyped by replaying historical blocks and reproducing each block's `state_root`, once a Sepolia base exists.
+
+## Built (branch `healer`, 2026-11-16)
+
+**The client** reads a format-3 manifest: a plain base (another block's tables) plus layers, each layer one run per table at `runs/<blake3>.run`. At every position it asks every run and the walk takes the candidate that hashes to the parent's reference (`NodeSource::node_hashed`); the top-levels cache keeps only what the walk selected. Repair rounds and code search every run. A plain (format 2) snapshot reads exactly as before: the pinned cost (1,469 reads, 7,897 requests, 34,340,864 bytes, 2,805 rounds) is unchanged from main.
+
+**The store** writes a step's rows as a layer (`write_layer`), merges consecutive layers newest-wins and drops nothing (`merge_layers`, two streaming passes), and writes layered manifests.
+
+**The healer** (`crates/snap/src/healer.rs`) is § The healer with these choices:
+
+- The local store is the published runs themselves (base and layers, read through `csl-run` readers by position), so there is no second node database.
+- A step diffs the verified head's trie against the held state from the root down, wave by wave. One wave is one `GetTrieNodes` round across peers. Served nodes are checked by hash before use, and a bounded cache (`--cache-mib`) keeps them across a re-pivot. New code comes with `GetByteCodes`.
+- A step that leaves anything unresolved after four tries, or passes its deadline (about 110 blocks after the target), re-pivots to the newest verified head.
+- Commit order:
+  1. Write the layer and merge tiers.
+  2. Read back every changed account, up to `--verify-slots` changed slots and every new code through the client over the local files at the new root.
+  3. Only then publish: runs and blobs, the manifest, head files, `snapshots/latest`.
+  4. Collect manifests past `--keep` and the runs only they reach.
+- `heal.json` holds the base, the head, the tiers and what is published, so a restart resumes.
+- Publishing goes to `scripts/gcs-publish.sh` (runs are cached as immutable), to a directory, or to a dry run.
+
+**Not built, against the plan above:**
+
+- The storage-root → owner index (a new owner whose storage root another already has is fetched whole from peers).
+- The sharded base and base compaction.
+- Size-triggered tiers. Tiers are count-triggered (`--fanout` per tier, `--tiers` levels, the top tier one run since the base), and compaction runs inside the step.
+- Per-run density hints, so a reader still asks every run.
+- Access lists, and the sustained snap/1 probe.
+
+**Tests.** The client has three layer tests: a base plus two layers answers every key as a fresh build of the last state; a dropped or corrupted layer yields only `Insufficient`; plain cost is pinned. They run over a crafted transition table: an extension split, a branch collapse, an owner sharing another's storage root, deletion then recreation with new code, and embedded↔hashed. The healer has four tests on the same table:
+
+- Step by step and across a two-step gap, each layer a superset of the full row diff and nothing outside the new state.
+- A step with a zero-size cache.
+- A re-pivot that reuses fetched nodes.
+- Twenty steps through tiers with every state read back.
+
+**Read cost over layers** (synthetic: about 4% of accounts change per step, so each layer is dense; `read_cost_over_n_layers_and_merged`):
+
+| layers | requests | bytes | rounds | the same layers merged into one |
+|---|---|---|---|---|
+| 1 | 1.32× | 1.35× | 2.12 vs 2.00 | 1.32×, 1.35× |
+| 2 | 1.60× | 1.66× | 2.14 vs 2.04 | 1.35×, 1.34× |
+| 4 | 2.26× | 2.37× | 2.17 vs 1.98 | 1.34×, 1.41× |
+| 8 | 3.38× | 3.60× | 2.31 vs 2.10 | 1.33×, 1.44× |
+| 16 | 5.65× | 6.07× | 2.31 vs 2.21 | 1.40×, 1.49× |
+
+Rounds barely move; requests and bytes grow about linearly with runs, because each run is one more predicted page per depth. Merging restores the cost to about 1.35×. The success bar (twice the base-only read) is therefore a bound of about three layers, unless density hints let readers skip runs. With count tiers the worst case is `(fanout − 1) × tiers + 1` layers: 16 at the defaults (fanout 4, 5 tiers), 3 at fanout 2 and 2 tiers, which rewrites the since-base run every four steps. Choosing between read cost and rewrite volume is what the mainnet run is for; density hints are the way out of the trade.
+
+**On mainnet, from the Mac (2026-11-16).**
+
+- **Base.** A fresh 1/4096 slice (prefix `1a7`, block 26,428,265: 105,262 accounts, 134,125 slots, 2,218 codes), fetched over 27 minutes from the one Nethermind peer the Mac reached through Mullvad.
+- **Run.** `csl-eth heal --to-dir pub --steps 5` against live peers and the Lodestar light-client endpoints, verifying from the 2026-11-15 checkpoint.
+- **Steps.** The first closed the 122 blocks since the base in 0.9 s (47 nodes, 15 KiB, 9 waves). The next four followed the head block by block, 0.2 to 0.7 s each, publishing about 16 s after each block's timestamp, which is the attested update's own delay. One peer was enough at this size.
+- **Checks.** Each step read its changed accounts back through the client before publishing, and the fourth merged a tier.
+- **Completeness.** `healed_dir_is_complete` (ignored test, `crates/snap/src/healer.rs`) then read every account of the slice from the published directory at block 26,428,391: 105,253 unchanged, 9 changed, 29,355 slots, 2,218 codes, none insufficient.
+
+**What remains before `full/`.**
+
+- **The finalized tier.** The healer publishes `head/optimistic` and period updates, not `head/finality`, and its manifests (`--keep 64`, about 13 minutes at one block a step) do not reach back to the finalized block.
+- **Catch-up from a stale base.** A step holds its rows in memory and must finish within the peers' window; a re-pivot keeps at most `--cache-mib` of fetched nodes. A backlog whose diff exceeds that does not converge, so `full/` (block 26,422,083, a day and more behind) needs a fresh burst (about $7) and the healer started within hours of it. A disk-backed node cache would lift this.
+- **The read-cost trade**, above.
 
 ## Review: what was set aside
 

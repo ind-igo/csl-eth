@@ -1929,3 +1929,71 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// A healed directory against the slice its base was built from:
+/// `CSL_HEAL_SLICE=<slice> CSL_HEAL_DIR=<published dir> cargo test
+/// --release -p csl-eth-snap --lib healed_dir_is_complete -- --ignored
+/// --nocapture`. Every account, slot and code of the slice must read at
+/// the published head as verified or proven absent; none insufficient.
+#[cfg(test)]
+mod mainnet {
+    use super::*;
+    use crate::slice::Slice;
+
+    #[test]
+    #[ignore]
+    fn healed_dir_is_complete() {
+        let (Ok(s), Ok(d)) = (std::env::var("CSL_HEAL_SLICE"), std::env::var("CSL_HEAL_DIR")) else { return };
+        let slice = Slice::read(Path::new(&s)).unwrap();
+        let dir = PathBuf::from(d);
+        let latest = fs::read_to_string(dir.join(LATEST_FILE)).unwrap();
+        let hash: B256 = format!("0x{}", latest.trim().trim_start_matches("0x")).parse().unwrap();
+        let m = Manifest::from_json(&fs::read(dir.join(manifest_path(&hash))).unwrap()).unwrap();
+        let mut snap = Snapshot::open(DirDriver::new(&dir), Some(hash), m.state_root).unwrap();
+        let (mut same, mut changed, mut gone, mut slots, mut slots_changed, mut codes) = (0, 0, 0, 0, 0, 0);
+        let mut bad = Vec::new();
+        for (k, a) in &slice.accounts {
+            let now = match snap.account(k).0 {
+                Read::Verified(n) => n,
+                r if r.is_absent() => {
+                    gone += 1;
+                    continue;
+                }
+                r => {
+                    bad.push(format!("account {k}: {r:?}"));
+                    continue;
+                }
+            };
+            if now == *a { same += 1 } else { changed += 1 }
+            if let Some(ss) = slice.storage.get(&a.storage_root) {
+                for (h, v) in ss.iter().take(50) {
+                    match snap.storage_of(&now, k, h).0 {
+                        Read::Verified(x) => {
+                            slots += 1;
+                            if x != *v {
+                                slots_changed += 1;
+                            }
+                        }
+                        r if r.is_absent() => slots_changed += 1,
+                        r => bad.push(format!("slot {k}/{h}: {r:?}")),
+                    }
+                }
+            }
+        }
+        for h in slice.code.keys() {
+            match snap.code(h).0 {
+                Read::Verified(_) => codes += 1,
+                r => bad.push(format!("code {h}: {r:?}")),
+            }
+        }
+        eprintln!(
+            "block {} accounts: {same} same, {changed} changed, {gone} gone; slots: {slots} read, {slots_changed} changed; codes {codes}; insufficient {}",
+            m.block_number,
+            bad.len()
+        );
+        for b in bad.iter().take(10) {
+            eprintln!("{b}");
+        }
+        assert!(bad.is_empty());
+    }
+}
