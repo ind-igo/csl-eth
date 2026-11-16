@@ -216,7 +216,8 @@ fn error_kind(e: &PeerError) -> String {
     s.chars().take(90).collect()
 }
 
-async fn worker_task(mut peer: Peer, shared: Arc<Shared>, idle_tx: mpsc::Sender<Worker>) {
+/// Serve jobs until the peer goes; returns how many nodes it served.
+async fn worker_task(mut peer: Peer, shared: Arc<Shared>, idle_tx: mpsc::Sender<Worker>) -> u64 {
     let id = peer.id();
     let client = peer.client.clone();
     let log = shared.log.clone();
@@ -237,7 +238,7 @@ async fn worker_task(mut peer: Peer, shared: Arc<Shared>, idle_tx: mpsc::Sender<
         shared.connected.fetch_sub(1, Ordering::Relaxed);
         log.emit(json!({"ev": "peer_down", "peer": id.to_string()[..16], "client": client, "reason": "behind", "served": 0}));
         peer.close().await;
-        return;
+        return 0;
     }
     let (tx, mut rx) = mpsc::channel::<Job>(1);
     let me = Worker { id, tx };
@@ -352,7 +353,11 @@ async fn worker_task(mut peer: Peer, shared: Arc<Shared>, idle_tx: mpsc::Sender<
     shared.connected.fetch_sub(1, Ordering::Relaxed);
     log.emit(json!({"ev": "peer_down", "peer": id.to_string()[..16], "client": client, "reason": reason, "served": served}));
     peer.close().await;
+    served
 }
+
+/// How long after a peer that served goes before it is dialed again.
+const REDIAL_AFTER: Duration = Duration::from_secs(60);
 
 fn spawn_connector(shared: Arc<Shared>, idle_tx: mpsc::Sender<Worker>) {
     tokio::spawn(async move {
@@ -360,7 +365,17 @@ fn spawn_connector(shared: Arc<Shared>, idle_tx: mpsc::Sender<Worker>) {
         let (status, fork_filter) = peer::mainnet_status(None);
         let mut candidates = discovery::start(key, shared.cfg.udp_port, fork_filter.clone(), true, true).await;
         let dials = Arc::new(tokio::sync::Semaphore::new(shared.cfg.dial_parallel));
-        while let Some(record) = candidates.recv().await {
+        // Discovery hands out each node once, but full nodes evict peers
+        // at random to free slots: one that served is dialed again later.
+        let (redial_tx, mut redial_rx) = mpsc::unbounded_channel::<reth_network_peers::NodeRecord>();
+        loop {
+            let record = tokio::select! {
+                Some(r) = redial_rx.recv() => r,
+                r = candidates.recv() => match r {
+                    Some(r) => r,
+                    None => break,
+                },
+            };
             while shared.connected.load(Ordering::Relaxed) >= shared.cfg.peers {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
@@ -368,6 +383,7 @@ fn spawn_connector(shared: Arc<Shared>, idle_tx: mpsc::Sender<Worker>) {
             let shared = shared.clone();
             let idle_tx = idle_tx.clone();
             let fork_filter = fork_filter.clone();
+            let redial_tx = redial_tx.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 shared.dialed.fetch_add(1, Ordering::Relaxed);
@@ -381,7 +397,10 @@ fn spawn_connector(shared: Arc<Shared>, idle_tx: mpsc::Sender<Worker>) {
                         }
                         peer.timeout = shared.cfg.timeout;
                         drop(_permit);
-                        worker_task(peer, shared, idle_tx).await;
+                        if worker_task(peer, shared, idle_tx).await > 0 {
+                            tokio::time::sleep(REDIAL_AFTER).await;
+                            let _ = redial_tx.send(record);
+                        }
                     }
                     Err(PeerError::NoSnap) => {
                         shared.no_snap.fetch_add(1, Ordering::Relaxed);
