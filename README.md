@@ -15,9 +15,15 @@ cold state layer; PoC 1 (cinder) built the same layer on a chain of its own.
 The page is served from the same Cloud Storage bucket it reads, so the whole
 demo is one bucket and one small VM that publishes to it.
 
-**Scope:** the bucket holds 1/4096 of mainnet state (account-trie prefix
-`1a7`, about 105,000 accounts), refreshed every epoch. A key outside the
-prefix answers `Insufficient`, never a false absence.
+**Scope:** the bucket holds two things.
+
+- **All of mainnet's state at one block** under `full/` (block 26,422,083,
+  finalized; 432 M accounts, 1.69 G storage slots, 344 GiB), with the last
+  22,084 blocks of transactions, receipts and logs beside it:
+  https://storage.googleapis.com/csl-eth-demo/index.html?open&bucket=https://storage.googleapis.com/csl-eth-demo/full&tier=finalized
+- **1/4096 of mainnet state, kept fresh** (account-trie prefix `1a7`, about
+  105,000 accounts), refreshed every epoch. A key outside the prefix answers
+  `Insufficient`, never a false absence.
 
 ## How a read is verified
 
@@ -78,13 +84,15 @@ above. Details in `docs/decisions.md`.
 
 ## Limits
 
-- **One slice, not full state.** The full-state plan is one export from a
-  local reth node, then a diff of changed trie nodes per snapshot, so the cost
-  of a snapshot scales with what changed, not with the state. Not yet measured.
-- **State only, no history yet.** Blocks, transactions, receipts and logs
-  are the next tables: append-only, verified against each header's
-  `transactionsRoot` and `receiptsRoot`, so a light client and a basic
-  indexer read them the same way. Not built.
+- **Full state is one block.** One burst (`deploy/gcp/full-export.sh`: reth's
+  snapshot, a sync, a 2.4 h export, a 2.4 h upload, about $7) publishes it;
+  keeping it current is a diff of changed trie nodes per snapshot, not built.
+  Cold reads against it, from Taipei: an account in 4 rounds and 80 KB
+  (843 ms), a storage slot in 7 rounds and 280 KB.
+- **History is recent.** `full/history/` covers the 22,084 blocks the node
+  kept (three days). Old headers cost a walk (6.4 MB for a transaction a day
+  back) until the beacon accumulator's files are published. History from
+  genesis is sized (about 4.9 TB, about $100 a month) but not run.
 - **The producer needs care.** It restarts under systemd, but nothing alerts
   when cycles fail, and each failed fetch costs about four epochs.
 - **The checkpoint.** The default root (slot 15,661,216, 2026-11-15) must be

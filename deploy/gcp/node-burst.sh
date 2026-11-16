@@ -78,13 +78,25 @@ say "export done in $(( $(date +%s) - t0 ))s, $(du -sh /data/out | cut -f1)"
 # 4. Publish under full/: content-addressed objects (immutable) first, then
 # the head files and the pointer (no-cache), so a reader never sees a
 # pointer to something missing.
+#
+# The bulk goes through `gcloud storage cp`, not gcs-publish.sh: the runs
+# are single objects of 94 and 254 GB, which one PUT under curl's
+# --max-time can never finish (the first full run stalled there). gcloud
+# streams them resumably. It can't use composite uploads here, since the
+# VM's account has no bucket GET, so each run is one stream at 40 to
+# 80 MB/s: mainnet's runs took 98 min and its 1.3M code blobs 46 min
+# (2026-11-16). --no-clobber makes a rerun resume.
 pub() { CSL_ETH_GCS_BUCKET="$BUCKET" /data/src/scripts/gcs-publish.sh "$@"; }
-export -f pub; export BUCKET
+imm=(--no-clobber --cache-control 'public, max-age=31536000, immutable' --content-type application/octet-stream)
 cd /data/out
+snap=$(cat snapshots/latest)
 t0=$(date +%s)
-find snapshots blobs -type f ! -name latest -print0 2>/dev/null \
-  | xargs -0 -P 32 -I{} bash -c 'pub put "full/$1" "$1"' _ {}
-say "objects up in $(( $(date +%s) - t0 ))s"
+gcloud storage cp "${imm[@]}" "snapshots/$snap/"*.run "gs://$BUCKET/full/snapshots/$snap/"
+say "runs up in $(( $(date +%s) - t0 ))s"
+t0=$(date +%s)
+if [ -d blobs ]; then gcloud storage cp -r "${imm[@]}" blobs "gs://$BUCKET/full/"; fi
+say "blobs up in $(( $(date +%s) - t0 ))s"
+pub put "full/snapshots/$snap/manifest.json" "snapshots/$snap/manifest.json"
 cd /data/head
 find . -type f -print0 | while IFS= read -r -d '' f; do pub put "full/head/${f#./}" "$f"; done
 cd /data/out
@@ -101,3 +113,27 @@ for d in $(gcloud storage ls "gs://$BUCKET/full/snapshots/" 2>/dev/null | grep '
   [ "$h" = "$new" ] || [ "$h" = "$prev" ] && continue
   gcloud storage rm -r -q "$d" && say "removed old snapshot $h"
 done
+
+# 5. The history the minimal node still holds (its last ~22,000 blocks of
+# transactions and receipts, three days), anchored at the same verified
+# block and published under full/history/. Two minutes of export and 11 GB
+# on mainnet (2026-11-16). Best effort: the state above is the burst's job.
+X=/data/src/tools/export-reth/target/release/export-reth
+first=$($X history probe --datadir /data/reth | sed -n 's/.*"transactions_from":\([0-9]*\).*/\1/p')
+if [ -n "$first" ] && rm -rf /data/hout && mkdir -p /data/hout \
+  && $X history export --datadir /data/reth --block-number "$BLOCK_NUMBER" --block-hash "$BLOCK_HASH" \
+    --first "$first" --out /data/hout --workers 16 2>&1 | sed -u 's/^/csl-export history /' \
+  && [ -f /data/hout/history/latest ]; then
+  (
+    set -e
+    cd /data/hout
+    gcloud storage rsync -r "${imm[@]}" history/packs "gs://$BUCKET/full/history/packs"
+    gcloud storage rsync -r "${imm[@]}" history/runs "gs://$BUCKET/full/history/runs"
+    m="history/$(cat history/latest)/manifest.json"
+    pub put "full/$m" "$m"
+    pub put full/history/latest history/latest
+  ) && say "published history $first..$BLOCK_NUMBER at gs://$BUCKET/full/history/" \
+    || say "history publish failed; state is published"
+else
+  say "history export failed; state is published"
+fi
