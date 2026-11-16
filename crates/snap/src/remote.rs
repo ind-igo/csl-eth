@@ -177,6 +177,9 @@ pub struct RemoteBase {
 /// Fetched pages kept between batches; past this the cache starts over
 /// (the readers keep their verified model pages).
 const PAGE_CACHE: usize = 65_536;
+/// Rounds of fetching per batch, and rounds in a row without a page.
+const MAX_ROUNDS: usize = 64;
+const IDLE_ROUNDS: usize = 3;
 
 impl RemoteBase {
     /// The base tables of `manifest` (its plain tables, not its layers).
@@ -256,28 +259,45 @@ impl RemoteBase {
         }
         let mut out = HashMap::new();
         let mut open: Vec<usize> = (0..needs.len()).collect();
-        for _ in 0..8 {
+        let mut missed = false;
+        // A cold lookup may walk several model pages in turn: go on while
+        // pages come, and stop after a few rounds in which none did.
+        let mut idle = 0;
+        for _ in 0..MAX_ROUNDS {
             let mut next = Vec::new();
             for i in open {
                 match self.lookup(&needs[i]) {
                     Ok(Some(b)) => {
                         out.insert(i, b);
                     }
-                    Ok(None) | Err(false) => {}
+                    Ok(None) | Err(false) => missed = true,
                     Err(true) => next.push(i),
                 }
             }
-            if next.is_empty() {
+            open = next;
+            if open.is_empty() {
                 break;
             }
-            self.fill().await;
-            open = next;
+            if self.fill().await == 0 {
+                idle += 1;
+                if idle >= IDLE_ROUNDS {
+                    break;
+                }
+            } else {
+                idle = 0;
+            }
+        }
+        // An old node the base should hold and did not answer: its pages
+        // may have come short or wrong. Drop the fetched pages so the next
+        // ask fetches them again (the readers keep their verified models).
+        if missed || !open.is_empty() {
+            self.pages.lock().expect("pages").got.clear();
         }
         Ok(out)
     }
 
-    /// Fetch every wanted page, `parallel` at a time.
-    async fn fill(&mut self) {
+    /// Fetch every wanted page, `parallel` at a time; how many came.
+    async fn fill(&mut self) -> usize {
         let wanted: Vec<(usize, u64, usize)> = {
             let mut p = self.pages.lock().expect("pages");
             p.wanted.drain().collect()
@@ -296,9 +316,11 @@ impl RemoteBase {
         // A page that fails to come leaves its lookups pending for the
         // next round; past the rounds they are left out.
         let mut s = futures::stream::iter(jobs).buffer_unordered(self.parallel.max(1));
+        let mut came = 0;
         while let Some(((run, off), r)) = s.next().await {
             match r {
                 Ok(b) => {
+                    came += 1;
                     self.requests += 1;
                     self.bytes += b.len() as u64;
                     self.pages
@@ -313,6 +335,7 @@ impl RemoteBase {
                 }
             }
         }
+        came
     }
 }
 

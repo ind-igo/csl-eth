@@ -3013,6 +3013,71 @@ mod tests {
         (Store::open_with(dir, &m, local).unwrap(), m)
     }
 
+    /// The bucket serving pages short or wrong for a while: the asks then
+    /// come back empty, and once it serves them right the same base answers
+    /// every node (nothing bad stays cached), each checked by hash.
+    #[tokio::test]
+    async fn a_bad_bucket_page_is_fetched_again() {
+        use crate::remote::{DirRanges, RangeGet, RemoteBase};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Flaky(DirRanges, AtomicBool);
+        impl RangeGet for Flaky {
+            fn get(&self, rel: &str, off: u64, len: usize) -> Result<Vec<u8>, String> {
+                let mut b = self.0.get(rel, off, len)?;
+                if self.1.load(Ordering::Relaxed) {
+                    // Every other page short, the rest with a flipped byte.
+                    if off % 2 == 0 {
+                        b.truncate(b.len() / 2);
+                    } else if let Some(x) = b.get_mut(len / 2) {
+                        *x ^= 0x40;
+                    }
+                }
+                Ok(b)
+            }
+            fn file(&self, rel: &str) -> Result<Vec<u8>, String> {
+                self.0.file(rel)
+            }
+        }
+        let s = states();
+        let h0 = head_of(&s[0], 0);
+        let bucket = scratch("flaky");
+        let base = produce(&bucket, &h0, "", leaves(&s[0]), &code_of(&s[0]))
+            .unwrap()
+            .manifest;
+        let r = rows(&s[0], &h0);
+        let needs: Vec<Need> = r
+            .account
+            .iter()
+            .map(|(k, v)| {
+                // The account table's key: packed path, then its depth.
+                let nibs: Vec<u8> = (0..k[31] as usize)
+                    .map(|i| (k[i / 2] >> if i % 2 == 0 { 4 } else { 0 }) & 0xf)
+                    .collect();
+                Need {
+                    owner: None,
+                    path: Nibbles::from_nibbles(&nibs),
+                    hash: keccak256(v),
+                }
+            })
+            .collect();
+        let flaky = Arc::new(Flaky(DirRanges(bucket.clone()), AtomicBool::new(true)));
+        let mut rb = RemoteBase::new(flaky.clone(), &base).unwrap();
+        let bad = rb.nodes(&needs).await.unwrap();
+        eprintln!("bad pages: {} of {} answered", bad.len(), needs.len());
+        assert!(bad.len() < needs.len());
+        flaky.1.store(false, Ordering::Relaxed);
+        let good = rb.nodes(&needs).await.unwrap();
+        assert_eq!(
+            good.len(),
+            needs.len(),
+            "every node once the pages are right"
+        );
+        for (i, b) in good {
+            assert_eq!(keccak256(&b), needs[i].hash);
+        }
+        fs::remove_dir_all(&bucket).ok();
+    }
+
     /// Without the base on disk: across a gap the old side comes from the
     /// base's runs by range (a directory standing in for the bucket); in
     /// the window, from peers at the old root. The layers are what a
