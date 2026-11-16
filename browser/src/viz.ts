@@ -1,4 +1,4 @@
-// The visualizer: the same wasm client and driver as the main page. Live,
+// The page (served as index.html): the wasm client and its driver. Live,
 // on the real clock: every request this tab makes and every step its
 // client computes. After a read answers: the client's trace of its final
 // verified walk, each node check attributed to the client step that made
@@ -38,12 +38,13 @@ import { C, LANE, roundColor } from "./viz/palette.ts";
 import { explainEnd, renderTrie } from "./viz/trie.ts";
 import { reqLabel, renderWaterfall, sceneEnd } from "./viz/waterfall.ts";
 
-// Served from a Cloud Storage bucket (deploy/gcp/site.sh), the page reads the
-// bucket it came from; anywhere else, the R2 bucket.
+// Served from the Cloud Storage bucket (deploy/gcp/site.sh), the page reads
+// the full mainnet state under `full/` in the bucket it came from; anywhere
+// else (the dev server), the same files on the demo bucket.
 const DEFAULT_BASE =
   location.hostname === "storage.googleapis.com"
-    ? new URL(".", location.href).href.replace(/\/+$/, "")
-    : "https://pub-a977a488180546bfb335de69b6f2e207.r2.dev";
+    ? new URL("full", location.href).href.replace(/\/+$/, "")
+    : "https://storage.googleapis.com/csl-eth-demo/full";
 const DEFAULT_CHECKPOINT = "0x431b33af8452e2d644377405e69d4f382182ab906f31461190ca24cb3401d70b";
 /// Display time each node check takes in a replay or after a live read.
 const CHECK_MS = 160;
@@ -83,7 +84,8 @@ const el = {
 const params = new URLSearchParams(location.search);
 el.base.value = params.get("bucket") ?? DEFAULT_BASE;
 el.checkpoint.value = params.get("checkpoint") ?? DEFAULT_CHECKPOINT;
-el.tier.value = tierParam(params);
+// The full state is published under its finalized head only.
+el.tier.value = params.has("tier") ? tierParam(params) : "finalized";
 
 // --- state --------------------------------------------------------------------
 
@@ -96,6 +98,7 @@ let opened: Config | null = null;
 let head: Head | null = null;
 let tables: TableInfo[] = [];
 let topLevels = 4;
+let hasByHash = false;
 let busy = false;
 let sceneId = 0;
 
@@ -280,9 +283,13 @@ async function open() {
     bucket.setTables(tables);
     bucket.resize();
     bucket.addHeat(s);
-    const bad = tables.filter((t) => t.error).map((t) => `${t.name} (${t.error})`);
+    // The by-hash table only serves the race; a snapshot without it (the
+    // full state) just has no race.
+    hasByHash = tables.some((t) => t.name === "nodes_by_hash" && !t.error);
+    el.race.hidden = !hasByHash;
+    const bad = tables.filter((t) => t.error && t.name !== "nodes_by_hash").map((t) => `${t.name} (${t.error})`);
     const fcr = fcrLine(h.fcr);
-    status(`head verified: block ${h.block_number.toLocaleString()}, ${tierLine(h)}.${fcr ? ` ${fcr[0]!.toUpperCase()}${fcr.slice(1)}.` : ""} ${bad.length ? `Unusable: ${bad.join(", ")}.` : "Pick a key."}`, bad.length > 0);
+    status(`Head verified: block ${h.block_number.toLocaleString()}, ${tierLine(h)}.${fcr ? ` ${fcr[0]!.toUpperCase()}${fcr.slice(1)}.` : ""} ${bad.length ? `Unusable: ${bad.join(", ")}.` : ""}`, bad.length > 0);
   } catch (e) {
     if (c && client !== c) c.free();
     status(`not verified: ${e instanceof Error ? e.message : e}`, true);
@@ -332,7 +339,7 @@ async function read() {
 /// proves a different head or snapshot from the one shown, or from each
 /// other.
 async function race() {
-  if (busy || !client || !wasm || !opened || !head) return;
+  if (busy || !client || !wasm || !opened || !head || !hasByHash) return;
   const what = el.kind.value as What;
   if (what === "code") {
     status("a race compares trie walks: pick an account or a storage slot", true);
@@ -837,12 +844,11 @@ interface Chip {
   slot?: string;
 }
 const CHIPS: Chip[] = [
-  { label: "an EOA", kind: "account", key: "0x00c290a6375b3c2a0a553ab65b82ad8847e3524d" },
-  { label: "a contract", kind: "account", key: "0x20ea861b3acec90d3a15b4755d9a1cf1f161496e" },
-  { label: "its slot 2", kind: "storage", key: "0x20ea861b3acec90d3a15b4755d9a1cf1f161496e", slot: "2" },
-  { label: "its empty slot 1", kind: "storage", key: "0x20ea861b3acec90d3a15b4755d9a1cf1f161496e", slot: "1" },
-  { label: "absent key", kind: "account", key: "0x1a7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" },
-  { label: "vitalik.eth (outside the slice)", kind: "account", key: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045" },
+  { label: "vitalik.eth", kind: "account", key: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045" },
+  { label: "USDC contract", kind: "account", key: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" },
+  { label: "USDT storage slot 1", kind: "storage", key: "0xdAC17F958D2ee523a2206206994597C13D831ec7", slot: "1" },
+  { label: "burn address 0x…dEaD", kind: "account", key: "0x000000000000000000000000000000000000dEaD" },
+  { label: "an account that doesn't exist", kind: "account", key: "0x7e57c0de00000000000000000000000000000000" },
 ];
 let codeChip: Chip | null = null;
 
@@ -922,6 +928,13 @@ requestAnimationFrame(frame);
     wasm = await loadWasm();
     $<HTMLSpanElement>("version").textContent = `csl-eth-wasm ${wasm.version()}`;
     await open();
+    // Show a read straight away: the first chip, unless the URL names a key.
+    if (client) {
+      const k = params.get("key");
+      if (k) setInputs({ label: "", kind: (params.get("kind") as What) ?? "account", key: k, slot: params.get("slot") ?? undefined });
+      else setInputs(CHIPS[0]!);
+      await read();
+    }
   } catch (e) {
     status(`could not load the wasm module: ${e instanceof Error ? e.message : e}`, true);
   }

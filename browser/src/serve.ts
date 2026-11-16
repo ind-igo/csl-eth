@@ -1,7 +1,8 @@
-// The dev server: bundles `src/main.ts` and `src/viz.ts` into `dist/` with Bun, then serves `index.html`, `viz.html`, `dist/*` and the wasm-bindgen output
+// The dev server: bundles `src/viz.ts` into `dist/` with Bun, then serves `index.html`, `dist/*` and the wasm-bindgen output
 // in `pkg/*` (`.wasm` as `application/wasm`, so the module compiles while
 // streaming). With `--site <dir>` it instead assembles a static site there
-// (index.html, viz.html, dist/, pkg/) for hosting, and exits.
+// (index.html, and viz.html as a copy for old links; dist/, pkg/) for
+// hosting, and exits.
 //
 //   bun src/serve.ts [--port 8791]
 //   bun src/serve.ts --site site
@@ -22,7 +23,7 @@ const TYPES: Record<string, string> = {
 
 export async function build(): Promise<void> {
   const out = await Bun.build({
-    entrypoints: [join(ROOT, "src/main.ts"), join(ROOT, "src/viz.ts")],
+    entrypoints: [join(ROOT, "src/viz.ts")],
     outdir: join(ROOT, "dist"),
     target: "browser",
     format: "esm",
@@ -39,7 +40,7 @@ function site(dir: string) {
   rmSync(out, { recursive: true, force: true });
   mkdirSync(out, { recursive: true });
   cpSync(join(ROOT, "index.html"), join(out, "index.html"));
-  cpSync(join(ROOT, "viz.html"), join(out, "viz.html"));
+  cpSync(join(ROOT, "index.html"), join(out, "viz.html"));
   cpSync(join(ROOT, "dist"), join(out, "dist"), { recursive: true });
   cpSync(join(ROOT, "pkg"), join(out, "pkg"), { recursive: true });
   // Static-assets Worker: cache the hashed-by-nothing assets for a short while.

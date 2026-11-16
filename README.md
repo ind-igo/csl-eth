@@ -6,24 +6,21 @@ byte range, and proves every value and every absence from the state root the
 beacon chain signed. No RPC and no node at read time. This is PoC 2 of the
 cold state layer; PoC 1 (cinder) built the same layer on a chain of its own.
 
-- **Client:** https://storage.googleapis.com/csl-eth-demo/index.html?open
-- **Visualizer:** https://storage.googleapis.com/csl-eth-demo/viz.html shows
-  each read's proof node by node, lets you flip a byte to watch the client
-  refuse, and races the read against a by-hash baseline. Nothing on it is
-  simulated.
+**Demo:** https://storage.googleapis.com/csl-eth-demo/index.html opens all of
+mainnet's state, verifies the head and reads vitalik.eth on its own, then
+shows each read's requests and its proof node by node. A checkbox flips one
+byte of a fetched page to show the client refusing it. Nothing on it is
+simulated.
 
-The page is served from the same Cloud Storage bucket it reads, so the whole
-demo is one bucket and one small VM that publishes to it.
+**Scope:** all of mainnet's state at one block, under `full/` in the bucket:
+block 26,422,083, finalized; 432 M accounts, 1.69 G storage slots, 344 GiB.
+The last 22,084 blocks of transactions, receipts and logs sit beside it. The
+page is served from the same Cloud Storage bucket it reads. Keeping the full
+state current, block by block, is the next piece (`docs/delta-producer.md`).
 
-**Scope:** the bucket holds two things.
-
-- **All of mainnet's state at one block** under `full/` (block 26,422,083,
-  finalized; 432 M accounts, 1.69 G storage slots, 344 GiB), with the last
-  22,084 blocks of transactions, receipts and logs beside it:
-  https://storage.googleapis.com/csl-eth-demo/index.html?open&bucket=https://storage.googleapis.com/csl-eth-demo/full&tier=finalized
-- **1/4096 of mainnet state, kept fresh** (account-trie prefix `1a7`, about
-  105,000 accounts), refreshed every epoch. A key outside the prefix answers
-  `Insufficient`, never a false absence.
+Before the full state, the PoC kept 1/4096 of the state (account-trie prefix
+`1a7`) fresh every epoch, fetched over devp2p `snap` with no node. That
+producer is stopped (2026-11-16); its numbers below are kept for the record.
 
 ## How a read is verified
 
@@ -51,8 +48,13 @@ report as a named source's claim, which the client does not verify.
 
 ## Numbers
 
-Read cost against Cloudflare R2, from Taipei through a VPN
-(2026-10-31 to 11-01, `results/m1.md`; not yet re-measured on Cloud Storage):
+The full state on Cloud Storage, cold, in headless Chromium (2026-11-16):
+the page loads, verifies the head and reads an account in about 2.5 s; an
+account takes 3 to 5 rounds and about 80 KB (650 to 850 ms), a storage slot 7
+rounds (about 1.3 s), an absent account 3 rounds.
+
+Earlier, the slice against Cloudflare R2, from Taipei through a VPN
+(2026-10-31 to 11-01, `results/m1.md`):
 
 - **Account:** 2.7 requests, 37 KB, one round (two when its index pages are
   cold), 135 ms p50.
@@ -64,8 +66,8 @@ Read cost against Cloudflare R2, from Taipei through a VPN
 - **Correctness:** zero false answers in 86,368 workload reads and 23 aimed
   faults.
 
-Freshness in production (fafo-0 publishing to R2, 258 cycles, 2026-11-06
-11:34 to 11-08 12:51 UTC):
+The slice's freshness in production (fafo-0 publishing to R2, 258 cycles,
+2026-11-06 11:34 to 11-08 12:51 UTC):
 
 - **Snapshot age a reader sees**, averaged over time: median about 14
   minutes, p90 39, p99 73, max 91.
@@ -93,8 +95,11 @@ above. Details in `docs/decisions.md`.
   kept (three days). Old headers cost a walk (6.4 MB for a transaction a day
   back) until the beacon accumulator's files are published. History from
   genesis is sized (about 4.9 TB, about $100 a month) but not run.
-- **The producer needs care.** It restarts under systemd, but nothing alerts
-  when cycles fail, and each failed fetch costs about four epochs.
+- **HTTP/3 through a small-MTU tunnel.** Behind a VPN whose path MTU is
+  below about 1,350 bytes, Chrome's HTTP/3 to storage.googleapis.com stalls
+  (Google's QUIC packets are larger than the path and are dropped without an
+  error), and the page hangs loading. TCP is fine. Seen 2026-11-16 through
+  Mullvad; normal connections are unaffected.
 - **The checkpoint.** The default root (slot 15,661,216, 2026-11-15) must be
   replaced before it leaves the weak-subjectivity period, around the end of
   November.
@@ -135,7 +140,7 @@ cd browser && bun install && bun run serve                     # http://127.0.0.
 # the demo on Google Cloud (project csl-eth): bucket, VM, network, in one Alchemy stack
 cd infra && bun install && bun run plan && bun run deploy --yes
 deploy/gcp/apply.sh        # build the producer on the VM, run it under systemd
-deploy/gcp/site.sh         # build the page, upload it into the bucket
+deploy/gcp/site.sh         # build the page (gzipped), upload it into the bucket
 ```
 
 The producer publishes with `scripts/gcs-publish.sh`, as the VM's service
