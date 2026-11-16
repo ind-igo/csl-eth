@@ -2496,9 +2496,15 @@ pub async fn run(args: Args) -> Result<(), String> {
                         h.log.emit(json!({"ev": "finalized", "block": fe.block_number, "block_hash": fe.block_hash, "how": "pinned", "commit": v}));
                     } else if fe.block_number > h.st.head.block_number
                         && window_secs(fe.timestamp) >= FINALIZED_MIN_WINDOW
+                        && window_secs(h.st.head.timestamp) > 0
                     {
-                        // Ahead of us with time left in the window: step
-                        // to it first.
+                        // Ahead of us with time left in the window, and the
+                        // step is short (our head is still in the peers'
+                        // window): step to it first. A catch-up targets the
+                        // attested head instead, whose whole window the
+                        // attempt then gets; the finalized block, about 78
+                        // blocks older, would leave it about 6 minutes
+                        // before re-pivoting.
                         fin = Some((fu, fvh));
                     } else if fe.block_number != fin_missed {
                         // Passed over (or too old to reach): the next
