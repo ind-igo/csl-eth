@@ -12,8 +12,8 @@ use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{HashBuilder, KECCAK_EMPTY};
 use csl_eth_client::{Cost, DirDriver, Driver, Read, Snapshot};
 use csl_eth_store::{
-    build_rows, manifest_path, produce, run_path, write_layer, write_layered_manifest, AccountLeaf,
-    Head, LayerRows, Manifest, ProduceOptions, Rows4, EPSILON,
+    build_rows, manifest_path, merge_layers, produce, run_path, write_layer,
+    write_layered_manifest, AccountLeaf, Head, LayerRows, Manifest, ProduceOptions, Rows4, EPSILON,
 };
 use csl_eth_trie::{encode_word, path_of, Account};
 use rand::{Rng, RngCore, SeedableRng};
@@ -682,6 +682,14 @@ fn base_plus_layers_answers_as_a_fresh_build() {
         assert!(snap.account(d).0.is_absent());
     }
     assert!(snap.account(&k.recreated).0.is_absent());
+
+    // L1 and L2 merged, newest wins, nothing dropped: S2 again.
+    let m = merge_layers(&f.dir, &[f.l1.clone(), f.l2.clone()], EPSILON).unwrap();
+    assert_eq!((m.from_block, m.to_block), (f.l1.from_block, f.l2.to_block));
+    claim(&f, vec![m]);
+    let (ins, merged) = check(&f.dir, &f, &ps, &want, false, 3, "merged");
+    assert_eq!(ins, 0);
+    eprintln!("merged, cache 3: {}", merged.line());
     std::fs::remove_dir_all(&f.dir).ok();
     std::fs::remove_dir_all(&f.fresh).ok();
 }
@@ -836,3 +844,123 @@ fn plain_snapshot_read_cost_is_unchanged() {
 }
 
 const PLAIN_COST: (u64, u64, u64, u64) = (1469, 7897, 34_340_864, 2805);
+
+/// One step of churn: about 2% of accounts change balance, a third of
+/// those a slot, and a few accounts are created.
+fn churn(s: &State, rng: &mut ChaCha8Rng) -> State {
+    let mut next = s.clone();
+    let keys: Vec<B256> = next.keys().copied().collect();
+    for _ in 0..keys.len() / 50 {
+        let k = keys[rng.random_range(0..keys.len())];
+        let a = next.get_mut(&k).unwrap();
+        a.balance += U256::from(1u64);
+        if !a.storage.is_empty() && rng.random_bool(0.3) {
+            a.storage
+                .insert(key(rng.random(), rng), U256::from(rng.random::<u64>() | 1));
+        }
+    }
+    for _ in 0..3 {
+        let k = key(rng.random(), rng);
+        next.insert(
+            k,
+            Acct {
+                nonce: 0,
+                balance: U256::from(1u64),
+                storage: BTreeMap::new(),
+                code: None,
+            },
+        );
+    }
+    next
+}
+
+/// The read cost over N layers, against a fresh build of the same state,
+/// and the same layers merged into one: printed for the record, with the
+/// answers checked each time.
+#[test]
+fn read_cost_over_n_layers_and_merged() {
+    let (s0, _, _, _) = states();
+    let mut rng = ChaCha8Rng::seed_from_u64(21);
+    let dir = scratch("n-layers");
+    let h0 = head_of(&s0, 0);
+    let base = produce(&dir, &h0, "", leaves(&s0), &code_of(&s0))
+        .unwrap()
+        .manifest;
+    let mut s = s0.clone();
+    let mut r_prev = rows(&s0, &h0);
+    let mut layers = Vec::new();
+    let mut lines = Vec::new();
+    for n in 1..=16u8 {
+        let next = churn(&s, &mut rng);
+        let h = head_of(&next, n);
+        let r = rows(&next, &h);
+        layers.push(
+            write_layer(
+                &dir,
+                h0.block_number + n as u64 - 1,
+                h.block_number,
+                &LayerRows::diff(&r_prev, &r),
+                EPSILON,
+            )
+            .unwrap(),
+        );
+        s = next;
+        r_prev = r;
+        if ![1, 2, 4, 8, 16].contains(&n) {
+            continue;
+        }
+        let fresh = scratch(&format!("n-layers-fresh-{n}"));
+        produce(&fresh, &h, "", leaves(&s), &code_of(&s)).unwrap();
+        // Probes: a third of the accounts, their first slot, absent keys.
+        let mut ps = Vec::new();
+        for (k, a) in s.iter().step_by(3) {
+            ps.push(Probe::Account(*k));
+            if let Some(slot) = a.storage.keys().next() {
+                ps.push(Probe::Slot(*k, *slot));
+            }
+            ps.push(Probe::Account(key(rng.random(), &mut rng)));
+        }
+        let mut t = Snapshot::open(DirDriver::new(&fresh), None, h.state_root).unwrap();
+        let want: Vec<Answer> = ps.iter().map(|p| ask(&mut t, p).0).collect();
+        let f = Fixture {
+            dir: dir.clone(),
+            fresh: fresh.clone(),
+            s: [s0.clone(), s0.clone(), s.clone()],
+            heads: [h0, h0, h],
+            base: base.clone(),
+            l1: layers[0].clone(),
+            l2: layers[0].clone(),
+            keys: states().3,
+        };
+        write_layered_manifest(&dir, &h, &base, layers.clone(), true).unwrap();
+        let (ins, layered) = check(&dir, &f, &ps, &want, false, 0, &format!("{n} layers"));
+        assert_eq!(ins, 0);
+        let (_, plain) = check(&fresh, &f, &ps, &want, false, 0, "fresh");
+        let merged = merge_layers(&dir, &layers, EPSILON).unwrap();
+        write_layered_manifest(&dir, &h, &base, vec![merged], true).unwrap();
+        let (ins, one) = check(
+            &dir,
+            &f,
+            &ps,
+            &want,
+            false,
+            0,
+            &format!("{n} layers merged"),
+        );
+        assert_eq!(ins, 0);
+        lines.push(format!(
+            "{n:>2} layers: {:.2}x requests, {:.2}x bytes, {:.2} vs {:.2} rounds; merged: {:.2}x requests, {:.2}x bytes",
+            layered.requests as f64 / plain.requests as f64,
+            layered.bytes as f64 / plain.bytes as f64,
+            layered.rounds as f64 / layered.reads as f64,
+            plain.rounds as f64 / plain.reads as f64,
+            one.requests as f64 / plain.requests as f64,
+            one.bytes as f64 / plain.bytes as f64,
+        ));
+        std::fs::remove_dir_all(&fresh).ok();
+    }
+    for l in &lines {
+        eprintln!("{l}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -23,6 +23,7 @@ pub mod faults;
 pub mod fcr;
 pub mod fetch;
 pub mod heal;
+pub mod healer;
 pub mod history;
 pub mod peer;
 pub mod produce;

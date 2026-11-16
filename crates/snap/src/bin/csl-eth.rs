@@ -71,6 +71,10 @@ enum Cmd {
     /// files, verify, publish in order, collect old snapshots. One JSON
     /// line per cycle on stdout and in `<work>/produce.log`.
     Produce(csl_eth_snap::produce::Args),
+    /// Keep a published state current: heal it to each verified attested
+    /// head over snap/1 `GetTrieNodes`, one layer per step, merged in
+    /// tiers (`docs/delta-producer.md`). Logs to `<work>/heal.jsonl`.
+    Heal(csl_eth_snap::healer::Args),
     /// Build a bucket (snapshot runs, blobs, manifest) from a slice.
     Build {
         #[arg(long)]
@@ -351,6 +355,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.cmd {
         Cmd::Produce(args) => {
             tokio::task::spawn_blocking(move || csl_eth_snap::produce::run(args)).await??;
+        }
+        Cmd::Heal(args) => {
+            csl_eth_snap::healer::run(args).await?;
         }
         Cmd::Workload(args) => {
             let out = csl_eth_snap::workload::run(args)?;

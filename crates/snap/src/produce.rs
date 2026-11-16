@@ -1168,7 +1168,7 @@ fn unix_ms_of(t: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-fn parse_prefix(s: &str) -> Result<Nibbles, String> {
+pub(crate) fn parse_prefix(s: &str) -> Result<Nibbles, String> {
     let s = s.trim_start_matches("0x");
     if s.is_empty() || s.len() > 62 {
         return Err("prefix must be 1 to 62 hex nibbles".into());

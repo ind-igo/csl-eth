@@ -34,7 +34,7 @@ pub use export::{
     Phase as ExportPhase, SourceAccount, Sources, StateSource, VecSource, DEFAULT_RANGES,
     MIN_WORKER_BYTES,
 };
-pub use layer::{write_layer, write_layered_manifest, LayerRows};
+pub use layer::{merge_layers, write_layer, write_layered_manifest, LayerRows};
 pub use producer::{
     build_rows, produce, produce_with, AccountLeaf, Head, Options as ProduceOptions, ProduceError,
     Produced, Rows, Rows4, Stats as ProduceStats,

@@ -16,7 +16,7 @@ use crate::{
     ProduceError, Rows, TableRef, CODE_BLOB_THRESHOLD, FORMAT_VERSION_LAYERED, LATEST_FILE,
     RUN_FORMAT, TABLE_ACCOUNT_NODES, TABLE_CODE, TABLE_STORAGE_NODES,
 };
-use csl_run::{Config, Entry, Writer};
+use csl_run::{Config, Entry, Reader, RunRef, Writer};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
@@ -80,6 +80,23 @@ fn write_run(
     epsilon: u16,
     entries: impl ExactSizeIterator<Item = Entry>,
 ) -> Result<TableRef, ProduceError> {
+    let n = entries.len() as u64;
+    write_run_with(root, table_id, epsilon, n, |push| {
+        for e in entries {
+            push(e)?;
+        }
+        Ok(())
+    })
+}
+
+/// [`write_run`], the `count` entries pushed by `fill`.
+fn write_run_with(
+    root: &Path,
+    table_id: u16,
+    epsilon: u16,
+    count: u64,
+    fill: impl FnOnce(&mut dyn FnMut(Entry) -> Result<(), ProduceError>) -> Result<(), ProduceError>,
+) -> Result<TableRef, ProduceError> {
     let dir = root.join("runs");
     fs::create_dir_all(&dir)?;
     let tmp = dir.join(format!(
@@ -102,9 +119,11 @@ fn write_run(
         value_size: 0,
         epsilon,
     };
-    let mut w = Writer::with_format(file, cfg, RUN_FORMAT, entries.len() as u64)?;
-    for e in entries {
-        w.push(e)?;
+    let mut w = Writer::with_format(file, cfg, RUN_FORMAT, count)?;
+    let filled = fill(&mut |e| w.push(e).map_err(ProduceError::from));
+    if let Err(e) = filled {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
     let built = w.finish()?;
     // Without inline proofs the run's root is `blake3` of the file; the
@@ -221,4 +240,129 @@ pub fn write_layered_manifest(
         )?;
     }
     Ok(m)
+}
+
+fn run_err(e: csl_run::Error) -> ProduceError {
+    ProduceError::Io(std::io::Error::other(e.to_string()))
+}
+
+/// A run read front to back, page by page.
+struct Cursor {
+    reader: Reader<File>,
+    pages: u64,
+    next_page: u64,
+    buf: std::vec::IntoIter<Entry>,
+    head: Option<Entry>,
+}
+
+impl Cursor {
+    fn open(root: &Path, t: &TableRef, rref: RunRef) -> Result<Cursor, ProduceError> {
+        let f = File::open(root.join(run_path(&t.root)))?;
+        let mut reader = Reader::try_with_format(f, rref, RUN_FORMAT).map_err(run_err)?;
+        reader.prepare().map_err(run_err)?;
+        let mut c = Cursor {
+            reader,
+            pages: t.page_count,
+            next_page: 1,
+            buf: Vec::new().into_iter(),
+            head: None,
+        };
+        c.advance()?;
+        Ok(c)
+    }
+
+    fn advance(&mut self) -> Result<(), ProduceError> {
+        loop {
+            if let Some(e) = self.buf.next() {
+                self.head = Some(e);
+                return Ok(());
+            }
+            if self.next_page > self.pages {
+                self.head = None;
+                return Ok(());
+            }
+            let p = self.reader.fetch_page(self.next_page).map_err(run_err)?;
+            self.next_page += 1;
+            self.buf = p.entries.into_iter();
+        }
+    }
+}
+
+/// The entries of `cursors` (newest first) in key order, one per key: the
+/// newest run's.
+fn merged(
+    mut cursors: Vec<Cursor>,
+    mut f: impl FnMut(Entry) -> Result<(), ProduceError>,
+) -> Result<u64, ProduceError> {
+    let mut n = 0;
+    loop {
+        let Some(min) = cursors
+            .iter()
+            .filter_map(|c| c.head.as_ref().map(|e| e.key))
+            .min()
+        else {
+            return Ok(n);
+        };
+        let mut took = false;
+        for c in cursors.iter_mut() {
+            if c.head.as_ref().is_some_and(|e| e.key == min) {
+                let e = c.head.take().expect("head");
+                if !took {
+                    f(e)?;
+                    took = true;
+                    n += 1;
+                }
+                c.advance()?;
+            }
+        }
+    }
+}
+
+/// Merge consecutive `layers` (oldest first) into one layer from the
+/// first's `from_block` to the last's `to_block`: per table and key, the
+/// newest layer's entry.
+///
+/// Nothing is dropped. A layer holds every position whose node changed in
+/// its step (a position whose node is unchanged keeps its hash, so the
+/// whole subtree under it is unchanged too), so for any position of the
+/// last state, the newest layer that wrote it wrote that state's node.
+/// Older entries at positions the last state no longer has are dead
+/// weight, never a wrong answer: a reader takes the candidate that hashes
+/// to its parent's reference. Dropping them would need the last state's
+/// trie to say which positions are dead, and dropping a subtree on a
+/// restructure can remove descendants still reachable through a new
+/// extension (`docs/delta-producer.md`), so a merge does not try.
+pub fn merge_layers(root: &Path, layers: &[Layer], epsilon: u16) -> Result<Layer, ProduceError> {
+    let (Some(first), Some(last)) = (layers.first(), layers.last()) else {
+        return Err(ProduceError::Io(std::io::Error::other("nothing to merge")));
+    };
+    let mut tables = Vec::new();
+    for t in [TABLE_ACCOUNT_NODES, TABLE_STORAGE_NODES, TABLE_CODE] {
+        let open = || -> Result<Vec<Cursor>, ProduceError> {
+            layers
+                .iter()
+                .rev()
+                .filter_map(|l| l.tables.iter().find(|x| x.table_id == t).map(|x| (l, x)))
+                .map(|(l, x)| {
+                    let mut rref = x.run_ref(l.from_block);
+                    rref.block_hi = l.to_block;
+                    Cursor::open(root, x, rref)
+                })
+                .collect()
+        };
+        let count = merged(open()?, |_| Ok(()))?;
+        if count == 0 {
+            continue;
+        }
+        // Two passes, streamed: the writer needs the count first.
+        let cursors = open()?;
+        tables.push(write_run_with(root, t, epsilon, count, |push| {
+            merged(cursors, |e| push(e)).map(|_| ())
+        })?);
+    }
+    Ok(Layer {
+        from_block: first.from_block,
+        to_block: last.to_block,
+        tables,
+    })
 }
