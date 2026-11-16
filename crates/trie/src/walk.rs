@@ -21,6 +21,17 @@ use std::collections::HashMap;
 /// Nodes the client already holds, by position.
 pub trait NodeSource {
     fn node(&self, key: &NodeKey) -> Option<&[u8]>;
+
+    /// The node at `key` that should hash to `hash` (what its parent
+    /// committed to). A source holding several candidates at a position
+    /// (a base and layers over it) returns the one that hashes to it, or
+    /// any other when none does; the walk checks whatever it gets, so a
+    /// source can never make it accept a wrong node. One candidate per
+    /// position needs nothing more than [`NodeSource::node`].
+    fn node_hashed(&self, key: &NodeKey, hash: &B256) -> Option<&[u8]> {
+        let _ = hash;
+        self.node(key)
+    }
 }
 
 impl NodeSource for HashMap<NodeKey, Vec<u8>> {
@@ -32,6 +43,9 @@ impl NodeSource for HashMap<NodeKey, Vec<u8>> {
 impl<T: NodeSource> NodeSource for &T {
     fn node(&self, key: &NodeKey) -> Option<&[u8]> {
         (**self).node(key)
+    }
+    fn node_hashed(&self, key: &NodeKey, hash: &B256) -> Option<&[u8]> {
+        (**self).node_hashed(key, hash)
     }
 }
 
@@ -191,7 +205,7 @@ fn walk_inner<S: NodeSource>(
         let bytes: &[u8] = if let Some(h) = hash {
             fetched.push(key);
             expected = Some(h);
-            let Some(b) = src.node(&key) else {
+            let Some(b) = src.node_hashed(&key, &h) else {
                 note(key, hash, 0, Shape::Missing);
                 return done(Outcome::Missing(key), nodes, fetched, expected);
             };

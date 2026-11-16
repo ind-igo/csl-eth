@@ -182,6 +182,8 @@ enum Job {
     Nodes { root: B256, kind: &'static str, age: i64, needs: Vec<Need>, reply: oneshot::Sender<NodesDone> },
     HeaderAt { number: u64, reply: oneshot::Sender<Option<Header>> },
     Ages { roots: Vec<(u64, B256)>, reply: oneshot::Sender<()> },
+    /// Bytecodes by hash: those the peer returned that hash to one asked.
+    Codes { hashes: Vec<B256>, reply: oneshot::Sender<HashMap<B256, Bytes>> },
 }
 
 struct NodesDone {
@@ -307,6 +309,23 @@ async fn worker_task(mut peer: Peer, shared: Arc<Shared>, idle_tx: mpsc::Sender<
                     break 'life "header failed".into();
                 }
             }
+            Job::Codes { hashes, reply } => {
+                let want: HashSet<B256> = hashes.iter().copied().collect();
+                let r = peer.byte_codes(hashes, shared.cfg.bytes).await;
+                let mut got = HashMap::new();
+                if let Ok(m) = &r {
+                    for c in &m.codes {
+                        let h = keccak256(c);
+                        if want.contains(&h) {
+                            got.insert(h, c.clone());
+                        }
+                    }
+                }
+                let _ = reply.send(got);
+                if matches!(r, Err(ref e) if !matches!(e, PeerError::Timeout)) {
+                    break 'life "codes failed".into();
+                }
+            }
             Job::Ages { roots, reply } => {
                 for (age, root) in roots {
                     let need = vec![Need { owner: None, path: Nibbles::default(), hash: root }];
@@ -381,7 +400,7 @@ fn spawn_connector(shared: Arc<Shared>, idle_tx: mpsc::Sender<Worker>) {
 // ---------------------------------------------------------------------------
 // Scheduling requests over the idle peers
 
-struct Pool {
+pub struct Pool {
     shared: Arc<Shared>,
     idle_rx: mpsc::Receiver<Worker>,
     idle: Vec<Worker>,
@@ -434,7 +453,56 @@ impl Fetch for Pool {
 }
 
 impl Pool {
-    fn connected(&self) -> usize {
+    /// Start dialling mainnet peers that serve snap/1, logging to
+    /// `cfg.out`; the pool fills in the background.
+    pub fn start(cfg: &Config) -> std::io::Result<Pool> {
+        let log = Log(Arc::new(Mutex::new(BufWriter::new(
+            File::options().create(true).append(true).open(&cfg.out)?,
+        ))));
+        let shared = Arc::new(Shared {
+            cfg: cfg.clone(),
+            log,
+            connected: AtomicUsize::new(0),
+            head_number: AtomicU64::new(0),
+            head_time: AtomicU64::new(0),
+            dialed: AtomicUsize::new(0),
+            accepted: AtomicUsize::new(0),
+            no_snap: AtomicUsize::new(0),
+            dial_errors: Mutex::new(HashMap::new()),
+        });
+        let (idle_tx, idle_rx) = mpsc::channel::<Worker>(1024);
+        spawn_connector(shared.clone(), idle_tx);
+        Ok(Pool { shared, idle_rx, idle: Vec::new(), used: HashSet::new() })
+    }
+
+    /// Dials so far: (dialed, accepted snap/1).
+    pub fn dials(&self) -> (usize, usize) {
+        (self.shared.dialed.load(Ordering::Relaxed), self.shared.accepted.load(Ordering::Relaxed))
+    }
+
+    /// Bytecodes by hash from idle peers, each batch tried on up to
+    /// `attempts` peers; those no peer returned are left out.
+    pub async fn codes(&mut self, hashes: &[B256], attempts: usize, deadline: Instant) -> HashMap<B256, Bytes> {
+        let mut out = HashMap::new();
+        let mut left: Vec<B256> = hashes.to_vec();
+        let mut tries = 0;
+        while !left.is_empty() && tries < attempts * left.len().div_ceil(64).max(1) && Instant::now() < deadline {
+            tries += 1;
+            let Some(w) = self.worker(Duration::from_secs(30)).await else { break };
+            let batch: Vec<B256> = left.iter().take(64).copied().collect();
+            let (tx, rx) = oneshot::channel();
+            if w.tx.send(Job::Codes { hashes: batch, reply: tx }).await.is_err() {
+                continue;
+            }
+            if let Ok(got) = rx.await {
+                left.retain(|h| !got.contains_key(h));
+                out.extend(got);
+            }
+        }
+        out
+    }
+
+    pub fn connected(&self) -> usize {
         self.shared.connected.load(Ordering::Relaxed)
     }
 

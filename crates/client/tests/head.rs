@@ -439,6 +439,8 @@ fn manifest(hash: B256, state_root: B256) -> csl_eth_store::Manifest {
         state_root,
         prefix: String::new(),
         tables: vec![],
+        base: None,
+        layers: Vec::new(),
     }
 }
 

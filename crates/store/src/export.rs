@@ -1114,6 +1114,8 @@ pub fn export<F: Sources + ?Sized>(root: &Path, head: &Head, sources: &F, opts: 
         state_root: head.state_root,
         prefix: String::new(),
         tables,
+        base: None,
+        layers: Vec::new(),
     };
     write_atomic(&manifest_file, manifest.to_json().as_bytes())?;
     write_atomic(&root.join(LATEST_FILE), hex::encode(head.block_hash).as_bytes())?;

@@ -161,7 +161,8 @@ impl From<csl_run::Error> for ProduceError {
     }
 }
 
-type Rows = Vec<([u8; 32], Vec<u8>)>;
+/// Table rows: key and value, in key order once sorted.
+pub type Rows = Vec<([u8; 32], Vec<u8>)>;
 
 /// Collects a trie build's nodes under their table keys and by hash.
 struct Collect<'a> {
@@ -226,11 +227,34 @@ where
     produce_with(root, head, prefix, accounts, code, Options::default())
 }
 
+/// Every row a snapshot of `accounts` holds, checked against `head`'s
+/// `state_root` as [`produce_with`] checks it, before anything is written:
+/// the path-keyed tables in key order, the by-hash table deduplicated, the
+/// code by hash. A layer is the rows of one state that the state before
+/// it lacks ([`crate::layer`]).
+#[derive(Clone, Debug, Default)]
+pub struct Rows4 {
+    pub account: Rows,
+    pub storage: Rows,
+    pub by_hash: Rows,
+    pub code: BTreeMap<[u8; 32], Vec<u8>>,
+}
+
 pub fn produce_with<I>(root: &Path, head: &Head, prefix: &str, accounts: I, code: &HashMap<B256, Vec<u8>>, opts: Options) -> Result<Produced, ProduceError>
 where
     I: IntoIterator<Item = AccountLeaf>,
 {
     let epsilon = opts.epsilon;
+    let (rows, mut stats) = build_rows(head, accounts, code, opts)?;
+    let Rows4 { account: account_rows, storage: storage_rows, by_hash, code: code_rows } = rows;
+    write_snapshot(root, head, prefix, epsilon, &account_rows, &storage_rows, &by_hash, &code_rows, &mut stats)
+}
+
+/// The rows of [`Rows4`] for `accounts`, every root checked.
+pub fn build_rows<I>(head: &Head, accounts: I, code: &HashMap<B256, Vec<u8>>, opts: Options) -> Result<(Rows4, Stats), ProduceError>
+where
+    I: IntoIterator<Item = AccountLeaf>,
+{
     let mut stats = Stats::default();
     let mut account_rows: Rows = Vec::new();
     let mut storage_rows: Rows = Vec::new();
@@ -326,7 +350,21 @@ where
     by_hash.dedup_by(|a, b| a.0 == b.0);
     debug_assert!(account_rows.windows(2).all(|w| w[0].0 < w[1].0));
     debug_assert!(storage_rows.windows(2).all(|w| w[0].0 < w[1].0));
+    Ok((Rows4 { account: account_rows, storage: storage_rows, by_hash, code: code_rows }, stats))
+}
 
+#[allow(clippy::too_many_arguments)]
+fn write_snapshot(
+    root: &Path,
+    head: &Head,
+    prefix: &str,
+    epsilon: u16,
+    account_rows: &Rows,
+    storage_rows: &Rows,
+    by_hash: &Rows,
+    code_rows: &BTreeMap<[u8; 32], Vec<u8>>,
+    stats: &mut Stats,
+) -> Result<Produced, ProduceError> {
     // Files.
     let dir = root.join(snapshot_dir(&head.block_hash));
     fs::create_dir_all(&dir)?;
@@ -358,16 +396,16 @@ where
             Some(TableStats { entries: built.entry_count, pages: built.page_count, model_bytes: built.layout.model_bytes, file_bytes: built.layout.total_len });
         Ok(())
     };
-    write_rows(TABLE_ACCOUNT_NODES, &account_rows, &mut stats)?;
-    write_rows(TABLE_STORAGE_NODES, &storage_rows, &mut stats)?;
-    write_rows(TABLE_NODES_BY_HASH, &by_hash, &mut stats)?;
+    write_rows(TABLE_ACCOUNT_NODES, account_rows, stats)?;
+    write_rows(TABLE_STORAGE_NODES, storage_rows, stats)?;
+    write_rows(TABLE_NODES_BY_HASH, by_hash, stats)?;
 
     // Code: inline up to the threshold, a blob file above it.
     if !code_rows.is_empty() {
         let path = dir.join(TABLE_FILES[TABLE_CODE as usize]);
         let file = File::options().read(true).write(true).create(true).truncate(true).open(&path)?;
         let mut w = Writer::with_format(file, cfg(TABLE_CODE), RUN_FORMAT, code_rows.len() as u64)?;
-        for (k, v) in &code_rows {
+        for (k, v) in code_rows {
             if v.len() > CODE_BLOB_THRESHOLD {
                 let h = *blake3::hash(v).as_bytes();
                 write_atomic(&root.join(blob_path(&h)), v)?;
@@ -401,10 +439,12 @@ where
         state_root: head.state_root,
         prefix: prefix.to_string(),
         tables,
+        base: None,
+        layers: Vec::new(),
     };
     write_atomic(&root.join(manifest_path(&head.block_hash)), manifest.to_json().as_bytes())?;
     write_atomic(&root.join(LATEST_FILE), hex::encode(head.block_hash).as_bytes())?;
-    Ok(Produced { manifest, stats, dir })
+    Ok(Produced { manifest, stats: stats.clone(), dir })
 }
 
 /// Write to a temporary name and rename, so a reader never sees a partial

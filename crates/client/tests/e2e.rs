@@ -190,7 +190,12 @@ fn every_shape_reads_correctly_and_within_budget() {
             repaired += 1;
             continue;
         }
-        assert_eq!((c.repairs, c.rounds), (0, warm_rounds(&c)), "{}: {c:?}", a.hashed);
+        assert_eq!(
+            (c.repairs, c.rounds),
+            (0, warm_rounds(&c)),
+            "{}: {c:?}",
+            a.hashed
+        );
         max_cost.requests = max_cost.requests.max(c.requests);
         max_cost.bytes = max_cost.bytes.max(c.bytes);
     }
@@ -604,7 +609,11 @@ fn baseline_by_hash_agrees_and_costs_a_round_per_node() {
     let dir = scratch("baseline");
     produce(&dir, &w.head, "", w.accounts.iter().cloned(), &w.code).unwrap();
     let mut snap = Snapshot::open(DirDriver::new(&dir), None, w.head.state_root).unwrap();
-    let eps = snap.manifest().table(TABLE_ACCOUNT_NODES).unwrap().epsilon_pages as u64;
+    let eps = snap
+        .manifest()
+        .table(TABLE_ACCOUNT_NODES)
+        .unwrap()
+        .epsilon_pages as u64;
     snap.hint = csl_eth_client::Hint::symmetric(eps + 1);
 
     let mut path_rounds = 0u64;
@@ -619,7 +628,10 @@ fn baseline_by_hash_agrees_and_costs_a_round_per_node() {
         // round of an earlier node happened to bring its page, one round;
         // the aggregate below is where "serial" is asserted.
         assert!(hc.repairs >= 1 && hc.rounds >= 1, "{}: {hc:?}", a.hashed);
-        assert!(hc.repairs as usize <= hc.nodes, "a node fetched by hash is a node walked (embedded ones are walked, not fetched)");
+        assert!(
+            hc.repairs as usize <= hc.nodes,
+            "a node fetched by hash is a node walked (embedded ones are walked, not fetched)"
+        );
         path_rounds += pc.rounds as u64;
         hash_rounds += hc.rounds as u64;
         hash_max.rounds = hash_max.rounds.max(hc.rounds);
@@ -648,7 +660,11 @@ fn baseline_by_hash_agrees_and_costs_a_round_per_node() {
         let (h, hc) = snap.storage_by_hash(&a.hashed, &s);
         assert_eq!(p, Read::Verified(v));
         assert_eq!(h, p);
-        assert!(hc.rounds > pc.rounds, "{}: path {pc:?} hash {hc:?}", a.hashed);
+        assert!(
+            hc.rounds > pc.rounds,
+            "{}: path {pc:?} hash {hc:?}",
+            a.hashed
+        );
         slots += 1;
     }
     assert!(slots > 0);
@@ -663,12 +679,18 @@ fn baseline_by_hash_agrees_and_costs_a_round_per_node() {
     let b = &w.accounts[6];
     let (r, second) = snap.account_by_hash(&b.hashed);
     assert_eq!(r, Read::Verified(b.account));
-    assert!(second.repairs < first.repairs || first.repairs <= 3, "cache: {first:?} then {second:?}");
+    assert!(
+        second.repairs < first.repairs || first.repairs <= 3,
+        "cache: {first:?} then {second:?}"
+    );
     snap.top_levels = 0;
 
     // Tamper with nodes_by_hash: a value byte flipped in the middle of the
     // table. Every read is still right or Insufficient.
-    let rel = table_path(&snap.manifest().block_hash, csl_eth_store::TABLE_NODES_BY_HASH);
+    let rel = table_path(
+        &snap.manifest().block_hash,
+        csl_eth_store::TABLE_NODES_BY_HASH,
+    );
     let path = dir.join(&rel);
     let mut bytes = std::fs::read(&path).unwrap();
     let mut rng = ChaCha8Rng::seed_from_u64(9);
@@ -825,7 +847,7 @@ fn check_walk(
                 };
                 assert_eq!(tk, expect_tk);
                 match n.origin {
-                    Origin::Page { table, page } => {
+                    Origin::Page { table, page, .. } => {
                         assert_eq!(table, wt.table);
                         let info = &tables[table as usize];
                         let ro = 4096 + (page - 1) * info.record_bytes;

@@ -17,10 +17,11 @@
 //! serve; every value and absence is still proven by the trie walk to the
 //! `state_root` the client verified for itself.
 
+pub mod beacon;
 pub mod export;
 pub mod extsort;
-pub mod beacon;
 pub mod history;
+pub mod layer;
 pub mod producer;
 
 use alloy_primitives::B256;
@@ -29,12 +30,14 @@ use serde::{Deserialize, Serialize};
 
 pub use csl_eth_trie as trie;
 pub use export::{
-    export, AccountRange, CodeIter, ExportError, ExportOptions, ExportStats, Exported, Phase as ExportPhase, SourceAccount, Sources, StateSource, VecSource, DEFAULT_RANGES,
+    export, AccountRange, CodeIter, ExportError, ExportOptions, ExportStats, Exported,
+    Phase as ExportPhase, SourceAccount, Sources, StateSource, VecSource, DEFAULT_RANGES,
     MIN_WORKER_BYTES,
 };
+pub use layer::{write_layer, write_layered_manifest, LayerRows};
 pub use producer::{
-    produce, produce_with, AccountLeaf, Head, Options as ProduceOptions, ProduceError, Produced,
-    Stats as ProduceStats,
+    build_rows, produce, produce_with, AccountLeaf, Head, Options as ProduceOptions, ProduceError,
+    Produced, Rows, Rows4, Stats as ProduceStats,
 };
 
 /// Bumped to 2 on 2026-10-31 when the run format paged its model
@@ -42,6 +45,12 @@ pub use producer::{
 /// section a tree of model pages. A client reading a manifest of another
 /// version refuses it.
 pub const FORMAT_VERSION: u32 = 2;
+
+/// A snapshot that is a base plus layers (`docs/delta-producer.md`): the
+/// base's tables under the base snapshot's directory, each layer's under
+/// `runs/<blake3>.run`. A client of version 2 refuses it, which is right:
+/// it would read the base alone and find its nodes stale.
+pub const FORMAT_VERSION_LAYERED: u32 = 3;
 
 /// The format every table is written and read in: variable layout, no
 /// inline proofs (the trie proves values), the model paged so a client
@@ -97,6 +106,11 @@ pub fn blob_path(hash: &[u8; 32]) -> String {
     format!("blobs/{}", hex::encode(hash))
 }
 
+/// A layer's run file, named by its `blake3`, so manifests share it.
+pub fn run_path(root: &[u8; 32]) -> String {
+    format!("runs/{}.run", hex::encode(root))
+}
+
 /// One table's run, as the manifest carries it: the `RunRef` fields of
 /// v1-min §3 with the block range implied by the snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,13 +157,86 @@ pub struct Manifest {
     pub timestamp: u64,
     pub state_root: B256,
     pub prefix: String,
-    /// Tables with at least one entry; an empty table has no run.
+    /// Tables with at least one entry; an empty table has no run. For a
+    /// layered snapshot these are the base's.
     pub tables: Vec<TableRef>,
+    /// A layered snapshot's base: the snapshot whose directory holds
+    /// `tables`. `None`: this snapshot's own directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<B256>,
+    /// The layers over the base, oldest first. A reader takes, at each
+    /// position, the candidate that hashes to what its parent committed
+    /// to, never the newest, so a stale node in an older run is never
+    /// accepted and nothing is deleted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<Layer>,
+}
+
+/// One layer: the nodes and code that changed between the state of
+/// `from_block` and that of `to_block`, a run per table at
+/// [`run_path`]`(root)`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Layer {
+    pub from_block: u64,
+    pub to_block: u64,
+    pub tables: Vec<TableRef>,
+}
+
+/// One run a table is read from: its path in the bucket and its ref.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunAt {
+    pub path: String,
+    pub table: TableRef,
+    /// The blocks its contents come from (the base's: its own block).
+    pub block_lo: u64,
+    pub block_hi: u64,
 }
 
 impl Manifest {
     pub fn table(&self, table_id: u16) -> Option<&TableRef> {
         self.tables.iter().find(|t| t.table_id == table_id)
+    }
+
+    /// The block whose directory holds the base tables.
+    pub fn base_hash(&self) -> B256 {
+        self.base.unwrap_or(self.block_hash)
+    }
+
+    /// Whether this is a base plus layers.
+    pub fn is_layered(&self) -> bool {
+        self.base.is_some() || !self.layers.is_empty()
+    }
+
+    /// Every run `table_id` is read from: the base's, then each layer's,
+    /// oldest first.
+    pub fn runs(&self, table_id: u16) -> Vec<RunAt> {
+        let mut out = Vec::new();
+        let base_block = if self.base.is_some() {
+            self.layers
+                .first()
+                .map_or(self.block_number, |l| l.from_block)
+        } else {
+            self.block_number
+        };
+        if let Some(t) = self.table(table_id) {
+            out.push(RunAt {
+                path: table_path(&self.base_hash(), table_id),
+                table: *t,
+                block_lo: base_block,
+                block_hi: base_block,
+            });
+        }
+        for l in &self.layers {
+            if let Some(t) = l.tables.iter().find(|t| t.table_id == table_id) {
+                out.push(RunAt {
+                    path: run_path(&t.root),
+                    table: *t,
+                    block_lo: l.from_block,
+                    block_hi: l.to_block,
+                });
+            }
+        }
+        out
     }
 
     pub fn to_json(&self) -> String {
@@ -199,9 +286,33 @@ mod tests {
                 model_bytes: 6,
                 model_root: [7; 32],
             }],
+            base: None,
+            layers: Vec::new(),
         };
         let j = m.to_json();
         assert_eq!(Manifest::from_json(j.as_bytes()).unwrap(), m);
+        // A plain manifest's JSON has no layer fields, so a version-2
+        // reader parses it as before.
+        assert!(!j.contains("layers") && !j.contains("\"base\""));
+        assert_eq!(m.runs(0).len(), 1);
+        assert_eq!(m.runs(0)[0].path, table_path(&m.block_hash, 0));
+        let mut l = m.clone();
+        l.base = Some(B256::repeat_byte(9));
+        l.layers.push(Layer {
+            from_block: 7,
+            to_block: 9,
+            tables: vec![TableRef {
+                root: [8; 32],
+                ..m.tables[0]
+            }],
+        });
+        let j = l.to_json();
+        assert_eq!(Manifest::from_json(j.as_bytes()).unwrap(), l);
+        let runs = l.runs(0);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].path, table_path(&B256::repeat_byte(9), 0));
+        assert_eq!(runs[1].path, format!("runs/{}.run", "08".repeat(32)));
+        assert_eq!((runs[1].block_lo, runs[1].block_hi), (7, 9));
         assert_eq!(m.table(0).unwrap().run_ref(7).block_hi, 7);
         assert!(m.table(1).is_none());
         assert_eq!(

@@ -99,8 +99,8 @@ fn node_json(n: &TraceNode, trie: Trie) -> serde_json::Value {
     let s = &n.step;
     let from = match n.origin {
         Origin::Cache => serde_json::json!({ "kind": "cache" }),
-        Origin::Page { table, page } => {
-            serde_json::json!({ "kind": "page", "table": table, "name": table_name(table), "page": page })
+        Origin::Page { table, run, page } => {
+            serde_json::json!({ "kind": "page", "table": table, "name": table_name(table), "run": run, "page": page })
         }
         Origin::Embedded => serde_json::json!({ "kind": "embedded" }),
         Origin::NotServed { searched } => match searched {
@@ -416,7 +416,9 @@ impl Client {
         let now = SystemTime::UNIX_EPOCH + Duration::from_millis(now_ms.max(0.0) as u64);
         let tier = tier.unwrap_or_default();
         let choice = TierChoice::parse(&tier).ok_or_else(|| {
-            JsValue::from_str(&format!("tier: {tier:?} is not best, finalized or attested"))
+            JsValue::from_str(&format!(
+                "tier: {tier:?} is not best, finalized or attested"
+            ))
         })?;
         Ok(Client {
             opener: Some(HeadOpener::with_tier(NoDriver, checkpoint, now, choice)),
@@ -446,7 +448,11 @@ impl Client {
     /// instead of the path-keyed one.
     pub fn account(&mut self, key: &str, baseline: bool) -> String {
         match account_key(key) {
-            Ok((hashed, address)) => self.start(Op::Account { hashed, address, baseline }),
+            Ok((hashed, address)) => self.start(Op::Account {
+                hashed,
+                address,
+                baseline,
+            }),
             Err(e) => self.fail(e),
         }
     }
@@ -541,14 +547,22 @@ impl Client {
                     None => return self.fail("open first"),
                 };
                 match op {
-                    Op::Account { hashed, address, baseline } => match if baseline {
+                    Op::Account {
+                        hashed,
+                        address,
+                        baseline,
+                    } => match if baseline {
                         snap.try_account_by_hash(&hashed)
                     } else {
                         snap.try_account(&hashed)
                     } {
                         Err(Pending) => {
                             let w = snap.store().take_wanted(merge);
-                            self.op = Op::Account { hashed, address, baseline };
+                            self.op = Op::Account {
+                                hashed,
+                                address,
+                                baseline,
+                            };
                             self.need(w)
                         }
                         Ok((r, cost)) => {

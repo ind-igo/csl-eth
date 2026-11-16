@@ -2789,6 +2789,8 @@ mod tests {
             state_root,
             prefix: "1a7".into(),
             tables: vec![],
+            base: None,
+            layers: Vec::new(),
         };
         touch(
             &w.bucket,
