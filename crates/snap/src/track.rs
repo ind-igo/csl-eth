@@ -393,18 +393,44 @@ fn prefix8(b: &[u8]) -> u64 {
     u64::from_le_bytes(b[..8].try_into().expect("8 bytes"))
 }
 
-fn done_key(owner: &Option<B256>, path: &Nibbles, hash: &B256) -> u64 {
-    let mut b = Vec::with_capacity(32 + 33 + 32 + 2);
-    match owner {
+/// The marker for a subtree complete at a position: its new node and the
+/// old node it was diffed against there (and the owner nodes were copied
+/// from). The old node depends on the shape of the new trie above, not
+/// only on the position: an extension in the held state that the new trie
+/// splits leaves the same subtree with no old node, and then every node
+/// of it must be on disk, not only those that differ. With the base on
+/// disk the difference never shows (the runs hold the rest); without it,
+/// a marker for the subtree alone skipped nodes never fetched.
+fn done_key(p: &Pos, hash: &B256) -> u64 {
+    let mut b = Vec::with_capacity(2 + 32 + 34 + 32 + 34 + 33);
+    match p.owner {
         Some(o) => {
             b.push(1);
             b.extend_from_slice(o.as_slice());
         }
         None => b.push(0),
     }
-    b.push(path.len() as u8);
-    b.extend_from_slice(&path.pack());
+    b.push(p.path.len() as u8);
+    b.extend_from_slice(&p.path.pack());
     b.extend_from_slice(hash.as_slice());
+    match &p.old {
+        None => b.push(0),
+        Some(Ref::Hash(h)) => {
+            b.push(1);
+            b.extend_from_slice(h.as_slice());
+        }
+        Some(Ref::Inline(r)) => {
+            b.push(2);
+            b.extend_from_slice(keccak256(r).as_slice());
+        }
+    }
+    match p.src {
+        None => b.push(0),
+        Some(o) => {
+            b.push(1);
+            b.extend_from_slice(o.as_slice());
+        }
+    }
     prefix8(keccak256(&b).as_slice())
 }
 
@@ -1214,6 +1240,11 @@ async fn sync<S: Source>(
             if steps % 65_536 == 0 && Instant::now() > deadline {
                 return Err(StepError::Deadline);
             }
+            // A walk through what is already on disk can run for minutes
+            // between waves: let the peers' sessions in.
+            if steps.is_multiple_of(4096) {
+                tokio::task::yield_now().await;
+            }
             let p = &it.pos;
             if p.old.as_ref() == Some(&p.new) {
                 tree.child_done(db, it.parent);
@@ -1238,7 +1269,7 @@ async fn sync<S: Source>(
                     )?;
                 }
                 Ref::Hash(h) => {
-                    let key = done_key(&p.owner, &p.path, h);
+                    let key = done_key(p, h);
                     if db.is_done(key) {
                         st.done_skips += 1;
                         tree.child_done(db, it.parent);
@@ -1412,6 +1443,15 @@ async fn sync<S: Source>(
     Ok(())
 }
 
+/// Run `f`, which blocks for long, where the runtime's other tasks keep
+/// going (a test's single-threaded runtime just runs it).
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 /// Walk `new_root`'s trie against the held state with every node local,
 /// streaming each hashed node that differs at its position into the rows.
 #[allow(clippy::too_many_arguments)]
@@ -1443,7 +1483,10 @@ fn materialize(
         let rlp = match &p.new {
             Ref::Inline(b) => b.clone(),
             Ref::Hash(h) => {
-                let b = cx.local(db, &p, h)?.ok_or(StepError::Missing)?;
+                let b = cx.local(db, &p, h)?.ok_or_else(|| {
+                    warn!(owner = ?p.owner, path = ?p.path, hash = %h, old = ?p.old, "materialize: new node not on disk");
+                    StepError::Missing
+                })?;
                 let nk = NodeKey::prefix(&p.path, p.path.len());
                 match p.owner {
                     None => {
@@ -1472,7 +1515,10 @@ fn materialize(
         // Every old node the sync needed is on disk; one that is not means
         // the markers lied, as for a missing new node.
         let o = cx.open(db, &p, &rlp, st).map_err(|e| match e {
-            StepError::Old(_) => StepError::Missing,
+            StepError::Old(n) => {
+                warn!(owner = ?n.owner, path = ?n.path, hash = %n.hash, at = ?p.path, "materialize: old node not on disk");
+                StepError::Missing
+            }
             e => e,
         })?;
         if o.storage {
@@ -1490,10 +1536,10 @@ fn materialize(
         }
         if let Some(c) = o.code {
             if !rows.code.contains_key(&c.0) && !cx.store.has_code(&c).map_err(StepError::Store)? {
-                let b = db
-                    .get(&c)
-                    .map_err(StepError::Store)?
-                    .ok_or(StepError::Missing)?;
+                let b = db.get(&c).map_err(StepError::Store)?.ok_or_else(|| {
+                    warn!(code = %c, "materialize: code not on disk");
+                    StepError::Missing
+                })?;
                 st.codes += 1;
                 st.code_bytes += b.len() as u64;
                 rows.code.insert(c.0, b.to_vec());
@@ -1554,15 +1600,19 @@ pub async fn track_step<S: Source>(
         (st.old_asked, st.old_peers, st.old_bucket),
     );
     let mut sm = StepStats::default();
-    let r = materialize(
-        &mut cx,
-        db,
-        new_root,
-        slot_sample,
-        sort_dir,
-        sort_budget,
-        &mut sm,
-    );
+    // Minutes of disk reads on a catch-up: off the runtime's workers, so
+    // the peers' sessions keep answering.
+    let r = blocking(|| {
+        materialize(
+            &mut cx,
+            db,
+            new_root,
+            slot_sample,
+            sort_dir,
+            sort_budget,
+            &mut sm,
+        )
+    });
     match r {
         Ok(mut h) => {
             let s = &mut h.stats;
@@ -3235,6 +3285,204 @@ mod tests {
         fs::remove_dir_all(&local).ok();
         fs::remove_dir_all(&bucket).ok();
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// Without a local base a completed subtree stands for its diff against
+    /// one old node. The branch under the extension 0x33..33 (accounts p1
+    /// and p2) changes, and an attempt completes it against the old branch
+    /// there; then an insert splits the extension above it, and the next
+    /// root reaches the same branch with no old node: the leaf that did not
+    /// change was never fetched, and a marker for the branch alone would
+    /// skip it.
+    #[tokio::test]
+    async fn diskless_markers_hold_for_one_old_node() {
+        use crate::remote::{DirRanges, RemoteBase};
+        let mut s0 = states().remove(0);
+        let mut p = [0x33u8; 32];
+        p[30] = 0x10;
+        let p1 = B256::from(p);
+        // p2's leaf otherwise has p1's old bytes, which the first attempt
+        // fetches.
+        p[30] = 0x70;
+        s0.get_mut(&B256::from(p)).unwrap().balance += U256::from(10u64);
+        let mut s1 = s0.clone();
+        s1.get_mut(&p1).unwrap().balance += U256::from(1u64);
+        let mut s2 = s1.clone();
+        let mut q = [0x33u8; 32];
+        q[20] = 0x00;
+        s2.insert(
+            B256::from(q),
+            Acct {
+                balance: U256::from(3u64),
+                storage: BTreeMap::new(),
+                code: None,
+            },
+        );
+        let chain = [s0, s1, s2];
+        let heads: Vec<Head> = chain
+            .iter()
+            .enumerate()
+            .map(|(i, x)| head_of(x, i as u64))
+            .collect();
+        let bucket = scratch("split-bucket");
+        let base = produce(
+            &bucket,
+            &heads[0],
+            "",
+            leaves(&chain[0]),
+            &code_of(&chain[0]),
+        )
+        .unwrap()
+        .manifest;
+        let root = scratch("split-diskless");
+        let mp = manifest_path(&base.block_hash);
+        fs::create_dir_all(root.join(&mp).parent().unwrap()).unwrap();
+        fs::copy(bucket.join(&mp), root.join(&mp)).unwrap();
+        fs::create_dir_all(root.join("runs")).unwrap();
+        let mut store = Store::open_with(&root, &base, false).unwrap();
+        let mut rb = RemoteBase::new(Arc::new(DirRanges(bucket.clone())), &base).unwrap();
+        let mut db = NodeDb::open(&root.join("nodes"), heads[0].state_root).unwrap();
+        for target in [1usize, 2] {
+            let mut h = track_step(
+                &mut Mem::of(&chain[target], &heads[target]),
+                &mut store,
+                &mut db,
+                heads[0].state_root,
+                heads[target].state_root,
+                None,
+                10_000,
+                far(),
+                &root.join("sort"),
+                64 << 20,
+                None,
+                OldSide {
+                    peers: false,
+                    remote: Some(&mut rb),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("to S{target}: {e}"));
+            if target == 2 {
+                assert_eq!(
+                    h.stats.done_skips, 0,
+                    "the branch was done against another old node"
+                );
+            }
+            let want = LayerRows::diff(
+                &rows(&chain[0], &heads[0]),
+                &rows(&chain[target], &heads[target]),
+            );
+            let got = h.rows.collect();
+            assert!(want
+                .account
+                .iter()
+                .all(|(k, v)| got.account.get(k) == Some(v)));
+        }
+        fs::remove_dir_all(&bucket).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A catch-up without a local base across many pivots: a subtree an
+    /// earlier attempt completed may be reached again under a different
+    /// old node (the new trie above it changed shape), and its marker must
+    /// not stand for that diff.
+    #[tokio::test]
+    async fn diskless_catch_up_across_pivots() {
+        use crate::remote::{DirRanges, RemoteBase};
+        for seed in 0..6u64 {
+            let mut rng = ChaCha8Rng::seed_from_u64(100 + seed);
+            let mut chain = vec![states().remove(0)];
+            for _ in 0..10 {
+                let next = churn(chain.last().unwrap(), &mut rng);
+                chain.push(next);
+            }
+            let heads: Vec<Head> = chain
+                .iter()
+                .enumerate()
+                .map(|(i, x)| head_of(x, i as u64))
+                .collect();
+            let last = chain.len() - 1;
+            let bucket = scratch("pivot-bucket");
+            let base = produce(
+                &bucket,
+                &heads[0],
+                "",
+                leaves(&chain[0]),
+                &code_of(&chain[0]),
+            )
+            .unwrap()
+            .manifest;
+            let root = scratch("pivot-diskless");
+            let mp = manifest_path(&base.block_hash);
+            fs::create_dir_all(root.join(&mp).parent().unwrap()).unwrap();
+            fs::copy(bucket.join(&mp), root.join(&mp)).unwrap();
+            fs::create_dir_all(root.join("runs")).unwrap();
+            let mut store = Store::open_with(&root, &base, false).unwrap();
+            let mut rb = RemoteBase::new(Arc::new(DirRanges(bucket.clone())), &base).unwrap();
+            let mut db = NodeDb::open(&root.join("nodes"), heads[0].state_root).unwrap();
+            let attempt = |target: usize, budget: usize| {
+                let mut src = Mem::of(&chain[target], &heads[target]);
+                src.budget = budget;
+                (src, heads[target].state_root)
+            };
+            for target in 1..last {
+                let (mut src, new_root) = attempt(target, 40 + rng.random_range(0..200));
+                let _ = track_step(
+                    &mut src,
+                    &mut store,
+                    &mut db,
+                    heads[0].state_root,
+                    new_root,
+                    None,
+                    10_000,
+                    far(),
+                    &root.join("sort"),
+                    64 << 20,
+                    None,
+                    OldSide {
+                        peers: false,
+                        remote: Some(&mut rb),
+                    },
+                )
+                .await;
+            }
+            let (mut src, new_root) = attempt(last, usize::MAX);
+            let mut h = track_step(
+                &mut src,
+                &mut store,
+                &mut db,
+                heads[0].state_root,
+                new_root,
+                None,
+                10_000,
+                far(),
+                &root.join("sort"),
+                64 << 20,
+                None,
+                OldSide {
+                    peers: false,
+                    remote: Some(&mut rb),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            assert!(h.stats.done_skips > 0, "seed {seed}: markers were used");
+            let want = LayerRows::diff(
+                &rows(&chain[0], &heads[0]),
+                &rows(&chain[last], &heads[last]),
+            );
+            let got = h.rows.collect();
+            assert!(want
+                .account
+                .iter()
+                .all(|(k, v)| got.account.get(k) == Some(v)));
+            assert!(want
+                .storage
+                .iter()
+                .all(|(k, v)| got.storage.get(k) == Some(v)));
+            fs::remove_dir_all(&bucket).ok();
+            fs::remove_dir_all(&root).ok();
+        }
     }
 
     async fn step(
