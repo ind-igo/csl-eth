@@ -1954,8 +1954,13 @@ pub struct Args {
     #[arg(long, default_value_t = 1024)]
     pub sort_mib: u64,
     /// Changed slots read back through the client per step.
-    #[arg(long, default_value_t = 2000)]
+    #[arg(long, default_value_t = 256)]
     pub verify_slots: usize,
+    /// Changed accounts read back per step, spread evenly over the step's
+    /// changes (every changed account was read back until 2026-11-17: about
+    /// 5 s of a 16 s step at the head, a third of the time to publish).
+    #[arg(long, default_value_t = 256)]
+    pub verify_accounts: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2178,11 +2183,15 @@ fn run_name(r: &str) -> String {
 }
 
 /// Read back what a step changed, through the client over the local files
-/// at the new root: every changed account, the sampled slots, new code.
-fn read_back(root: &Path, head: &Head, h: &Tracked) -> Result<Value, String> {
+/// at the new root: up to `accounts` changed accounts spread over the
+/// step's changes, the sampled slots, new code.
+fn read_back(root: &Path, head: &Head, h: &Tracked, accounts: usize) -> Result<Value, String> {
     let mut snap = Snapshot::open(DirDriver::new(root), Some(head.block_hash), head.state_root)
         .map_err(|e| format!("open: {e}"))?;
-    for (k, a) in &h.accounts {
+    let every = h.accounts.len().div_ceil(accounts.max(1)).max(1);
+    let mut read = 0;
+    for (k, a) in h.accounts.iter().step_by(every) {
+        read += 1;
         match snap.account(k).0 {
             Read::Verified(got) if got == *a => {}
             other => return Err(format!("account {k}: {other:?}")),
@@ -2200,7 +2209,9 @@ fn read_back(root: &Path, head: &Head, h: &Tracked) -> Result<Value, String> {
             other => return Err(format!("code {}: {other:?}", B256::from(*k))),
         }
     }
-    Ok(json!({"accounts": h.accounts.len(), "slots": h.slots.len(), "codes": h.rows.code.len()}))
+    Ok(
+        json!({"accounts": read, "changed": h.accounts.len(), "slots": h.slots.len(), "codes": h.rows.code.len()}),
+    )
 }
 
 struct Tracker {
@@ -2270,7 +2281,7 @@ impl Tracker {
         let manifest = self.manifest(&head, tier == Some(Tier::Attested))?;
         let layer_s = t0.elapsed().as_secs_f64();
         let t_check = Instant::now();
-        let check = match read_back(&self.root, &head, h) {
+        let check = match read_back(&self.root, &head, h, self.args.verify_accounts) {
             Ok(v) => v,
             Err(err) => {
                 // Not published; the layers go back to what they were.
@@ -3186,7 +3197,7 @@ mod tests {
             true,
         )
         .unwrap();
-        read_back(dir, to, h).unwrap();
+        read_back(dir, to, h, usize::MAX).unwrap();
         // A tracker without a local base keeps only the layers.
         let local = m
             .runs(TABLE_ACCOUNT_NODES)
