@@ -12,8 +12,8 @@ use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use csl_eth_client::{
     head::Chain,
     trie::{decode_word, Account, Nibbles, Shape},
-    Cost, FcrReport, HeadOpener, Hint, NoDriver, Origin, Pending, Read, Reason, Snapshot,
-    TierChoice, Trace, TraceNode, Trie, VerifiedHead, WalkTrace, Want,
+    Cost, HeadOpener, Hint, NoDriver, Origin, Pending, Read, Reason, Snapshot, TierChoice, Trace,
+    TraceNode, Trie, VerifiedHead, WalkTrace, Want,
 };
 use js_sys::Uint8Array;
 use std::time::{Duration, SystemTime};
@@ -249,25 +249,7 @@ fn error_json(e: impl std::fmt::Display) -> String {
     serde_json::json!({ "error": e.to_string() }).to_string()
 }
 
-/// The producer's `head/fcr` note, as the page shows it: never verified.
-fn fcr_json(f: &FcrReport) -> serde_json::Value {
-    serde_json::json!({
-        "verified": false,
-        "source": f.source,
-        "classification": f.classification.name(),
-        "confirmed_after_secs": f.confirmed_after_secs,
-        "trail_blocks": f.trail_blocks,
-        "block_number": f.block_number,
-        "block_hash": format!("{}", f.block_hash),
-        "checked_at": f.checked_at,
-    })
-}
-
-fn head_json(
-    h: &VerifiedHead,
-    snap: &Snapshot<NoDriver>,
-    fcr: Option<&FcrReport>,
-) -> serde_json::Value {
+fn head_json(h: &VerifiedHead, snap: &Snapshot<NoDriver>) -> serde_json::Value {
     let m = snap.manifest();
     serde_json::json!({
         "checkpoint": format!("{}", h.checkpoint),
@@ -289,7 +271,6 @@ fn head_json(
             "state_root": format!("{}", m.state_root),
             "prefix": m.prefix,
         },
-        "fcr": fcr.map(fcr_json),
     })
 }
 
@@ -318,8 +299,6 @@ pub struct Client {
     opener: Option<HeadOpener<NoDriver>>,
     snap: Option<Snapshot<NoDriver>>,
     head: Option<VerifiedHead>,
-    /// The producer's unverified note, when it is about the head.
-    fcr: Option<FcrReport>,
     hint: Hint,
     top_levels: usize,
     op: Op,
@@ -426,7 +405,6 @@ impl Client {
             opener: Some(HeadOpener::with_tier(NoDriver, checkpoint, now, choice)),
             snap: None,
             head: None,
-            fcr: None,
             hint: Hint::symmetric(prefetch as u64),
             top_levels: top_levels as usize,
             op: Op::Idle,
@@ -435,7 +413,7 @@ impl Client {
     }
 
     /// Begin opening: the first `need` is the head bootstrap, the head
-    /// updates (and `head/fcr`), the second (when there is one) the period
+    /// updates, the second (when there is one) the period
     /// updates between, the third the manifests of the heads that verified.
     pub fn open(&mut self) -> String {
         if self.opener.is_none() {
@@ -531,13 +509,11 @@ impl Client {
                         snap.top_levels = self.top_levels;
                         snap.tracing = true;
                         let (requests, bytes, rounds) = snap.store().cost();
-                        let fcr = o.fcr().cloned();
-                        let mut v = head_json(&head, &snap, fcr.as_ref());
+                        let mut v = head_json(&head, &snap);
                         v["open"] = serde_json::json!({ "requests": requests, "bytes": bytes, "rounds": rounds });
                         self.opener = None;
                         self.snap = Some(snap);
                         self.head = Some(head);
-                        self.fcr = fcr;
                         self.done(v)
                     }
                 }
@@ -722,7 +698,7 @@ impl Client {
     /// The verified head and the snapshot it named, once open.
     pub fn head(&self) -> String {
         match (&self.head, &self.snap) {
-            (Some(h), Some(s)) => head_json(h, s, self.fcr.as_ref()).to_string(),
+            (Some(h), Some(s)) => head_json(h, s).to_string(),
             _ => error_json("not open"),
         }
     }

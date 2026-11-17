@@ -1704,7 +1704,7 @@ fn verify(
             head.execution.state_root, manifest.state_root
         ));
     }
-    let (mut snap, _, _) = open_at_head_with(
+    let (mut snap, _) = open_at_head_with(
         DirDriver::new(&work.bucket),
         args.checkpoint,
         now,

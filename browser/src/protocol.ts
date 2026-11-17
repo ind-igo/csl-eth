@@ -68,20 +68,6 @@ export interface Head {
   timestamp: number;
   snapshot: { block_number: number; block_hash: string; state_root: string; prefix: string };
   open: { requests: number; bytes: number; rounds: number };
-  /// The producer's report of a named RPC's `safe` tag for this block;
-  /// never verified, present only when it names this head's block.
-  fcr: Fcr | null;
-}
-
-export interface Fcr {
-  verified: false;
-  source: string;
-  classification: "fcr_like" | "justified_like";
-  confirmed_after_secs: number;
-  trail_blocks: number;
-  block_number: number;
-  block_hash: string;
-  checked_at: number;
 }
 
 /// The head a read was verified against.

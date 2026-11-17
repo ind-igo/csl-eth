@@ -7,7 +7,7 @@
 // happened (replays may slow the clock down, and say so).
 
 import { drive, loadWasm, type ClientLike, type DriveHooks, type WasmModule } from "./client.ts";
-import { fcrLine, tierChoice, tierLine, tierParam } from "./head.ts";
+import { tierChoice, tierLine, tierParam } from "./head.ts";
 import type { Head, Need, ReadResult, TableInfo, TamperTarget } from "./protocol.ts";
 import { BucketView, checkedPages, type Focus } from "./viz/bucket.ts";
 import { renderChain } from "./viz/chain.ts";
@@ -347,8 +347,7 @@ async function open() {
     hasByHash = tables.some((t) => t.name === "nodes_by_hash" && !t.error);
     el.race.hidden = !hasByHash;
     const bad = tables.filter((t) => t.error && t.name !== "nodes_by_hash").map((t) => `${t.name} (${t.error})`);
-    const fcr = fcrLine(h.fcr);
-    status(`Head verified: block ${h.block_number.toLocaleString()}, ${tierLine(h)}.${fcr ? ` ${fcr[0]!.toUpperCase()}${fcr.slice(1)}.` : ""} ${bad.length ? `Unusable: ${bad.join(", ")}.` : ""}`, bad.length > 0);
+    status(`Head verified: block ${h.block_number.toLocaleString()}, ${tierLine(h)}. ${bad.length ? `Unusable: ${bad.join(", ")}.` : ""}`, bad.length > 0);
     if (pinnedCheckpoint === null) s.rotation = await rotate(cc, cfg);
   } catch (e) {
     if (c && client !== c) c.free();

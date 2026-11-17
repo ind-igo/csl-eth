@@ -14,8 +14,7 @@
 //!
 //! Opening is rounds like everything else, and the head is at most two of
 //! them however old the checkpoint: the bootstrap and the head updates
-//! together (and `head/fcr`, an unverified note, when the attested tier is
-//! wanted), then at once every period update from the bootstrap's period
+//! together, then at once every period update from the bootstrap's period
 //! up to the one the newest head update was signed in (none when they
 //! share a period, and then there is no second round); then the manifests
 //! of the heads that verified, then the models. The verifier still reads
@@ -25,8 +24,7 @@
 use crate::{manifest_path, At, Driver, Opener, Pending, Snapshot, Store, PENDING};
 use alloy_primitives::B256;
 pub use csl_eth_head::{
-    adopt, Chain, ExecutionHead, FcrClass, FcrReport, HeadError, Pointer, Proven, Refusal, Tier,
-    VerifiedHead,
+    adopt, Chain, ExecutionHead, HeadError, Pointer, Proven, Refusal, Tier, VerifiedHead,
 };
 use csl_eth_head::{paths, update_periods_for, verify_tier, HeadSource};
 use csl_eth_store::Manifest;
@@ -113,8 +111,8 @@ impl TierChoice {
 }
 
 /// Verify each of `tiers`' heads from the store, or `Pending` with the next
-/// round's files. Round 1 is the bootstrap, each tier's update file and
-/// `extra`; round 2 the period updates every head update needs, which its
+/// round's files. Round 1 is the bootstrap and each tier's update file;
+/// round 2 the period updates every head update needs, which its
 /// signing period bounds before it is verified. A file that is absent,
 /// does not prove the checkpoint or is stale asks for no updates: the
 /// verifier then refuses it with the same error it always did.
@@ -124,16 +122,14 @@ fn try_verify(
     checkpoint: B256,
     now: SystemTime,
     tiers: &[Tier],
-    extra: &[&str],
 ) -> Result<Vec<Result<VerifiedHead, HeadError>>, Pending> {
     let chain = Chain::mainnet();
     let bootstrap = store.file(&paths::bootstrap(&checkpoint));
     let heads: Vec<_> = tiers.iter().map(|t| store.file(t.path())).collect();
-    let extra_pending = extra.iter().any(|p| store.file(p).is_err());
     let Ok(bootstrap) = bootstrap else {
         return Err(Pending);
     };
-    if extra_pending || heads.iter().any(Result::is_err) {
+    if heads.iter().any(Result::is_err) {
         return Err(Pending);
     }
     if let Ok(Some(b)) = &bootstrap {
@@ -172,7 +168,7 @@ pub fn verify_head<D: Driver>(
 ) -> Result<VerifiedHead, HeadError> {
     let store = Store::new();
     loop {
-        match try_verify(&store, checkpoint, now, &[Tier::Finalized], &[]) {
+        match try_verify(&store, checkpoint, now, &[Tier::Finalized]) {
             Ok(mut r) => return r.remove(0),
             Err(Pending) => crate::drive(driver, &store, true),
         }
@@ -191,7 +187,6 @@ pub struct HeadOpener<D> {
     candidates: Option<Vec<VerifiedHead>>,
     /// The one whose snapshot is being opened.
     head: Option<VerifiedHead>,
-    fcr: Option<FcrReport>,
     inner: Option<Opener<D>>,
 }
 
@@ -215,7 +210,6 @@ impl<D: Driver> HeadOpener<D> {
             choice,
             candidates: None,
             head: None,
-            fcr: None,
             inner: None,
         }
     }
@@ -230,12 +224,6 @@ impl<D: Driver> HeadOpener<D> {
         self.head
             .as_ref()
             .or_else(|| self.candidates.as_ref().and_then(|c| c.first()))
-    }
-
-    /// The producer's `head/fcr` report, when the head chosen is attested
-    /// and the report is about its block. Unverified: see [`FcrReport`].
-    pub fn fcr(&self) -> Option<&FcrReport> {
-        self.fcr.as_ref()
     }
 
     /// One synchronous round through the driver.
@@ -294,17 +282,7 @@ impl<D: Driver> HeadOpener<D> {
         &mut self,
     ) -> Result<Result<(Snapshot<D>, VerifiedHead), HeadOpenError>, Pending> {
         if self.candidates.is_none() {
-            let extra: &[&str] = match self.choice {
-                TierChoice::Finalized => &[],
-                _ => &[paths::FCR],
-            };
-            let r = try_verify(
-                &self.store,
-                self.checkpoint,
-                self.now,
-                self.choice.tiers(),
-                extra,
-            )?;
+            let r = try_verify(&self.store, self.checkpoint, self.now, self.choice.tiers())?;
             match self.choose(r) {
                 Ok(c) => self.candidates = Some(c),
                 Err(e) => return Ok(Err(HeadOpenError::Head(e))),
@@ -359,11 +337,6 @@ impl<D: Driver> HeadOpener<D> {
                     newest,
                 }));
             };
-            if head.tier == Tier::Attested {
-                if let Ok(Ok(Some(b))) = self.store.file(paths::FCR) {
-                    self.fcr = FcrReport::from_json(&b).and_then(|r| r.about(&head.execution));
-                }
-            }
             let driver = self.driver.take().expect("taken once");
             self.inner = Some(Opener::new(
                 driver,
@@ -411,22 +384,21 @@ pub fn open_at_head<D: Driver>(
     checkpoint: B256,
     now: SystemTime,
 ) -> Result<(Snapshot<D>, VerifiedHead), HeadOpenError> {
-    open_at_head_with(driver, checkpoint, now, TierChoice::Best).map(|(s, h, _)| (s, h))
+    open_at_head_with(driver, checkpoint, now, TierChoice::Best)
 }
 
-/// [`open_at_head`] with the tier chosen, also returning the producer's
-/// unverified `head/fcr` report when it is about the head opened.
-#[allow(clippy::result_large_err, clippy::type_complexity)]
+/// [`open_at_head`] with the tier chosen.
+#[allow(clippy::result_large_err)]
 pub fn open_at_head_with<D: Driver>(
     driver: D,
     checkpoint: B256,
     now: SystemTime,
     choice: TierChoice,
-) -> Result<(Snapshot<D>, VerifiedHead, Option<FcrReport>), HeadOpenError> {
+) -> Result<(Snapshot<D>, VerifiedHead), HeadOpenError> {
     let mut o = HeadOpener::with_tier(driver, checkpoint, now, choice);
     loop {
         match o.try_open() {
-            Ok(r) => return r.map(|(s, h)| (s, h, o.fcr().cloned())),
+            Ok(r) => return r,
             Err(Pending) => o.round(),
         }
     }
