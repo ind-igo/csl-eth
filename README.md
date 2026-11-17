@@ -71,7 +71,9 @@ bucket's region, 2026-11-17; `docs/decisions.md` has the detail):
 - **Reads over layers,** cold, against the base alone, eight layers: an
   account 0.85× the requests, an absent account 1.9×, a slot of a contract
   that changed recently 1.6× to 1.7×, a slot of USDT 1.5× (3.5× before
-  storage hints by contract and path), WETH 2.2×. Most of what remains is
+  storage hints by contract and path), WETH 2.2× (path hints for owners
+  with 16 or more changed nodes, kept through merges for owners hot
+  lately; WETH's re-measure waits for the older merged layers to go). Most of what remains is
   the since-base layer, which carries no hints (`docs/decisions.md`).
 - **Cost:** about $30 a month (the VM and its disks about $22, about
   50,000 writes a day about $8), plus about $3.60 of bucket reads per day of
@@ -139,14 +141,15 @@ above. Details in `docs/decisions.md`.
   Cloudflare in 13 to 18 s over HTTP/3, 0.08 s over TCP). Without the VPN the
   page opens, verifies the head and reads an account in 0.7 s, all over
   HTTP/3. Behind such a VPN, turning QUIC off in Chrome fixes it.
-- **The checkpoint.** The default root (slot 15,661,216, 2026-11-15) must be
-  replaced before it leaves the weak-subjectivity period, around the end of
-  November, so far by hand. Automatic rotation is sketched in
-  `docs/decisions.md`, not built: the tracker publishes a newer finalized
-  root's bootstrap, and the page moves to a root only if it proved that root
-  finalized itself.
-  The page also accepts `?checkpoint=` and `?bucket=` from the URL without a
-  warning.
+- **The checkpoint.** The page's built-in root (slot 15,661,216, 2026-11-15)
+  ages out of the weak-subjectivity period around the end of November, but
+  a visitor moves past it. Once a period, the tracker publishes a newer
+  finalized root's bootstrap and a pointer, `head/checkpoint`. After each
+  open, the page adopts that root only if the open proved it finalized from
+  the root it held, then remembers it in localStorage (`docs/decisions.md`).
+  A first visit still starts from the built-in root, and so does the
+  tracker itself. `?checkpoint=` pins a root and is never rotated. The page
+  accepts it and `?bucket=` from the URL without a warning.
 - **Gloas.** EIP-7732 removes the state root from the light-client header, so
   after that fork the head verifier needs the execution header from another
   source.

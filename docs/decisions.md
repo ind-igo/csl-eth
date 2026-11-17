@@ -585,11 +585,11 @@ By layer, USDT's read asked the storage runs of the six path-hinted layers 10, 0
 
 **Build.** In the 166 steps after the deploy, step build time had a median of 1.0 s and a maximum of 3.8 s. The slowest merge (the one that made the tier-4 layer) took 3.2 s. Before the fix, rewriting the since-base layer took 70 to 95 s.
 
-**Open.** A path hint for any owner named in every layer it merges into, whatever its count in one layer, or HOT_MIN lowered to about 16, so that WETH-like owners keep their hints. A rebase, which removes the since-base layer, now the largest cost of a read.
+**Open.** A path hint for any owner named in every layer it merges into, whatever its count in one layer, or HOT_MIN lowered to about 16, so that WETH-like owners keep their hints (both done the same day, see checkpoint rotation, built). A rebase, which removes the since-base layer, now the largest cost of a read.
 
 **Peers after this restart.** 17 peers on the known list. Ten served within the first minute and twelve (the cap) by the third. The same restart without the list took 2 to 26 minutes to reach three.
 
-## 2026-11-17: automatic checkpoint rotation (sketch, not built)
+## 2026-11-17: automatic checkpoint rotation (sketch; built the same day, below)
 
 The page's one trust input is a beacon block root, and each one is good for the weak-subjectivity period it was chosen in. The current default (slot 15,661,216, 2026-11-15) has to be replaced before about the end of November, and so far each move has been by hand: find a finalized root several public endpoints agree on, publish its bootstrap, change the page's default, redeploy. The tracker and the page can do this between them without trusting the tracker any more than they do now.
 
@@ -602,3 +602,38 @@ The page's one trust input is a beacon block root, and each one is good for the 
 **First visits.** A visitor without a remembered root uses the page's default. That default is as trusted as the page's code, since both come from the same bucket, so refreshing it adds no new trust. `site.sh` would read `head/checkpoint`, verify a head from it starting at the current default with the CLI (`csl-eth head`), and only then bake it in. A weekly re-deploy keeps the default inside its period. The tracker's own `--checkpoint` can stay as it is for this: it publishes bootstraps for newer roots but verifies its own heads from the root it started with. Its root ages out too, though. Advancing it with the same rule (a root it proved finalized) is the follow-up.
 
 **Deadline.** All of this has to be live before the current root ages out around the end of November, and a returning visitor needs to have opened the page once after it ships. Otherwise the fallback is the manual move described on 2026-11-16, which is the same steps.
+
+## 2026-11-17: checkpoint rotation, built; path hints at 16 positions, sticky
+
+**Rotation as sketched, with one change: the tracker picks the root from its own proof.** `verify_tier` now returns `proven_finalized`. This is the finalized header of each period update it applied, when the slot is not 0 and two thirds of the committee signed (helios checks the finality branch against the signed attested header for every such update). It also includes the head itself when the tier is finalized. Alongside that it returns `checkpoint_slot`. `adopt(head, pointer, bootstrap)` in the head crate is the whole acceptance rule. The pointer's root must be one this verification proved, at the slot it proved, and newer than the checkpoint. The bootstrap must be present and must prove that root's header and its sync committee (`checked_bootstrap`). Otherwise it returns a `Refusal`: not a pointer, not proven, not newer, wrong slot, no bootstrap, or a bad bootstrap. A lying `head/checkpoint` can only keep the checkpoint where it is.
+
+The tracker runs this every 30 s, after the finalized head verifies. It takes the newest root proven by a period update, excluding the head's own entry, so the root moves once a period, not every epoch. It fetches that root's bootstrap and runs `adopt` on it as a self-check. Then it publishes the period updates, the bootstrap, and `head/checkpoint` (`{"root","slot","period"}`), in that order. If the pointer it last published is no longer proven (the update it came from changed), it re-points. On a failure it backs off 10 minutes. The first run after the deploy published slot 15,663,232 (period 1912, root `0x5bd5…0273`) three seconds after start.
+
+The page takes its checkpoint from `?checkpoint=` (pinned, never rotated), then localStorage (`csl-eth.checkpoint`, every access in try/catch), then the built-in default. After each open it fetches `head/checkpoint` and the named bootstrap and calls `Client.adopt`. It stores the root only when adopted. The chain-of-trust panel shows the outcome as a last item, "next checkpoint". If a remembered root fails to open, the page opens from the built-in root instead. It does this only for its own bucket, because that default comes from the same bucket as the page's code and so adds no trust. With `?bucket=` pointing elsewhere it fails closed, since a foreign bucket could otherwise withhold files to roll a visitor back to the older root (omp's review). The remembered root is kept until a newer adoption replaces it.
+
+Tests:
+- Head crate, over the p1900 fixtures plus a period-1899 bootstrap fetched for this:
+  - the proven set;
+  - adoption, and the same head verifying again from the adopted root with one update fewer;
+  - a lying pointer: an unproven root, a made-up root, a proven but older root, a wrong slot, a non-JSON body and a malformed body;
+  - a missing bootstrap, another block's bootstrap, and a forged committee;
+  - an update short of quorum, or with slot 0, proving nothing.
+- Tracker:
+  - with no bootstrap reachable, nothing is pointed at;
+  - a foreign bootstrap fails the self-check;
+  - rotation happens once per period;
+  - a stale pointer is replaced.
+
+Live, through the deployed page in headless Chromium:
+
+| Profile | First open | Reload |
+|---|---|---|
+| fresh | from the default `0x431b…`, adopted `0x5bd5…` (slot 15,663,232) | from `0x5bd5…`, "already the checkpoint" |
+| holding the old root `0x431b…` | adopted `0x5bd5…` | from `0x5bd5…` |
+| holding a root that doesn't open | fell back to the default, adopted `0x5bd5…` | from `0x5bd5…` |
+
+**Path hints.** HOT_MIN is now 16. Owners hot in a step stay sticky for 1024 steps, the since-base merge period. A sticky owner gets a path hint in every layer that names it, built from all its positions there, so a merge, which keeps an owner's hint only when every merged layer has one, keeps WETH's. The sticky set is seeded at startup from the current layers' hints. New single-step layers hint 250 to 330 owners, up from 11 to 23.
+
+WETH is pending the merges. Right after the deploy (11 layers, block 26,433,114), the new single-step layers that hint WETH were asked 0, 0, 3 and 5 times for a WETH slot. The older merged layers, built before the sticky set, were asked 13 to 15 times each, as owners-only layers. Five of those layers still lacked WETH's hint at block 26,433,201. The last of them is the 392-block layer, which goes at its tier-4 merge (256 steps, about 8 hours at the current 2 minutes per step). Until then WETH costs about what it did: 169 requests against 58 for the base alone at 11 layers. Reads on the deployed page after the deploy: USDT slot 76 requests in 5 rounds, an absent account 14.
+
+**Open.** The tracker's own `--checkpoint` still ages out, so it should advance by the same rule. The page fetches the bootstrap again when the pointer names the root it already holds (54 KB per open). A weekly `site.sh` should bake the newest proven root in as the default. The rebase.
