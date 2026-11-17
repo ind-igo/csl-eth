@@ -643,3 +643,35 @@ WETH is pending the merges. Right after the deploy (11 layers, block 26,433,114)
 ## 2026-11-17: the slice retired from Cloudflare
 
 The R2 bucket `csl-eth-apac` (533 objects, 1.7 GB: the 1/4096 slice's runs, snapshots and head files, last written 2026-11-16) and the static-assets Worker `csl-eth` that served the first page are deleted, so https://csl-eth.indigo-db8.workers.dev and the r2.dev domain above no longer answer. The numbers measured against them stay in `results/m1.md` and the README. `scripts/r2-publish.sh`, `scripts/r2-s3-publish.sh` and `deploy/k8s/` stay as the record of how the slice was published; they would need a bucket again to run. The producer's Deployment on fafo-0 is scaled to zero and is removed by hand.
+
+## 2026-11-17: the since-base merge in the background; an owner index for the since-base layer (branch `since-base-bg`)
+
+**The merge off the step.** `compact` no longer merges at the top tier. When two or more top-tier layers lead the stack (the since-base layer, then a new tier-5 layer every 1,024 steps), `start_top` hands them to one thread at nice 10. The thread merges them into a new layer, writes it under new names and uploads the files nothing has published yet. The steps go on publishing manifests over the old since-base layer plus the pending top-tier layer. At the first commit after the job ends, `tend_top` swaps the new layer in, provided its inputs still lead the stack. A restart or preemption mid-merge loses only the job: temporaries (`.tmp-*`, `<hash>.tmp`) are removed at startup, and the next step starts the job again. Collection waits while a job runs. The job journals each file name (`work/since-base-sent`) before uploading it, so the uploads of a failed or interrupted job join the published set and are collected once no kept manifest names them. Merges below the top tier stay inline. omp (gpt-6.1, high) found four issues, all fixed. A job and a step could upload the same file at once through the same temporary name: the job now skips what the step will send, and `DirPublish` and `dir-publish.sh` use unique temporary names. A failed job's uploads were never collected: hence the journal. Hint and owner-index temporaries were not swept. The job check reread the since-base hint file at every step: it is now cached by name. The review found no wrong-answer path.
+
+**The owner index.** A layer whose changed storage owners exceed the hint cap (65,536), which in practice means the since-base layer, used to carry no storage hint, so every storage read asked it. Its merge now derives those owners exactly: an account leaf with a storage root, whose storage-root position is in the layer's storage run. It writes them as `runs/<hash>.owners`, sorted 8-byte prefixes in 4 KiB pages of 512, and puts `owners: {file, count, first}` in the hints (`first` holds each page's first owner). A layer at or under the cap gets the usual key set instead. A since-base layer published before this gets the index from a one-input job, which rewrites only its hints. The client fetches the one owner page with its first round. If the page doesn't list the contract, the layer is skipped for that contract's storage. A malformed index, a bad page or a missing file gives Maybe. Hints still only schedule, so a lying or missing index costs requests, never an answer. Old manifests and old pages read as before. Tests:
+- the store pages and checks its pages;
+- the client test derives the index exactly, then reads through a correct index, a fake index, a count mismatch, zeroed pages and a missing owners file, and finds every read correct;
+- the tracker test covers a job killed mid-merge, reads during a pending merge, a stale swap refused, the job's uploads and the journal, and collection keeping inputs that a kept manifest names.
+
+**Live (deployed 09:51 UTC).** The first step started the index job on the live since-base layer (blocks 26,422,083 to 26,432,171). It built in 18 s and uploaded a 552 KB index listing 69,025 owners in 0.35 s. Steps went on publishing meanwhile, and the next step swapped it in. At 11:22, step 1,280, the fourth tier-4 layer formed. The inline merge of the four tier-4 layers into a tier-5 layer took that step to 80 s (37 s build, 1.2 GB uploaded in 30 s). That stall is bounded by 1,024 steps of change and does not grow with the base's age. The background job then merged the since-base layer and the new tier-5 layer into a 4.04 GB layer: 1.72 GB of accounts, 2.32 GB of storage, and 77,517 owners. It built in 100 s and uploaded in 82 s. Three steps published during those 200 s, 80, 80 and 57 s apart, with lag peaking at 120 s. Steps normally come 10 to 20 s apart with about 35 s of lag. The two vCPUs and the disk are shared, so the steps slowed but did not stop. Inline, the same merge would have stopped publishing for about three minutes, and longer each day.
+
+**Reads** (`layer_cost.rs`, 12:15 UTC, block 26,434,716, ten layers, all of them after the merge; cold, in requests; "no index" is the same read with the `.owners` file withheld):
+
+| read | base only | hinted | no index | unhinted |
+|---|---|---|---|---|
+| vitalik.eth | 13 | 24 | 24 | 84 |
+| absent account | 10 | 19 | 19 | 53 |
+| USDT slot 1 | 53 | 94 (1.8×) | 94 | 357 |
+| WETH slot 0 | 58 | 136 (2.3×) | 136 | 382 |
+| The DAO slot 0 | 47 | 74 (1.6×) | 74 | 365 |
+| CryptoPunks slot 0 | 50 | 72 (1.4×) | 72 | 343 |
+| Uniswap v1 slot 0 (absent) | 35 | 41 (1.17×) | 51 | 222 |
+| REP v1 slot 0 | 44 | 49 (1.11×) | 69 | 336 |
+
+The DAO and CryptoPunks are not quiet at this scale. Both storage roots changed since the base, and the index lists both, correctly, so they still pay the since-base layer (19 to 23 requests). For a contract the since-base layer never touched, the layer now costs one owner page instead of 10 to 20 run requests. Rounds are unchanged. The owner page rides the first round.
+
+**WETH re-measure.** The older layers without WETH's path hint are gone, folded into the since-base layer. WETH is at 2.3×, against 2.2× on eight layers before. The three merged layers of 68 to 88 blocks are still asked 13 to 20 times each, because WETH changes enough slots in 70 blocks that its path hint covers most positions, and the since-base layer is asked 17 times. The sticky hint works; what remains is how much WETH changes.
+
+**Next limit.** `gcs-publish.sh` gives each upload `--max-time 240`, inside the tracker's 300 s per call. At the 50 MB/s seen here, that caps a file at about 12 GB. The since-base storage run (2.3 GB at 12,348 blocks) reaches that in roughly a week. After that the job fails and retries every 10 minutes, and top-tier layers pile up: reads stay correct but get dearer. Before then, scale the time limits with the file's size, or rebase.
+
+**The rolling merge is parked.** The rolling-merge design (branch `rolling-merge-design`, `docs/rolling-merge.md`) is not merged. The PoC handles growth with the background merge and the owner index, plus a bigger disk or a fresh export after about six weeks. A rolling merge belongs in a node-side publisher, and a reth ExEx is a possible future PoC.
