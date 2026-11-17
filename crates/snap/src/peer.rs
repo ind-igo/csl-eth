@@ -611,20 +611,32 @@ impl Peer {
     }
 
     /// Keep the connection alive while there is nothing to ask: read for
-    /// `for_` servicing the peer's pings and requests. `P2PStream` answers
-    /// pings only when polled, so an idle peer that is not read drops us
-    /// with "ping timeout".
+    /// `for_` servicing the peer's pings and requests. Reading a ping only
+    /// queues the pong; it reaches the wire when the sink is polled, so the
+    /// sink is driven every second (which also sends our own pings). Read
+    /// without that, an idle peer heard nothing from us and Geth closed the
+    /// connection after its 30 s read timeout.
     pub async fn idle(&mut self, for_: Duration) -> Result<(), PeerError> {
         let deadline = Instant::now() + for_;
         loop {
-            match self.next_before(deadline).await {
+            self.flush_control().await?;
+            let slice = deadline.min(Instant::now() + Duration::from_secs(1));
+            match self.next_before(slice).await {
                 Ok(Inbound::Eth(m)) => self.service_eth(m).await?,
                 Ok(Inbound::Snap(m)) => self.service_snap(m).await?,
                 Ok(Inbound::Ignored) => {}
-                Err(PeerError::Timeout) => return Ok(()),
+                Err(PeerError::Timeout) if Instant::now() < deadline => {}
+                Err(PeerError::Timeout) => return self.flush_control().await,
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Send what the stream queued on its own: pongs, its pings.
+    async fn flush_control(&mut self) -> Result<(), PeerError> {
+        std::future::poll_fn(|cx| futures::Sink::<bytes::Bytes>::poll_ready(std::pin::Pin::new(&mut self.conn), cx)).await?;
+        self.conn.flush().await?;
+        Ok(())
     }
 
     /// snap/1 `GetTrieNodes` at `root`; the reply's nodes in request order
