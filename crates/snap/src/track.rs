@@ -1233,6 +1233,7 @@ async fn sync<S: Source>(
         }
     }
     let mut waiting: Vec<Waiting> = Vec::new();
+    let mut pre: Vec<Need> = Vec::new();
     loop {
         while fetch.len() + waiting.len() < WAVE {
             let Some(it) = stack.pop() else { break };
@@ -1294,7 +1295,24 @@ async fn sync<S: Source>(
                                 0,
                             )?;
                         }
-                        None => fetch.push((it.pos, slot, 0)),
+                        None => {
+                            // Its old node too, in the same wave: opening it
+                            // needs both, and asking for the old one only
+                            // after the new one came cost a wave a level.
+                            if let Some(Ref::Hash(oh)) = &it.pos.old {
+                                if cx.old.any()
+                                    && old_node(cx.store, Some(db), it.pos.owner, &it.pos.path, oh)?
+                                        .is_none()
+                                {
+                                    pre.push(Need {
+                                        owner: it.pos.owner,
+                                        path: it.pos.path,
+                                        hash: *oh,
+                                    });
+                                }
+                            }
+                            fetch.push((it.pos, slot, 0))
+                        }
                     }
                 }
             }
@@ -1336,14 +1354,13 @@ async fn sync<S: Source>(
         }
         // The old side, in the same wave: peers at the old root while it is
         // in their window, then the base in the bucket.
-        if !waiting.is_empty() {
+        if !waiting.is_empty() || !pre.is_empty() {
             let mut olds: Vec<Need> = Vec::new();
             let mut seen: HashSet<B256> = HashSet::new();
-            for w in &waiting {
-                if seen.insert(w.need.hash)
-                    && !db.contains(&w.need.hash).map_err(StepError::Store)?
-                {
-                    olds.push(w.need.clone());
+            let pre = std::mem::take(&mut pre);
+            for n in waiting.iter().map(|w| &w.need).chain(pre.iter()) {
+                if seen.insert(n.hash) && !db.contains(&n.hash).map_err(StepError::Store)? {
+                    olds.push(n.clone());
                 }
             }
             st.old_asked += olds.len() as u64;
@@ -2251,6 +2268,8 @@ impl Tracker {
             self.args.tiers,
         )?;
         let manifest = self.manifest(&head, tier == Some(Tier::Attested))?;
+        let layer_s = t0.elapsed().as_secs_f64();
+        let t_check = Instant::now();
         let check = match read_back(&self.root, &head, h) {
             Ok(v) => v,
             Err(err) => {
@@ -2259,6 +2278,7 @@ impl Tracker {
                 return Err(format!("read-back failed, step not published: {err}"));
             }
         };
+        let readback_s = t_check.elapsed().as_secs_f64();
         let built_s = t0.elapsed().as_secs_f64();
         let t1 = Instant::now();
         let sent = self.publish_step(&head, &manifest, h, update, tier)?;
@@ -2274,7 +2294,8 @@ impl Tracker {
         self.store = Store::open_with(&self.root, &manifest, self.args.base_url.is_none())?;
         Ok(json!({
             "merges": merges, "runs": self.store.run_counts(), "check": check, "sent": sent,
-            "collected": collected, "build_s": built_s, "publish_s": t1.elapsed().as_secs_f64(),
+            "collected": collected, "build_s": built_s, "layer_s": layer_s, "readback_s": readback_s,
+            "publish_s": t1.elapsed().as_secs_f64(),
         }))
     }
 
