@@ -467,7 +467,7 @@ impl Program {
     /// the group) is abandoned, not joined. The program's exit status
     /// decides the call: one that exited 0 but left something holding its
     /// output has done its work, and that straggler is killed and logged.
-    fn run(&self, args: &[&std::ffi::OsStr]) -> Result<(), String> {
+    fn run(&self, args: &[&std::ffi::OsStr], timeout: Duration) -> Result<(), String> {
         use std::{
             io::Read as _,
             sync::{Arc, Mutex},
@@ -531,7 +531,7 @@ impl Program {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + timeout;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(st)) => break Some(st),
@@ -548,7 +548,7 @@ impl Program {
             return Err(format!(
                 "{}: no answer in {} s; killed",
                 shown(),
-                self.timeout.as_secs()
+                timeout.as_secs()
             ));
         };
         if !drained_by(&readers, deadline) {
@@ -586,13 +586,29 @@ impl Program {
     }
 }
 
+/// The slowest upload rate a put is allowed, bytes a second: about five
+/// times under the 40 to 80 MB/s one stream gets from the VM to the bucket.
+/// `scripts/gcs-publish.sh` gives each try the same allowance.
+pub const PUT_FLOOR_RATE: u64 = 10_000_000;
+
+/// How long a put of `bytes` may take: the fixed deadline plus three tries'
+/// worth of transfer at [`PUT_FLOOR_RATE`] (the script retries twice). The
+/// fixed deadline alone capped a file at about 12 GB.
+pub fn put_timeout(base: Duration, bytes: u64) -> Duration {
+    base + Duration::from_secs(3 * (bytes / PUT_FLOOR_RATE))
+}
+
 impl Publish for Program {
     fn put(&self, key: &str, file: &Path) -> Result<(), String> {
-        self.run(&["put".as_ref(), key.as_ref(), file.as_os_str()])
+        let bytes = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+        self.run(
+            &["put".as_ref(), key.as_ref(), file.as_os_str()],
+            put_timeout(self.timeout, bytes),
+        )
     }
 
     fn delete(&self, key: &str) -> Result<(), String> {
-        self.run(&["delete".as_ref(), key.as_ref()])
+        self.run(&["delete".as_ref(), key.as_ref()], self.timeout)
     }
 }
 
@@ -3209,6 +3225,18 @@ mod tests {
         assert!(calls.contains(&"put head/updates/1898".to_string()));
         assert!(!calls.iter().any(|c| c.contains("head/updates/1899")));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_put_deadline_grows_with_the_file() {
+        let base = Duration::from_secs(300);
+        assert_eq!(put_timeout(base, 0), base);
+        assert_eq!(put_timeout(base, 9_999_999), base);
+        // 12 GB, the old cap at 50 MB/s: 3 tries of 1,200 s each on top.
+        assert_eq!(
+            put_timeout(base, 12_000_000_000),
+            Duration::from_secs(300 + 3_600)
+        );
     }
 
     #[cfg(unix)]

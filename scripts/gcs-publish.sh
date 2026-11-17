@@ -35,13 +35,19 @@ token() {
     sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p'
 }
 
+# Seconds each try may take: 240, plus one per 10 MB of the upload, so a
+# large file gets time at about a fifth of the VM's usual 40-80 MB/s. The
+# tracker's own deadline for the call grows the same way (PUT_FLOOR_RATE in
+# crates/snap/src/produce.rs).
+max_time=240
+
 gcs() {
   local t
   t=$(token)
   [ -n "$t" ] || { echo "no access token from the metadata server" >&2; return 1; }
   # The token goes to curl on stdin as a config line, never in argv.
   printf 'header = "Authorization: Bearer %s"\n' "$t" |
-    curl -sS --config - --max-time 240 --retry 2 --retry-all-errors \
+    curl -sS --config - --max-time "$max_time" --retry 2 --retry-all-errors \
       -o "$err" -w '%{http_code}' "$@"
 }
 
@@ -51,6 +57,7 @@ case "${1:-}" in
     key=$2
     file=$3
     [ -f "$file" ] || { echo "put $key: no such file: $file" >&2; exit 1; }
+    max_time=$((240 + $(wc -c <"$file") / 10000000))
     # Rules by the key under a "full/" or "history-full/" prefix (the
     # full-state export, deploy/gcp/node-burst.sh, and the full history,
     # deploy/gcp/history-burst.sh, publish whole bucket layouts there).

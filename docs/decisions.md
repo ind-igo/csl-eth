@@ -675,3 +675,7 @@ The DAO and CryptoPunks are not quiet at this scale. Both storage roots changed 
 **Next limit.** `gcs-publish.sh` gives each upload `--max-time 240`, inside the tracker's 300 s per call. At the 50 MB/s seen here, that caps a file at about 12 GB. The since-base storage run (2.3 GB at 12,348 blocks) reaches that in roughly a week. After that the job fails and retries every 10 minutes, and top-tier layers pile up: reads stay correct but get dearer. Before then, scale the time limits with the file's size, or rebase.
 
 **The rolling merge is parked.** The rolling-merge design (branch `rolling-merge-design`, `docs/rolling-merge.md`) is not merged. The PoC handles growth with the background merge and the owner index, plus a bigger disk or a fresh export after about six weeks. A rolling merge belongs in a node-side publisher, and a reth ExEx is a possible future PoC.
+
+## 2026-11-17: upload deadlines grow with the file
+
+The since-base layer's storage run would have outgrown a fixed upload deadline within about a week (`gcs-publish.sh`'s `--max-time 240` per try, the tracker's 300 s per call: about 12 GB at 50 MB/s). Both now add one second per 10 MB of the file, so a large put gets time at about a fifth of the VM's usual 40 to 80 MB/s; the tracker allows three tries' worth (`put_timeout` in `produce.rs`). Small files keep the old limits. The same day the VM went from e2-medium to e2-standard-4, so the background since-base merge stops competing with steps for two vCPUs, and its data disk from 100 to 200 GB.
