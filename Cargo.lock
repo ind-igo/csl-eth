@@ -1804,6 +1804,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "csl-eth-history"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "blake3",
+ "csl-eth-client",
+ "csl-eth-store",
+ "csl-run",
+ "hex",
+ "serde_json",
+]
+
+[[package]]
 name = "csl-eth-snap"
 version = "0.1.0"
 dependencies = [
@@ -1818,6 +1831,7 @@ dependencies = [
  "clap",
  "csl-eth-client",
  "csl-eth-head",
+ "csl-eth-history",
  "csl-eth-store",
  "csl-eth-trie",
  "csl-run",

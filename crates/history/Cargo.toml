@@ -1,0 +1,18 @@
+[package]
+name = "csl-eth-history"
+description = "History reads over the bucket (transactions, receipts, logs, headers by number), verified to the beacon head through csl-eth-client; not part of the browser's state client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+csl-eth-client = { path = "../client" }
+csl-eth-store = { path = "../store" }
+csl-run.workspace = true
+alloy-primitives.workspace = true
+blake3.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

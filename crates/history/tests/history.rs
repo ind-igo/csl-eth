@@ -4,19 +4,15 @@
 //! end every read `Insufficient` or correct.
 
 use alloy_primitives::{Address, B256};
-use csl_eth_client::{
-    history::{Anchor, History, HistoryCost, Insufficient, LogAt, LogTier, Logs, Term},
-    DirDriver,
-};
+use csl_eth_client::DirDriver;
+use csl_eth_history::{Anchor, History, HistoryCost, Insufficient, LogAt, LogTier, Logs, Term};
 use csl_eth_store::{
     history::{
         decode_header, decode_receipt, encode_receipt, history_manifest_path, locator, synthetic,
         tx_hash, tx_lookup_key, write_history, write_history_tampered, Block, HistoryManifest,
-        Tamper, MAINNET_GENESIS_TIME,
-        SECONDS_PER_SLOT, SLOTS_PER_PERIOD, H_TRANSACTIONS,
+        Tamper, H_TRANSACTIONS, MAINNET_GENESIS_TIME, SECONDS_PER_SLOT, SLOTS_PER_PERIOD,
     },
-    CODE_BLOB_THRESHOLD,
-    EPSILON,
+    CODE_BLOB_THRESHOLD, EPSILON,
 };
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -133,7 +129,12 @@ fn every_transaction_and_receipt_reads_back_verified() {
             );
             assert_eq!(&r.tx, t);
             assert_eq!(&r.receipt_leaf, &b.receipts[i]);
-            let large = b.txs.iter().chain(&b.receipts).filter(|v| v.len() > CODE_BLOB_THRESHOLD).count();
+            let large = b
+                .txs
+                .iter()
+                .chain(&b.receipts)
+                .filter(|v| v.len() > CODE_BLOB_THRESHOLD)
+                .count();
             if large > 0 {
                 packed += 1;
                 // A block's packed values are one range.
@@ -246,11 +247,18 @@ fn a_manifest_for_another_block_is_refused() {
 }
 
 /// Every transaction of `blocks` of `c` reads back verified.
-fn txs_read(h: &mut History<DirDriver>, c: &BTreeMap<u64, Block>, blocks: impl Iterator<Item = u64>) -> u64 {
+fn txs_read(
+    h: &mut History<DirDriver>,
+    c: &BTreeMap<u64, Block>,
+    blocks: impl Iterator<Item = u64>,
+) -> u64 {
     let mut n = 0;
     for b in blocks {
         for (i, t) in c[&b].txs.iter().enumerate() {
-            let r = h.tx(&tx_hash(t)).0.unwrap_or_else(|e| panic!("block {b} tx {i}: {e}"));
+            let r = h
+                .tx(&tx_hash(t))
+                .0
+                .unwrap_or_else(|e| panic!("block {b} tx {i}: {e}"));
             assert_eq!((r.block_number, r.index, &r.tx), (b, i as u64, t));
             n += 1;
         }
@@ -269,15 +277,32 @@ fn a_span_whose_open_period_is_empty_opens_and_reads() {
         synthetic::strip(&mut c, |n| n >= BOUNDARY);
         let dir = scratch(&format!("empty-open-{i}"));
         let w = write_history(&dir, &c, FIRST, (last, c[&last].hash), EPSILON).unwrap();
-        let pieces: Vec<_> = w.manifest.tx_lookup.iter().map(|l| l.table.is_some()).collect();
+        let pieces: Vec<_> = w
+            .manifest
+            .tx_lookup
+            .iter()
+            .map(|l| l.table.is_some())
+            .collect();
         assert_eq!(pieces, vec![true, false]);
-        let a = Anchor { number: last, hash: c[&last].hash };
+        let a = Anchor {
+            number: last,
+            hash: c[&last].hash,
+        };
         let mut h = History::open(DirDriver::new(&dir), a).expect("an empty piece opens");
-        assert_eq!(h.header(FIRST).0.unwrap(), decode_header(&c[&FIRST].header).unwrap());
+        assert_eq!(
+            h.header(FIRST).0.unwrap(),
+            decode_header(&c[&FIRST].header).unwrap()
+        );
         assert!(txs_read(&mut h, &c, FIRST..BOUNDARY) > 0);
         // A transaction the stripped period no longer has is not indexed.
-        let gone = honest.range(BOUNDARY..).find_map(|(_, b)| b.txs.first()).unwrap();
-        assert_eq!(h.tx(&tx_hash(gone)).0.unwrap_err(), Insufficient::NotIndexed);
+        let gone = honest
+            .range(BOUNDARY..)
+            .find_map(|(_, b)| b.txs.first())
+            .unwrap();
+        assert_eq!(
+            h.tx(&tx_hash(gone)).0.unwrap_err(),
+            Insufficient::NotIndexed
+        );
         for tier in [LogTier::Indexed, LogTier::Complete] {
             let r = h.logs(&busy(), FIRST, last, tier).0.unwrap();
             assert_eq!(r.logs, truth(&c, &busy(), FIRST, last), "{}", tier.name());
@@ -523,13 +548,20 @@ fn many_periods(periods: u64, per: u64) -> (BTreeMap<u64, Block>, Anchor) {
     let t = MAINNET_GENESIS_TIME + 1900 * SLOTS_PER_PERIOD * SECONDS_PER_SLOT;
     let c = synthetic::chain_spaced(9, FIRST, periods * per, t, secs, false);
     let last = FIRST + periods * per - 1;
-    let a = Anchor { number: last, hash: c[&last].hash };
+    let a = Anchor {
+        number: last,
+        hash: c[&last].hash,
+    };
     (c, a)
 }
 
 /// Warm transaction reads (models loaded, headers kept) over every
 /// `step`th block: the worst requests and rounds, and the tx_lookup bytes.
-fn warm_tx_reads(h: &mut History<DirDriver>, c: &BTreeMap<u64, Block>, step: usize) -> (u64, u32, u64) {
+fn warm_tx_reads(
+    h: &mut History<DirDriver>,
+    c: &BTreeMap<u64, Block>,
+    step: usize,
+) -> (u64, u32, u64) {
     let (mut requests, mut rounds, mut lookup) = (0, 0, 0);
     for b in c.values().step_by(step) {
         let Some(t) = b.txs.first() else { continue };
@@ -551,7 +583,11 @@ fn a_tx_read_does_not_grow_with_the_periods() {
         let dir = scratch(&format!("many-{periods}"));
         let w = write_history(&dir, &c, FIRST, (a.number, a.hash), EPSILON).unwrap();
         assert_eq!(w.manifest.periods.len() as u64, periods);
-        assert_eq!(w.manifest.tx_lookup.len(), 2, "the base and the open period");
+        assert_eq!(
+            w.manifest.tx_lookup.len(),
+            2,
+            "the base and the open period"
+        );
         let mut h = History::open(DirDriver::new(&dir), a).unwrap();
         assert_eq!(h.cost().requests, 1, "opening fetches the manifest only");
         // Load what the reads touch, then measure.
@@ -570,7 +606,7 @@ fn a_tx_read_does_not_grow_with_the_periods() {
 }
 
 /// The cost of a span of thousands of periods: run with
-/// `cargo test -p csl-eth-client --release --test history -- --ignored --nocapture`.
+/// `cargo test -p csl-eth-history --release --test history -- --ignored --nocapture`.
 #[test]
 #[ignore]
 fn measure_many_periods() {
@@ -580,7 +616,9 @@ fn measure_many_periods() {
         let t0 = std::time::Instant::now();
         let w = write_history(&dir, &c, FIRST, (a.number, a.hash), EPSILON).unwrap();
         let write_s = t0.elapsed().as_secs_f64();
-        let manifest = std::fs::read(dir.join(csl_eth_store::history::history_manifest_path(&a.hash))).unwrap();
+        let manifest =
+            std::fs::read(dir.join(csl_eth_store::history::history_manifest_path(&a.hash)))
+                .unwrap();
         let pretty = serde_json::to_vec_pretty(&w.manifest).unwrap();
         let t0 = std::time::Instant::now();
         let mut h = History::open(DirDriver::new(&dir), a).unwrap();
@@ -588,7 +626,12 @@ fn measure_many_periods() {
         let open = h.cost();
         // A first read after opening: a fresh client.
         let mid = &c[&(FIRST + periods * per / 2)];
-        let probe = mid.txs.first().or_else(|| c.values().find_map(|b| b.txs.first())).unwrap().clone();
+        let probe = mid
+            .txs
+            .first()
+            .or_else(|| c.values().find_map(|b| b.txs.first()))
+            .unwrap()
+            .clone();
         let (r, first) = h.tx(&tx_hash(&probe));
         r.unwrap();
         // Cold: headers and packs forgotten, models kept.
@@ -598,7 +641,12 @@ fn measure_many_periods() {
             h.forget();
             let (r, cost) = h.tx(&tx_hash(t));
             r.unwrap();
-            cold.push((cost.requests, cost.rounds, cost.bytes, cost.headers_verified));
+            cold.push((
+                cost.requests,
+                cost.rounds,
+                cost.bytes,
+                cost.headers_verified,
+            ));
         }
         // Warm: every header verified and kept, the models loaded; what a
         // transaction costs past the header walk.
@@ -610,7 +658,12 @@ fn measure_many_periods() {
             h.tx(&tx_hash(t)).0.unwrap();
             let (r, cost) = h.tx(&tx_hash(t));
             r.unwrap();
-            warm.push((cost.requests, cost.rounds, cost.bytes, cost.headers_verified));
+            warm.push((
+                cost.requests,
+                cost.rounds,
+                cost.bytes,
+                cost.headers_verified,
+            ));
         }
         let n = cold.len() as f64;
         let mean = |f: fn(&(u64, u32, u64, u64)) -> f64| cold.iter().map(f).sum::<f64>() / n;

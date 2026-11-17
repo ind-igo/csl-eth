@@ -14,11 +14,8 @@
 //! another block's hash, a neighbour slot.
 
 use alloy_primitives::B256;
-use csl_eth_client::{
-    beacon::{AccumError, Accumulator, BeaconAnchor},
-    head::verify_head,
-    Driver, Got, Store, Want,
-};
+use csl_eth_client::{head::verify_head, Driver, Got, Store, Want};
+use csl_eth_history::beacon::{AccumError, Accumulator, BeaconAnchor};
 use std::{
     collections::{BTreeMap, HashMap},
     time::{Duration, SystemTime},

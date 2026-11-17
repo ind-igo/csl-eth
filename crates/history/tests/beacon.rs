@@ -7,10 +7,10 @@
 //! and correct (by the walk) when it is not.
 
 use alloy_primitives::B256;
-use csl_eth_client::{
+use csl_eth_client::{DirDriver, Driver, Got, Store, Want};
+use csl_eth_history::{
     beacon::{AccumError, Accumulator, BeaconAnchor},
-    history::{Anchor, HeaderRoute, History, Insufficient},
-    DirDriver, Driver, Got, Store, Want,
+    {Anchor, HeaderRoute, History, Insufficient},
 };
 use csl_eth_store::{
     beacon::{

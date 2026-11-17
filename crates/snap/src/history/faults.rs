@@ -13,14 +13,12 @@
 
 use crate::history::BlockCache;
 use alloy_primitives::B256;
-use csl_eth_client::{
-    history::{Anchor, History, LogAt, LogTier, Term},
-    DirDriver,
-};
+use csl_eth_client::DirDriver;
+use csl_eth_history::{Anchor, History, LogAt, LogTier, Term};
 use csl_eth_store::{
     history::{
-        decode_header, decode_receipt, encode_receipt, locator, log_lookup_key, tx_hash, tx_lookup_key,
-        write_history_tampered, Block, BlockSource, Tamper, H_TRANSACTIONS,
+        decode_header, decode_receipt, encode_receipt, locator, log_lookup_key, tx_hash,
+        tx_lookup_key, write_history_tampered, Block, BlockSource, Tamper, H_TRANSACTIONS,
     },
     CODE_BLOB_THRESHOLD,
 };
@@ -72,7 +70,13 @@ impl Fault {
     /// does depends on the target block, so these may also end every read
     /// `Insufficient`.
     fn may_shorten(self) -> bool {
-        matches!(self, Fault::LogLookupOmitsBlock | Fault::LogDropped | Fault::ReceiptsFromAnotherBlock | Fault::ReceiptAltered)
+        matches!(
+            self,
+            Fault::LogLookupOmitsBlock
+                | Fault::LogDropped
+                | Fault::ReceiptsFromAnotherBlock
+                | Fault::ReceiptAltered
+        )
     }
 }
 
@@ -111,7 +115,13 @@ fn truth(src: &dyn BlockSource, term: &Term, from: u64, to: u64) -> Result<Vec<L
         for (i, r) in b.receipts.iter().enumerate() {
             for l in decode_receipt(r).map_err(String::from)?.logs {
                 if term.matches(&l) {
-                    out.push(LogAt { block_number: n, tx_index: i as u64, log_index: li, block_hash: b.hash, log: l });
+                    out.push(LogAt {
+                        block_number: n,
+                        tx_index: i as u64,
+                        log_index: li,
+                        block_hash: b.hash,
+                        log: l,
+                    });
                 }
                 li += 1;
             }
@@ -132,7 +142,11 @@ fn target(src: &dyn BlockSource, first: u64, last: u64) -> Result<(u64, Term), S
         if b.txs.len() < 2 {
             continue;
         }
-        if let Some(l) = decode_receipt(&b.receipts[0]).map_err(String::from)?.logs.first() {
+        if let Some(l) = decode_receipt(&b.receipts[0])
+            .map_err(String::from)?
+            .logs
+            .first()
+        {
             let t = (n, Term::Address(l.address));
             if b.txs.iter().take(24).any(|t| t.len() > CODE_BLOB_THRESHOLD) {
                 return Ok(t);
@@ -140,11 +154,22 @@ fn target(src: &dyn BlockSource, first: u64, last: u64) -> Result<(u64, Term), S
             fallback.get_or_insert(t);
         }
     }
-    fallback.ok_or_else(|| "no block in the span has two transactions and a log in its first receipt".into())
+    fallback.ok_or_else(|| {
+        "no block in the span has two transactions and a log in its first receipt".into()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_hostile(src: &dyn BlockSource, dir: &Path, first: u64, anchor: (u64, B256), epsilon: u16, fault: Fault, t: u64, term: &Term) -> Result<(), String> {
+fn write_hostile(
+    src: &dyn BlockSource,
+    dir: &Path,
+    first: u64,
+    anchor: (u64, B256),
+    epsilon: u16,
+    fault: Fault,
+    t: u64,
+    term: &Term,
+) -> Result<(), String> {
     let other = src.block(t + 1)?.receipts;
     let tb = src.block(t)?;
     let term = *term;
@@ -159,7 +184,9 @@ fn write_hostile(src: &dyn BlockSource, dir: &Path, first: u64, anchor: (u64, B2
                 r[mid] ^= 0x01;
             }
             Fault::LogDropped => {
-                let Ok(mut r) = decode_receipt(&b.receipts[0]) else { return };
+                let Ok(mut r) = decode_receipt(&b.receipts[0]) else {
+                    return;
+                };
                 if let Some(i) = r.logs.iter().position(|l| term.matches(l)) {
                     r.logs.remove(i);
                 }
@@ -193,11 +220,19 @@ fn write_hostile(src: &dyn BlockSource, dir: &Path, first: u64, anchor: (u64, B2
     // The target's packed transactions point one byte early: the wrong
     // bytes, under the entry's hash.
     let packed = move |table: u16, key: &[u8; 32], r: &mut csl_run::PackedRef| {
-        if fault == Fault::PackedOffsetWrong && table == H_TRANSACTIONS && key[..5] == t.to_be_bytes()[3..] {
+        if fault == Fault::PackedOffsetWrong
+            && table == H_TRANSACTIONS
+            && key[..5] == t.to_be_bytes()[3..]
+        {
             r.off = r.off.checked_sub(1).unwrap_or(1);
         }
     };
-    let tamper = Tamper { block: &block, tx_lookup: &tx_lookup, log_lookup: &log_lookup, packed: &packed };
+    let tamper = Tamper {
+        block: &block,
+        tx_lookup: &tx_lookup,
+        log_lookup: &log_lookup,
+        packed: &packed,
+    };
     let _ = std::fs::remove_dir_all(dir);
     write_history_tampered(dir, src, first, anchor, epsilon, &tamper).map_err(|e| e.to_string())?;
     Ok(())
@@ -205,20 +240,35 @@ fn write_hostile(src: &dyn BlockSource, dir: &Path, first: u64, anchor: (u64, B2
 
 /// The table over `blocks` blocks of the cache ending at `anchor`, the
 /// hostile buckets written under `dir`.
-pub fn run(work: &Path, dir: &Path, anchor: (u64, B256), blocks: u64, epsilon: u16) -> Result<Report, String> {
+pub fn run(
+    work: &Path,
+    dir: &Path,
+    anchor: (u64, B256),
+    blocks: u64,
+    epsilon: u16,
+) -> Result<Report, String> {
     let src = BlockCache(work.to_path_buf());
     let (last, hash) = anchor;
     let first = last + 1 - blocks.clamp(8, last + 1);
     let (t, term) = target(&src, first, last)?;
     let a = Anchor { number: last, hash };
-    let topic = decode_receipt(&src.block(t)?.receipts[0]).map_err(String::from)?.logs[0].topics.first().map(|x| Term::Topic(*x));
+    let topic = decode_receipt(&src.block(t)?.receipts[0])
+        .map_err(String::from)?
+        .logs[0]
+        .topics
+        .first()
+        .map(|x| Term::Topic(*x));
     let terms: Vec<Term> = std::iter::once(term).chain(topic).collect();
     let mut rows = Vec::new();
     for fault in FAULTS {
         let fdir = dir.join(fault.name());
         write_hostile(&src, &fdir, first, anchor, epsilon, fault, t, &term)?;
-        let mut h = History::open(DirDriver::new(&fdir), a).map_err(|e| format!("{}: {e}", fault.name()))?;
-        let mut row = Row { fault: fault.name(), ..Default::default() };
+        let mut h = History::open(DirDriver::new(&fdir), a)
+            .map_err(|e| format!("{}: {e}", fault.name()))?;
+        let mut row = Row {
+            fault: fault.name(),
+            ..Default::default()
+        };
         let note = |row: &mut Row, e: String| {
             row.insufficient += 1;
             if !row.insufficient_reasons.contains(&e) && row.insufficient_reasons.len() < 6 {
@@ -231,7 +281,13 @@ pub fn run(work: &Path, dir: &Path, anchor: (u64, B256), blocks: u64, epsilon: u
                 row.reads += 1;
                 h.forget_headers();
                 match h.tx(&tx_hash(tx)).0 {
-                    Ok(r) if (r.block_number, r.index) == (n, i as u64) && &r.tx == tx && r.receipt_leaf == b.receipts[i] => row.correct += 1,
+                    Ok(r)
+                        if (r.block_number, r.index) == (n, i as u64)
+                            && &r.tx == tx
+                            && r.receipt_leaf == b.receipts[i] =>
+                    {
+                        row.correct += 1
+                    }
                     Ok(_) => row.wrong += 1,
                     Err(e) => note(&mut row, e.to_string()),
                 }
@@ -254,7 +310,13 @@ pub fn run(work: &Path, dir: &Path, anchor: (u64, B256), blocks: u64, epsilon: u
                 h.forget_headers();
                 match h.logs(term, t - 3, t + 3, tier).0 {
                     Ok(r) if r.logs == want => row.correct += 1,
-                    Ok(r) if tier == LogTier::Indexed && fault.may_shorten() && r.logs.iter().all(|l| want.contains(l)) => row.short_indexed += 1,
+                    Ok(r)
+                        if tier == LogTier::Indexed
+                            && fault.may_shorten()
+                            && r.logs.iter().all(|l| want.contains(l)) =>
+                    {
+                        row.short_indexed += 1
+                    }
                     Ok(_) => row.wrong += 1,
                     Err(e) => note(&mut row, e.to_string()),
                 }
@@ -270,5 +332,12 @@ pub fn run(work: &Path, dir: &Path, anchor: (u64, B256), blocks: u64, epsilon: u
         rows.push(row);
     }
     let pass = rows.iter().all(|r| r.pass);
-    Ok(Report { first_block: first, anchor: last, target_block: t, term: term.to_string(), rows, pass })
+    Ok(Report {
+        first_block: first,
+        anchor: last,
+        target_block: t,
+        term: term.to_string(),
+        rows,
+        pass,
+    })
 }

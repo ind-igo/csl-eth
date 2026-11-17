@@ -63,9 +63,7 @@ pub mod http;
 #[cfg(feature = "http")]
 pub use http::HttpDriver;
 
-pub mod beacon;
 pub mod head;
-pub mod history;
 pub use head::{
     open_at_head, open_at_head_with, HeadOpenError, HeadOpener, TierChoice, VerifiedHead,
 };

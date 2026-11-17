@@ -6,8 +6,8 @@
 //! round once the slot is known (two the first time, for the head's
 //! preamble, which the session then keeps).
 
-use crate::{Pending, Store, VerifiedHead};
 use alloy_primitives::B256;
+use csl_eth_client::{Pending, Store, VerifiedHead};
 use csl_eth_store::beacon::{
     chunk_record_range, head_path, route, route_ranges, verify_block_hash, HeadPreamble,
     CAPELLA_PERIOD, HEAD_PREAMBLE, SLOTS_PER_HISTORICAL_ROOT,

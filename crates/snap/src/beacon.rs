@@ -21,13 +21,12 @@ pub mod ssz;
 
 use alloy_primitives::B256;
 use clap::{Args as ClapArgs, Subcommand};
-use csl_eth_client::{
-    beacon::{slot_of_timestamp, AccumError, Accumulator, BeaconAnchor},
-    head::verify_head,
-    history::{Anchor, HeaderRoute, History, HistoryCost},
-    DirDriver, Driver, Got, Store, VerifiedHead, Want,
-};
+use csl_eth_client::{head::verify_head, DirDriver, Driver, Got, Store, VerifiedHead, Want};
 use csl_eth_head::{Chain, DirSource};
+use csl_eth_history::{
+    beacon::{slot_of_timestamp, AccumError, Accumulator, BeaconAnchor},
+    {Anchor, HeaderRoute, History, HistoryCost},
+};
 use csl_eth_store::{
     beacon::{
         chunk_blocks, chunk_file, chunk_path, chunk_record_range, chunk_root, head_path,

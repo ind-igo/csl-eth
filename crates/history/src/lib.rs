@@ -45,12 +45,14 @@
 //! round more. Headers proven that way are held apart from the walked
 //! chain, which stays contiguous from the anchor. [`HeaderRoute`] picks.
 
-use crate::{
-    beacon::{slot_of_timestamp, Accumulator, BeaconAnchor},
+pub mod beacon;
+
+use crate::beacon::{slot_of_timestamp, Accumulator, BeaconAnchor};
+use alloy_primitives::B256;
+use csl_eth_client::{
     head::{verify_head, HeadError},
     is_pending, Driver, Hint, Pending, RunView, Store, VerifiedHead,
 };
-use alloy_primitives::B256;
 pub use csl_eth_store::history::{
     decode_header, decode_receipt, history_table_name, HeaderFields, HistoryManifest, Log,
     ReceiptFields, Term, HISTORY_TABLES, H_HEADERS, H_LOG_LOOKUP, H_RECEIPTS, H_TRANSACTIONS,
@@ -274,7 +276,10 @@ fn check_history_manifest(bytes: &[u8], anchor: &Anchor) -> Result<HistoryManife
     }
     let mut at = 0usize;
     for l in &m.tx_lookup {
-        let ok = m.periods.get(at).is_some_and(|p| p.period == l.first_period)
+        let ok = m
+            .periods
+            .get(at)
+            .is_some_and(|p| p.period == l.first_period)
             && l.last_period >= l.first_period;
         if !ok {
             return Err("history manifest tx_lookup pieces do not cover the periods".into());
@@ -316,7 +321,7 @@ impl<D: Driver> HistoryOpener<D> {
 
     pub fn round(&self) {
         if let Some(d) = &self.driver {
-            crate::drive(d, &self.store, true);
+            csl_eth_client::drive(d, &self.store, true);
         }
     }
 
@@ -1040,7 +1045,11 @@ impl<D: Driver> History<D> {
                             "packed entry in a period without a pack".into(),
                         )));
                     };
-                    if pr.off.checked_add(u64::from(pr.len)).is_none_or(|end| end > pack.bytes) {
+                    if pr
+                        .off
+                        .checked_add(u64::from(pr.len))
+                        .is_none_or(|end| end > pack.bytes)
+                    {
                         return Ok(Err(Insufficient::Blob(format!(
                             "packed value at {} (+{}) is past the pack's {} bytes",
                             pr.off, pr.len, pack.bytes

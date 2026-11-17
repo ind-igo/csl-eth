@@ -5,13 +5,13 @@
 use super::{acquire, faults, AcquireConfig, BlockCache};
 use alloy_primitives::{keccak256, Address, B256};
 use clap::{Args as ClapArgs, Subcommand};
-use csl_eth_client::{
-    head::verify_head,
-    history::{Anchor, History, HistoryCost, LogAt, LogTier, Term},
-    DirDriver, Driver, Got, HttpDriver, VerifiedHead, Want,
-};
+use csl_eth_client::{head::verify_head, DirDriver, Driver, Got, HttpDriver, VerifiedHead, Want};
+use csl_eth_history::{Anchor, History, HistoryCost, LogAt, LogTier, Term};
 use csl_eth_store::{
-    history::{decode_header, decode_receipt, history_table_name, tx_hash, write_history_with, BlockSource, HistoryManifest, HistoryOptions, HistoryTableStats},
+    history::{
+        decode_header, decode_receipt, history_table_name, tx_hash, write_history_with,
+        BlockSource, HistoryManifest, HistoryOptions, HistoryTableStats,
+    },
     producer::write_atomic,
     EPSILON,
 };
@@ -179,7 +179,11 @@ impl Driver for AnyDriver {
 }
 
 impl AnyDriver {
-    fn new(bucket: Option<&Path>, url: Option<&str>, proxy: Option<&str>) -> Result<AnyDriver, String> {
+    fn new(
+        bucket: Option<&Path>,
+        url: Option<&str>,
+        proxy: Option<&str>,
+    ) -> Result<AnyDriver, String> {
         match (bucket, url) {
             (Some(b), None) => Ok(AnyDriver::Dir(DirDriver::new(b))),
             (None, Some(u)) => Ok(AnyDriver::Http(HttpDriver::new(u, proxy)?)),
@@ -222,9 +226,15 @@ fn head_json(h: &VerifiedHead) -> Value {
 
 fn read_anchor(work: &Path) -> Result<Anchor, String> {
     let p = work.join("anchor.json");
-    let v: Value = serde_json::from_slice(&std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?).map_err(|e| e.to_string())?;
+    let v: Value =
+        serde_json::from_slice(&std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?)
+            .map_err(|e| e.to_string())?;
     let number = v["number"].as_u64().ok_or("anchor.json: no number")?;
-    let hash: B256 = v["hash"].as_str().ok_or("anchor.json: no hash")?.parse().map_err(|_| "anchor.json: bad hash")?;
+    let hash: B256 = v["hash"]
+        .as_str()
+        .ok_or("anchor.json: no hash")?
+        .parse()
+        .map_err(|_| "anchor.json: bad hash")?;
     Ok(Anchor { number, hash })
 }
 
@@ -236,7 +246,13 @@ pub async fn run(cmd: HistoryCmd) -> Result<Value, String> {
         HistoryCmd::Faults(a) => {
             let anchor = read_anchor(&a.work)?;
             let out = a.out.clone().unwrap_or_else(|| a.work.join("faults"));
-            let r = faults::run(&a.work, &out, (anchor.number, anchor.hash), a.blocks, a.epsilon)?;
+            let r = faults::run(
+                &a.work,
+                &out,
+                (anchor.number, anchor.hash),
+                a.blocks,
+                a.epsilon,
+            )?;
             serde_json::to_value(r).map_err(|e| e.to_string())
         }
     }
@@ -248,13 +264,24 @@ async fn build(a: BuildArgs) -> Result<Value, String> {
     let (anchor, head) = if a.offline {
         (read_anchor(&a.work)?, Value::Null)
     } else {
-        let checkpoint = a.checkpoint.ok_or("--checkpoint is required unless --offline")?;
-        let inner = AnyDriver::new(a.head_bucket.as_deref(), a.head_url.as_deref(), a.proxy.as_deref())?;
+        let checkpoint = a
+            .checkpoint
+            .ok_or("--checkpoint is required unless --offline")?;
+        let inner = AnyDriver::new(
+            a.head_bucket.as_deref(),
+            a.head_url.as_deref(),
+            a.proxy.as_deref(),
+        )?;
         let rec = Recording { inner, out: &a.out };
-        let h = verify_head(&rec, checkpoint, SystemTime::now()).map_err(|e| format!("head: {e}"))?;
-        let anchor = Anchor { number: h.execution.block_number, hash: h.execution.block_hash };
+        let h =
+            verify_head(&rec, checkpoint, SystemTime::now()).map_err(|e| format!("head: {e}"))?;
+        let anchor = Anchor {
+            number: h.execution.block_number,
+            hash: h.execution.block_hash,
+        };
         let doc = json!({ "number": anchor.number, "hash": anchor.hash, "head": head_json(&h) });
-        write_atomic(&a.work.join("anchor.json"), doc.to_string().as_bytes()).map_err(|e| e.to_string())?;
+        write_atomic(&a.work.join("anchor.json"), doc.to_string().as_bytes())
+            .map_err(|e| e.to_string())?;
         (anchor, head_json(&h))
     };
     let blocks = a.blocks.clamp(1, anchor.number + 1);
@@ -273,12 +300,25 @@ async fn build(a: BuildArgs) -> Result<Value, String> {
             max_stall: Duration::from_secs(a.stall_secs),
             ..Default::default()
         };
-        let s = acquire((anchor.number, anchor.hash), &a.work, cfg).await.map_err(|e| e.to_string())?;
+        let s = acquire((anchor.number, anchor.hash), &a.work, cfg)
+            .await
+            .map_err(|e| e.to_string())?;
         serde_json::to_value(s).map_err(|e| e.to_string())?
     };
     let started = Instant::now();
-    let mut opts = HistoryOptions { workers: a.workers, ..Default::default() };
-    let w = write_history_with(&a.out, &BlockCache(a.work.clone()), first, (anchor.number, anchor.hash), a.epsilon, &mut opts).map_err(|e| e.to_string())?;
+    let mut opts = HistoryOptions {
+        workers: a.workers,
+        ..Default::default()
+    };
+    let w = write_history_with(
+        &a.out,
+        &BlockCache(a.work.clone()),
+        first,
+        (anchor.number, anchor.hash),
+        a.epsilon,
+        &mut opts,
+    )
+    .map_err(|e| e.to_string())?;
     let mut totals: BTreeMap<&str, (u64, u64, u64, u64, u64)> = BTreeMap::new();
     let mut periods = Vec::new();
     let table_json = |t: &HistoryTableStats| {
@@ -339,7 +379,13 @@ fn open(s: &Source) -> Result<(History<AnyDriver>, Value), String> {
     match (s.checkpoint, &s.anchor_from) {
         (Some(c), None) => {
             let h = verify_head(&d, c, SystemTime::now()).map_err(|e| format!("head: {e}"))?;
-            let hist = History::open(d, Anchor { number: h.execution.block_number, hash: h.execution.block_hash })?;
+            let hist = History::open(
+                d,
+                Anchor {
+                    number: h.execution.block_number,
+                    hash: h.execution.block_hash,
+                },
+            )?;
             Ok((hist, head_json(&h)))
         }
         (None, Some(w)) => Ok((History::open(d, read_anchor(w)?)?, Value::Null)),
@@ -375,9 +421,11 @@ fn read(a: ReadArgs) -> Result<Value, String> {
     if let Some(t) = a.tx {
         let (r, c) = h.tx(&t);
         out["tx"] = match r {
-            Ok(r) => json!({ "block": r.block_number, "block_hash": r.block_hash, "index": r.index, "tx_bytes": r.tx.len(),
+            Ok(r) => {
+                json!({ "block": r.block_number, "block_hash": r.block_hash, "index": r.index, "tx_bytes": r.tx.len(),
                               "status": r.receipt.success, "cumulative_gas_used": r.receipt.cumulative_gas_used,
-                              "logs": r.receipt.logs.len(), "block_receipt_bytes": r.block_receipt_bytes, "block_tx_bytes": r.block_tx_bytes }),
+                              "logs": r.receipt.logs.len(), "block_receipt_bytes": r.block_receipt_bytes, "block_tx_bytes": r.block_tx_bytes })
+            }
             Err(e) => json!({ "insufficient": e.to_string() }),
         };
         out["tx_cost"] = cost_json(&c);
@@ -385,8 +433,10 @@ fn read(a: ReadArgs) -> Result<Value, String> {
     if let Some(n) = a.header {
         let (r, c) = h.header(n);
         out["header"] = match r {
-            Ok(x) => json!({ "number": x.number, "hash": x.hash, "parent_hash": x.parent_hash, "timestamp": x.timestamp,
-                              "transactions_root": x.transactions_root, "receipts_root": x.receipts_root }),
+            Ok(x) => {
+                json!({ "number": x.number, "hash": x.hash, "parent_hash": x.parent_hash, "timestamp": x.timestamp,
+                              "transactions_root": x.transactions_root, "receipts_root": x.receipts_root })
+            }
             Err(e) => json!({ "insufficient": e.to_string() }),
         };
         out["header_cost"] = cost_json(&c);
@@ -441,7 +491,11 @@ impl Costs {
 
     fn json(self) -> Value {
         let n = self.requests.len().max(1) as f64;
-        let mean: BTreeMap<_, _> = self.table_bytes.iter().map(|(k, v)| (*k, *v as f64 / n)).collect();
+        let mean: BTreeMap<_, _> = self
+            .table_bytes
+            .iter()
+            .map(|(k, v)| (*k, *v as f64 / n))
+            .collect();
         json!({ "requests": dist(self.requests), "bytes": dist(self.bytes), "rounds": dist(self.rounds),
                 "headers_verified": dist(self.headers), "mean_table_bytes": mean })
     }
@@ -455,7 +509,13 @@ fn truth(src: &dyn BlockSource, term: &Term, from: u64, to: u64) -> Result<Vec<L
         for (i, r) in b.receipts.iter().enumerate() {
             for l in decode_receipt(r).map_err(String::from)?.logs {
                 if term.matches(&l) {
-                    out.push(LogAt { block_number: n, tx_index: i as u64, log_index: li, block_hash: b.hash, log: l });
+                    out.push(LogAt {
+                        block_number: n,
+                        tx_index: i as u64,
+                        log_index: li,
+                        block_hash: b.hash,
+                        log: l,
+                    });
                 }
                 li += 1;
             }
@@ -487,7 +547,11 @@ fn measure(a: MeasureArgs) -> Result<Value, String> {
         let i = rng.random_range(0..b.txs.len());
         picks.push((n, i, tx_hash(&b.txs[i]), b.receipts[i].clone()));
     }
-    let bands: [(&str, u64, u64); 3] = [("depth_lt_64", 0, 64), ("depth_64_1024", 64, 1024), ("depth_ge_1024", 1024, u64::MAX)];
+    let bands: [(&str, u64, u64); 3] = [
+        ("depth_lt_64", 0, 64),
+        ("depth_64_1024", 64, 1024),
+        ("depth_ge_1024", 1024, u64::MAX),
+    ];
     let mut cold: Vec<Costs> = bands.iter().map(|_| Costs::default()).collect();
     let mut all_cold = Costs::default();
     let mut receipt_share = Vec::new();
@@ -504,7 +568,10 @@ fn measure(a: MeasureArgs) -> Result<Value, String> {
             Err(e) => insufficient.push(format!("tx {hash}: {e}")),
         }
         let d = last - n;
-        let bi = bands.iter().position(|b| d >= b.1 && d < b.2).expect("bands cover");
+        let bi = bands
+            .iter()
+            .position(|b| d >= b.1 && d < b.2)
+            .expect("bands cover");
         cold[bi].add(&c);
         all_cold.add(&c);
     }
@@ -556,8 +623,16 @@ fn measure(a: MeasureArgs) -> Result<Value, String> {
     by_count.sort();
     let span = last - first + 1;
     let busy = by_count.last().map(|x| x.1).ok_or("no logs in the span")?;
-    let one_pct = by_count.iter().min_by_key(|(c, _)| c.abs_diff(span / 100)).map(|x| x.1).expect("non-empty");
-    let rare = by_count.iter().find(|(c, _)| *c == 1).map(|x| x.1).unwrap_or(busy);
+    let one_pct = by_count
+        .iter()
+        .min_by_key(|(c, _)| c.abs_diff(span / 100))
+        .map(|x| x.1)
+        .expect("non-empty");
+    let rare = by_count
+        .iter()
+        .find(|(c, _)| *c == 1)
+        .map(|x| x.1)
+        .unwrap_or(busy);
     let transfer = keccak256("Transfer(address,address,uint256)");
     let terms = [
         ("busy_address", Term::Address(busy)),
@@ -577,7 +652,9 @@ fn measure(a: MeasureArgs) -> Result<Value, String> {
                 h.forget();
                 let (r, c) = h.logs(term, from, to, tier);
                 let (n, fetched, without) = match r {
-                    Ok(l) if l.logs == want => (l.logs.len(), l.blocks_fetched, l.blocks_without_match),
+                    Ok(l) if l.logs == want => {
+                        (l.logs.len(), l.blocks_fetched, l.blocks_without_match)
+                    }
                     Ok(l) => {
                         wrong += 1;
                         (l.logs.len(), l.blocks_fetched, l.blocks_without_match)
@@ -595,13 +672,23 @@ fn measure(a: MeasureArgs) -> Result<Value, String> {
 
     // Table sizes, from the manifest.
     let mut tables: BTreeMap<&str, (u64, u64, u64)> = BTreeMap::new();
-    for t in m.periods.iter().flat_map(|p| &p.tables).chain(m.tx_lookup.iter().filter_map(|l| l.table.as_ref())) {
+    for t in m
+        .periods
+        .iter()
+        .flat_map(|p| &p.tables)
+        .chain(m.tx_lookup.iter().filter_map(|l| l.table.as_ref()))
+    {
         let e = tables.entry(history_table_name(t.table_id)).or_default();
         e.0 += t.page_count;
         e.1 += u64::from(t.model_bytes);
         e.2 += t.entry_count;
     }
-    let pack_bytes: u64 = m.periods.iter().filter_map(|p| p.pack).map(|k| k.bytes).sum();
+    let pack_bytes: u64 = m
+        .periods
+        .iter()
+        .filter_map(|p| p.pack)
+        .map(|k| k.bytes)
+        .sum();
     let tables: Vec<Value> = tables
         .iter()
         .map(|(n, (pages, model, entries))| {
