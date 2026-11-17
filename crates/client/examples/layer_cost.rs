@@ -1,6 +1,7 @@
 //! What a read costs on a published layered snapshot, with and without the
-//! layers' hints, against the plain base: requests, bytes, rounds, layer
-//! runs asked, and the requests each run took.
+//! layers' hints (and with the hints but no owner index), against the plain
+//! base: requests, bytes, rounds, layer runs asked, and the requests each run
+//! took.
 //!
 //!   cargo run --release --features http -p csl-eth-client --example layer_cost -- \
 //!       https://storage.googleapis.com/csl-eth-demo/full 0x<block hash> 0x<state root> \
@@ -18,6 +19,7 @@ type Log = Rc<RefCell<BTreeMap<String, u64>>>;
 struct Probe {
     inner: HttpDriver,
     hints: bool,
+    owners: bool,
     log: Log,
 }
 
@@ -30,7 +32,9 @@ impl Driver for Probe {
             let rel = match w {
                 Want::File { rel } | Want::Range { rel, .. } => rel.clone(),
             };
-            if !self.hints && rel.ends_with(".hints") {
+            if (!self.hints && rel.ends_with(".hints"))
+                || (!self.owners && rel.ends_with(".owners"))
+            {
                 out.push((i, Ok(None)));
                 continue;
             }
@@ -85,6 +89,9 @@ fn main() {
         ("WETH slot 0", Key::Slot(address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), U256::from(0))),
         ("The DAO slot 0", Key::Slot(address!("BB9bC244D798123fDe783fCc1C72d3Bb8C189413"), U256::from(0))),
         ("CryptoPunks slot 0", Key::Slot(address!("b47e3cd837dDF8e4c57F05d70Ab865de6e193BBB"), U256::from(0))),
+        // Quiet: no storage change since the base when this was written.
+        ("Uniswap v1 slot 0", Key::Slot(address!("c0a47dFe034B400B8bDDf2D2EA1D6F8f0dB8fBc1"), U256::from(0))),
+        ("REP v1 slot 0", Key::Slot(address!("E94327D07Fc17907b4DB788E5aDf2ed424adDff6"), U256::from(0))),
     ];
     let runs_named = |log: &Log| -> String {
         let l = log.borrow();
@@ -95,13 +102,14 @@ fn main() {
             .join(" ")
     };
     for (name, k) in &keys {
-        for (mode, hash, sroot, hints) in [
-            ("base only", base, base_root, true),
-            ("hinted", at, root, true),
-            ("unhinted", at, root, false),
+        for (mode, hash, sroot, hints, owners) in [
+            ("base only", base, base_root, true, true),
+            ("hinted", at, root, true, true),
+            ("no index", at, root, true, false),
+            ("unhinted", at, root, false, false),
         ] {
             let log: Log = Default::default();
-            let d = Probe { inner: HttpDriver::new(url, None).unwrap(), hints, log: log.clone() };
+            let d = Probe { inner: HttpDriver::new(url, None).unwrap(), hints, owners, log: log.clone() };
             let mut snap = Snapshot::open(d, Some(hash), sroot).unwrap();
             log.borrow_mut().clear();
             let (r, c) = read(&mut snap, k);
