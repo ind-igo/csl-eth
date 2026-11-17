@@ -22,7 +22,7 @@ site=browser/site
 cc='public, max-age=300'
 up() { gcloud storage cp --gzip-local-all --cache-control="$cc" "$@"; }
 
-up --content-type=text/html "$site/index.html" "$site/viz.html" "gs://$bucket/"
+up --content-type=text/html "$site/index.html" "$site/viz.html" "$site/mini.html" "gs://$bucket/"
 up --content-type=text/javascript "$site"/dist/*.js "gs://$bucket/dist/"
 up --content-type=text/javascript "$site"/pkg/*.js "gs://$bucket/pkg/"
 up --content-type=application/json "$site"/dist/*.map "gs://$bucket/dist/"

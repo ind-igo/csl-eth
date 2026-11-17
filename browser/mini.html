@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>csl-eth · minimal light client</title>
+    <style>
+      :root {
+        --bg: #0d1016;
+        --panel: #131821;
+        --panel2: #171d28;
+        --line: #252d3b;
+        --ink: #e8ecf3;
+        --ink2: #aab3c2;
+        --muted: #737d8f;
+        --faint: #4a5365;
+        --ok: #4ade80;
+        --warn: #fbbf24;
+        --bad: #f87171;
+        --accent: #3987e5;
+        --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        color-scheme: dark;
+      }
+      * { box-sizing: border-box; }
+      [hidden] { display: none !important; }
+      html, body { margin: 0; background: var(--bg); color: var(--ink); }
+      body { font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; min-height: 100vh; overflow-x: hidden; }
+      a { color: var(--accent); }
+      .mono { font-family: var(--mono); }
+      :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+      .app { max-width: 980px; margin: 0 auto; padding: 16px 24px 48px; display: grid; gap: 12px; }
+      header { display: grid; grid-template-columns: 1fr auto; align-items: baseline; gap: 4px 20px; }
+      header h1 { font-size: 19px; margin: 0; font-weight: 650; letter-spacing: -0.015em; }
+      header .sub { grid-column: 1 / -1; color: var(--ink2); font-size: 13.5px; margin: 0; max-width: 92ch; }
+      header nav { display: flex; gap: 16px; font-size: 13px; }
+      header nav a { color: var(--ink2); text-decoration: none; }
+      header nav a:hover { color: var(--ink); }
+
+      .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+      input, button { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+      input.mono { font-family: var(--mono); font-size: 12px; }
+      #address { flex: 1 1 340px; min-width: 0; }
+      #slot { flex: 0 1 150px; min-width: 0; }
+      button { cursor: pointer; }
+      button.primary { background: var(--accent); border-color: transparent; color: #fff; font-weight: 600; padding: 5px 16px; }
+      button:disabled { opacity: 0.45; cursor: default; }
+      label.tog { display: inline-flex; align-items: center; gap: 5px; color: var(--ink2); cursor: pointer; user-select: none; }
+      label.tog input { margin: 0; }
+      label.tog.danger input { accent-color: var(--bad); }
+      .chips { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+      .chips .lbl { color: var(--muted); font-size: 12px; margin-right: 2px; }
+      button.chip { font-size: 12px; padding: 3px 9px; color: var(--ink2); background: transparent; border-radius: 999px; }
+      button.chip:hover:not(:disabled) { border-color: var(--ink2); color: var(--ink); }
+
+      .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+      #status { font-size: 15px; font-weight: 600; color: var(--ink2); overflow-wrap: anywhere; }
+      #status.ok { color: var(--ok); }
+      #status.bad { color: var(--bad); }
+      #tampered { margin-top: 6px; color: var(--bad); font-size: 12.5px; overflow-wrap: anywhere; }
+      .stats { display: flex; flex-wrap: wrap; gap: 6px 22px; margin-top: 12px; }
+      .stats div { display: grid; }
+      .stats b { font-size: 22px; font-weight: 650; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+      .stats span { color: var(--muted); font-size: 11.5px; }
+
+      .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+      h2 { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
+      dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 5px 14px; margin: 0; }
+      dt { color: var(--muted); }
+      dd { margin: 0; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; color: var(--ink); }
+      dd .note { font-family: ui-sans-serif, system-ui, sans-serif; color: var(--muted); font-size: 12px; }
+      ol.chain { margin: 0; padding: 0 0 0 18px; color: var(--ink2); display: grid; gap: 6px; }
+      ol.chain li::marker { color: var(--ok); }
+      ol.chain .mono { font-size: 12px; overflow-wrap: anywhere; }
+      .empty { color: var(--muted); }
+
+      .about { color: var(--ink2); font-size: 13.5px; line-height: 1.55; max-width: 80ch; }
+      .about p { margin: 0 0 8px; }
+      .about b { color: var(--ink); }
+
+      @media (max-width: 760px) {
+        .app { padding: 16px; }
+        .grid { grid-template-columns: 1fr; }
+        #address, #slot { flex: 1 1 100%; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <h1>Ethereum state, checked by one TypeScript file</h1>
+        <nav><a href="index.html">Full version</a><a href="https://github.com/ind-igo/csl-eth">GitHub</a></nav>
+        <p class="sub">A minimal light client for the same bucket. It fetches byte ranges of static files, checks the beacon chain's signatures and the state trie's hashes with noble's BLS and hash code, and shows only what checks out.</p>
+      </header>
+
+      <form class="bar" id="form">
+        <input id="address" class="mono" aria-label="address" placeholder="address, 0x…" spellcheck="false" autocomplete="off" />
+        <input id="slot" class="mono" aria-label="storage slot" placeholder="storage slot (optional)" spellcheck="false" autocomplete="off" />
+        <label class="tog"><input id="code" type="checkbox" />code</label>
+        <label class="tog danger"><input id="tamper" type="checkbox" />tamper next read</label>
+        <button id="read" class="primary" type="submit">Read</button>
+      </form>
+      <div class="chips" id="examples"><span class="lbl">Examples</span></div>
+
+      <section class="card" aria-live="polite">
+        <div id="status">Pick an example or paste an address.</div>
+        <div id="tampered" hidden></div>
+        <div class="stats" id="stats" hidden>
+          <div><b id="s-block">–</b><span>block</span></div>
+          <div><b id="s-rounds">–</b><span>rounds</span></div>
+          <div><b id="s-requests">–</b><span>requests</span></div>
+          <div><b id="s-bytes">–</b><span>fetched</span></div>
+          <div><b id="s-ms">–</b><span>time</span></div>
+        </div>
+      </section>
+
+      <div class="grid">
+        <section class="card">
+          <h2>Answer</h2>
+          <dl id="answer"><dd class="empty">Nothing yet.</dd></dl>
+        </section>
+        <section class="card">
+          <h2>Why it can be trusted</h2>
+          <ol class="chain" id="chain"><li class="empty">The proof steps appear here after a read.</li></ol>
+        </section>
+      </div>
+
+      <section class="about">
+        <p><b id="lines">The whole verifier is one file.</b> Every read starts from nothing: it fetches the head files, the snapshot's manifest and a few hundred 4 KB pages, and refuses the answer if any signature or hash fails. A page byte that is flipped in transit is caught by the trie's keccak hashes; a flipped head byte, by the committee's signature or a Merkle branch.</p>
+        <p>Left out, compared with the full version: layer hints (so it asks every layer), the owner index, checkpoint rotation, the finalized tier and the visualization. None of them is needed for correctness.</p>
+      </section>
+    </div>
+    <script type="module" src="dist/mini.js"></script>
+  </body>
+</html>

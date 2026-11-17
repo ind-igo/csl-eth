@@ -1,7 +1,9 @@
-// The dev server: bundles `src/viz.ts` into `dist/` with Bun, then serves `index.html`, `dist/*` and the wasm-bindgen output
+// The dev server: bundles `src/viz.ts` and the minimal client's
+// `mini/mini.ts` into `dist/` with Bun, then serves `index.html`,
+// `mini.html`, `dist/*` and the wasm-bindgen output
 // in `pkg/*` (`.wasm` as `application/wasm`, so the module compiles while
 // streaming). With `--site <dir>` it instead assembles a static site there
-// (index.html, and viz.html as a copy for old links; dist/, pkg/) for
+// (index.html, viz.html as a copy for old links, mini.html; dist/, pkg/) for
 // hosting, and exits.
 //
 //   bun src/serve.ts [--port 8791]
@@ -22,16 +24,24 @@ const TYPES: Record<string, string> = {
 };
 
 export async function build(): Promise<void> {
-  const out = await Bun.build({
-    entrypoints: [join(ROOT, "src/viz.ts")],
-    outdir: join(ROOT, "dist"),
-    target: "browser",
-    format: "esm",
-    sourcemap: "linked",
-  });
-  if (!out.success) {
-    for (const l of out.logs) console.error(l);
-    throw new Error("bun build failed");
+  // The minimal client's page states its verifier's length, counted here.
+  const lines = readFileSync(join(ROOT, "mini/verify.ts"), "utf8").trimEnd().split("\n").length;
+  for (const [entry, define] of [
+    ["src/viz.ts", {}],
+    ["mini/mini.ts", { __VERIFY_LINES__: String(lines) }],
+  ] as const) {
+    const out = await Bun.build({
+      entrypoints: [join(ROOT, entry)],
+      outdir: join(ROOT, "dist"),
+      target: "browser",
+      format: "esm",
+      sourcemap: "linked",
+      define,
+    });
+    if (!out.success) {
+      for (const l of out.logs) console.error(l);
+      throw new Error(`bun build of ${entry} failed`);
+    }
   }
 }
 
@@ -41,6 +51,7 @@ function site(dir: string) {
   mkdirSync(out, { recursive: true });
   cpSync(join(ROOT, "index.html"), join(out, "index.html"));
   cpSync(join(ROOT, "index.html"), join(out, "viz.html"));
+  cpSync(join(ROOT, "mini.html"), join(out, "mini.html"));
   cpSync(join(ROOT, "dist"), join(out, "dist"), { recursive: true });
   cpSync(join(ROOT, "pkg"), join(out, "pkg"), { recursive: true });
   // Static-assets Worker: cache the hashed-by-nothing assets for a short while.
