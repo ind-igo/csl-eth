@@ -68,10 +68,11 @@ bucket's region, 2026-11-17; `docs/decisions.md` has the detail):
   uploaded 3.05 GB in 1,402 files. Its last attempt took 27 minutes (fetch 7,
   materialize 7, build and read-back 9, upload 4); the bucket served the old
   side by range, about $7 of reads.
-- **Reads over layers,** cold, against the base alone: an account 1.2× the
-  requests, a slot of a contract that changed recently 1.4×, an absent
-  account 2.5×, a slot of a contract that changes every block (USDT, WETH)
-  3.5×. The cause and the fix are in `docs/decisions.md`.
+- **Reads over layers,** cold, against the base alone, eight layers: an
+  account 0.85× the requests, an absent account 1.9×, a slot of a contract
+  that changed recently 1.6× to 1.7×, a slot of USDT 1.5× (3.5× before
+  storage hints by contract and path), WETH 2.2×. Most of what remains is
+  the since-base layer, which carries no hints (`docs/decisions.md`).
 - **Cost:** about $30 a month (the VM and its disks about $22, about
   50,000 writes a day about $8), plus about $3.60 of bucket reads per day of
   gap when it has to catch up.
@@ -119,11 +120,8 @@ above. Details in `docs/decisions.md`.
   (`deploy/gcp/full-export.sh`: reth's snapshot, a sync, a 2.4 h export, a
   2.4 h upload, about $7) published the base. The layer since the base grows
   about 2.3 GB a day and carries no skip hints (it is too large), so every
-  read asks it; folding it into a new base (a rebase, a burst) is not built.
-- **Reads of hot contracts cost 3.5×.** Storage hints name only the
-  contracts a layer touched, so a contract that changes every block makes a
-  read ask every layer at every depth. Hints keyed by contract and path
-  prefix would fix it; not built.
+  read asks it, and it is now most of a read's extra cost (10 to 28 requests
+  for a slot). Folding it into a new base (a rebase, a burst) is not built.
 - **It depends on peers serving `snap/1`.** The tracker has no node: it
   needs mainnet peers that answer `GetTrieNodes` at the head, which snap/2
   removes. A restart used to take 2 to 26 minutes to find three such peers;
@@ -143,7 +141,10 @@ above. Details in `docs/decisions.md`.
   HTTP/3. Behind such a VPN, turning QUIC off in Chrome fixes it.
 - **The checkpoint.** The default root (slot 15,661,216, 2026-11-15) must be
   replaced before it leaves the weak-subjectivity period, around the end of
-  November.
+  November, so far by hand. Automatic rotation is sketched in
+  `docs/decisions.md`, not built: the tracker publishes a newer finalized
+  root's bootstrap, and the page moves to a root only if it proved that root
+  finalized itself.
   The page also accepts `?checkpoint=` and `?bucket=` from the URL without a
   warning.
 - **Gloas.** EIP-7732 removes the state root from the light-client header, so

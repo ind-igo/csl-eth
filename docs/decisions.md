@@ -554,4 +554,51 @@ The fix for the first is hints keyed by owner and storage path: for an owner wit
 
 **The VM.** RSS 765 MB of 4 GB, 2.7 GB available, 63 MB in swap, 20 GB of 99 GB on `/data`. Cost: about $22 a month for the spot VM and its disks, about $8 for about 50,000 writes a day, plus about $3.60 of bucket reads per day of gap.
 
-**Open.** Storage hints by owner and path, then the since-base layer at the top tier. A rebase. Overlapping steps with the head. The beacon accumulator's files for old headers. `head/fcr` is not published by the tracker (the page treats it as optional).
+**Open.** Storage hints by owner and path, then the since-base layer at the top tier (both done the same day, next section). A rebase. Overlapping steps with the head. The beacon accumulator's files for old headers. `head/fcr` is not published by the tracker (the page treats it as optional).
+
+## 2026-11-17: storage hints by contract and path; the since-base layer at the top tier
+
+**Path hints for hot contracts.** Each layer's hints now carry, besides the owners whose storage changed, a path hint for each owner with at least 64 changed storage nodes in the layer (`storage_paths` in `Hints`, keyed by the owner's first eight bytes). It is the same structure as the account hint: positions cut at the depth where they cover at most 1% of prefixes, plus the shallower positions with nothing below them. Hot owners are taken most nodes first, up to 2 × `HINT_CAP` entries in all. The tracker collects positions as it emits storage rows, which is the only place they exist, since the storage table's keys are hashed. It stops collecting past 4 M positions, so a catch-up's layer gets none, as it gets no other hints. The client plans a storage read with `Hints::storage_holds`. An owner the layer does not name gets No. A named owner with a path hint gets the hint's answer. A named owner without one gets Yes at its root and Maybe below, as before. A merge keeps an owner's path hint only if every merged layer that names the owner had one, and joins them at the shallower depth (`PathHint::union`). Hints only schedule: the walker checks every node against its parent's hash, so a wrong No or Yes costs a repair round, never an answer. The omp review (gpt-6.1, high) found no soundness issue. It did find that the test's "no hints" variants left hints in hint files, which is fixed. Old manifests read as before, and old pages ignore the field. A one-block layer's path hints are 2 to 8 KB, in its hint file.
+
+**The since-base layer at the top tier.** `compact` marks the oldest layer (everything since the base) as the top tier. The catch-up had written it at tier 0, so it was merged as a peer of the tier-0 layers after it, a 3 GB rewrite taking 70 to 95 s. Now a top-tier layer reaches it every 4^5 = 1,024 steps (about six hours). The deploy at 04:22 relabeled the live one, which by then ran to block 26,432,171: the catch-up's 8,903 blocks plus 1,185 blocks of later steps merged into it.
+
+**Synthetic.** `read_cost_over_n_layers_and_merged` now has a 3,000-slot contract that changes 45 slots every layer. Its first layer is 40 steps with its hints removed, standing in for a catch-up's layer over the cap. Requests for a hot slot, against a fresh build of the same state:
+
+| layers | path hints | owners only | no hints | merged into one |
+|---|---|---|---|---|
+| 4 | 1.37× | 1.94× | 2.34× | 1.52× |
+| 8 | 1.45× | 2.53× | 2.93× | 1.60× |
+| 16 | 1.75× | 3.83× | 4.43× | 1.58× |
+
+**Live.** `layer_cost.rs` at 06:11 UTC, block 26,432,883. The stack was the base, the since-base layer (10,088 blocks, no hints), a tier-4 layer of 392 blocks that merged pre-deploy layers and so has no path hints, and six layers of 2 to 131 blocks. One cold read each, in requests. The "before" column is the same probe at 04:00 on the pre-deploy stack of 7 layers.
+
+| read | base only | before (7 layers) | now (8 layers) | unhinted |
+|---|---|---|---|---|
+| vitalik.eth | 13 | 16 (1.2×) | 11 (0.85×) | 63 |
+| absent account | 10 | 25 (2.5×) | 19 (1.9×) | 52 |
+| USDT slot 1 | 53 | 188 (3.5×) | 81 (1.5×) | 286 |
+| WETH slot 0 | 58 | 200 (3.4×) | 125 (2.2×) | 309 |
+| The DAO slot 0 | 47 | 68 (1.45×) | 75 (1.6×) | 307 |
+| CryptoPunks slot 0 | 50 | 71 (1.4×) | 85 (1.7×) | 293 |
+
+By layer, USDT's read asked the storage runs of the six path-hinted layers 10, 0, 0, 3, 0 and 7 times (20 each unhinted), the tier-4 layer 6 times and the since-base layer 10 times. A cold contract's whole extra cost is the since-base layer, 27 to 28 requests; no other layer is asked. WETH gained less because three of the six layers have no path hint for it. WETH changes nearly every block, but a one-block layer often holds fewer than 64 of its nodes, so that layer names it without a path hint, and every merge it enters then drops WETH's hint. The tier-4 layer gets the same treatment until it reaches the since-base layer (within about 1,024 steps of 04:22).
+
+**Build.** In the 166 steps after the deploy, step build time had a median of 1.0 s and a maximum of 3.8 s. The slowest merge (the one that made the tier-4 layer) took 3.2 s. Before the fix, rewriting the since-base layer took 70 to 95 s.
+
+**Open.** A path hint for any owner named in every layer it merges into, whatever its count in one layer, or HOT_MIN lowered to about 16, so that WETH-like owners keep their hints. A rebase, which removes the since-base layer, now the largest cost of a read.
+
+**Peers after this restart.** 17 peers on the known list. Ten served within the first minute and twelve (the cap) by the third. The same restart without the list took 2 to 26 minutes to reach three.
+
+## 2026-11-17: automatic checkpoint rotation (sketch, not built)
+
+The page's one trust input is a beacon block root, and each one is good for the weak-subjectivity period it was chosen in. The current default (slot 15,661,216, 2026-11-15) has to be replaced before about the end of November, and so far each move has been by hand: find a finalized root several public endpoints agree on, publish its bootstrap, change the page's default, redeploy. The tracker and the page can do this between them without trusting the tracker any more than they do now.
+
+**What the page can already prove.** Opening from root C, the client applies the period updates `head/updates/<p>` from C's period to the current one, and each carries a finalized header whose finality branch and two-thirds signature `verify_update` checks against the committee it reached from C. The finalized head it opens on is proven the same way, and `VerifiedHead` already returns its `beacon_root`. So after an open, the client holds a set of roots it proved finalized starting from C. Any of them is as good a checkpoint as C, and newer.
+
+**The tracker's part.** Once per sync-committee period (about 27 hours), after the period's update is final, it takes the finalized header in `head/updates/<p>` for the period just ended, fetches the beacon node's `LightClientBootstrap` for that header's root R, checks the bootstrap against R and that a head verifies from it, and publishes `head/bootstrap/<R>` and then a pointer `head/checkpoint`: `{"root": R, "slot": …, "period": p}`. The pointer is not trusted, only a suggestion of which root has a bootstrap. The tracker keeps bootstraps and period updates back to about three weeks so older remembered roots still open. About 40 lines in `track.rs` beside `bootstrap_period` and `updates`.
+
+**The page's part.** The checkpoint is, in order: `?checkpoint=` from the URL, the root the page remembered (localStorage, read and written in try/catch, so a private window falls back), then the default in the page. After a successful open from C it reads `head/checkpoint`. It accepts R only if R is one of the finalized roots the client just proved from C, its slot is past C's, and `head/bootstrap/<R>` checks against R. Then it stores R as the remembered root. A bucket that lies in `head/checkpoint` can only stop the root from moving, never move it somewhere unproven. Rotation is a no-op when C is already in the current period, since no update is applied and C is fresh. The client side is a list of proven finalized roots out of `verify_tier` (head crate, about 20 lines), a wasm getter, and about 30 lines in `viz.ts` to show "checkpoint: remembered, advanced to slot …" in the chain-of-trust panel.
+
+**First visits.** A visitor without a remembered root uses the page's default. That default is as trusted as the page's code, since both come from the same bucket, so refreshing it adds no new trust. `site.sh` would read `head/checkpoint`, verify a head from it starting at the current default with the CLI (`csl-eth head`), and only then bake it in. A weekly re-deploy keeps the default inside its period. The tracker's own `--checkpoint` can stay as it is for this: it publishes bootstraps for newer roots but verifies its own heads from the root it started with. Its root ages out too, though. Advancing it with the same rule (a root it proved finalized) is the follow-up.
+
+**Deadline.** All of this has to be live before the current root ages out around the end of November, and a returning visitor needs to have opened the page once after it ships. Otherwise the fallback is the manual move described on 2026-11-16, which is the same steps.
