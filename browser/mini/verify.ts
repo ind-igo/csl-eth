@@ -119,10 +119,14 @@ export class Held {
   readonly bytes = new Map<string, Uint8Array>();
   readonly wants = new Map<string, Want>();
   readonly memo = new Map<string, unknown>();
+  /** Wants whose fetch failed: a refusal for whoever needs them, so another run can still answer. */
+  readonly failed = new Map<string, string>();
   static id = (w: Want) => (w.off === undefined ? w.path : `${w.path}@${w.off}+${w.len}`);
   /** The bytes if held, else noted as wanted. */
   get(w: Want): Uint8Array | undefined {
     const b = this.bytes.get(Held.id(w));
+    const f = this.failed.get(Held.id(w));
+    if (f !== undefined) refuse(f);
     if (!b) this.wants.set(Held.id(w), w);
     return b;
   }
@@ -133,6 +137,9 @@ export class Held {
   }
   put(w: Want, b: Uint8Array) {
     this.bytes.set(Held.id(w), b);
+  }
+  fail(w: Want, why: string) {
+    this.failed.set(Held.id(w), why);
   }
   once<T>(key: string, f: () => T): T {
     if (!this.memo.has(key)) this.memo.set(key, f());
@@ -283,8 +290,9 @@ function envelope(b: Uint8Array, what: string): J {
  * The sync committee's signature over `u.attested_header`: at least two
  * thirds of `keys` signed, and the aggregate verifies. Returns the signers.
  */
-function signed(u: J, keys: Uint8Array[] | undefined, what: string): number {
+function signed(u: J, keys: Uint8Array[] | undefined, what: string, nowSlot: number): number {
   const sigSlot = num(u?.signature_slot, `${what} signature_slot`);
+  if (sigSlot > nowSlot) refuse(`${what}: signed at slot ${sigSlot}, after the clock's ${nowSlot}`);
   if (!keys) return refuse(`${what}: no proven committee for period ${period(sigSlot)}`);
   if (Math.floor((Math.max(sigSlot, 1) - 1) / 32) < FULU_EPOCH) refuse(`${what}: signed before fulu, a fork this verifier does not know`);
   const bits = fixed(u?.sync_aggregate?.sync_committee_bits, COMMITTEE / 8, `${what} sync_committee_bits`);
@@ -322,7 +330,8 @@ export function verifyHead(h: Held, now: number): Head {
     const bootSlot = num(boot?.header?.beacon?.slot, "bootstrap slot");
     const sigSlot = num(opt?.signature_slot, "head/optimistic signature_slot");
     const [first, signedIn] = [period(bootSlot), period(sigSlot)];
-    const current = period(Math.floor((now / 1000 - GENESIS_TIME) / 12));
+    const nowSlot = Math.floor((now / 1000 - GENESIS_TIME) / 12);
+    const current = period(nowSlot);
     if (signedIn > current) refuse(`head signed in period ${signedIn}, after the clock's ${current}`);
     if (signedIn + 1 < current) refuse(`stale head: signed in period ${signedIn}, the clock is in ${current}`);
     const periods = Array.from({ length: Math.max(signedIn - first, 0) }, (_, i) => first + i);
@@ -343,7 +352,7 @@ export function verifyHead(h: Held, now: number): Head {
       const u = envelope(ups[i]!, `update ${p}`);
       const what = `update ${p}`;
       if (period(num(u?.attested_header?.beacon?.slot, `${what} slot`)) !== p) refuse(`${what} attests a header of another period`);
-      signed(u, keys.get(period(num(u.signature_slot, what))), what);
+      signed(u, keys.get(period(num(u.signature_slot, what))), what, nowSlot);
       const next = committee(u.next_sync_committee, `${what} next committee`);
       if (!branchOk(next.root, branch(u.next_sync_committee_branch, what), NEXT_COMMITTEE, b32(u.attested_header.beacon.state_root, what)))
         refuse(`${what}: next committee is not in the signed state`);
@@ -352,7 +361,7 @@ export function verifyHead(h: Held, now: number): Head {
 
     // The head: signed by its period's committee, and its execution header
     // is in the signed block body.
-    const participants = signed(opt, keys.get(signedIn), "head/optimistic");
+    const participants = signed(opt, keys.get(signedIn), "head/optimistic", nowSlot);
     const beacon = opt.attested_header.beacon;
     const slot = num(beacon.slot, "head slot");
     if (slot === 0 || slot < bootSlot) refuse(`head slot ${slot} is before the checkpoint's ${bootSlot}`);
@@ -410,7 +419,9 @@ function runs(h: Held, head: Head): Run[][] {
     const ref = (t: J): Ref => {
       const pages = num(t.page_count, "page_count");
       if (pages < 1 || pages > 2 ** 31) refuse("page_count outside [1, 2^31]");
-      return { root: b32(t.root, "root"), pages, eps: num(t.epsilon_pages, "epsilon_pages"), modelBytes: num(t.model_bytes, "model_bytes"), modelRoot: b32(t.model_root, "model_root") };
+      const eps = num(t.epsilon_pages, "epsilon_pages");
+      if (eps > 0xffff) refuse("epsilon_pages is a u16");
+      return { root: b32(t.root, "root"), pages, eps, modelBytes: num(t.model_bytes, "model_bytes"), modelRoot: b32(t.model_root, "model_root") };
     };
     return TABLE_FILES.map((file, table) => {
       const out: Omit<Run, "index" | "of">[] = [];
@@ -527,7 +538,7 @@ function search(p: number, count: number, eps: number, below: (q: number) => boo
   const down = below(p);
   const near = (step: number) => (down ? p - step : p + step);
   // Ask for the whole window at once (one round), then search it in order.
-  for (let step = 1; step <= eps + 1; step++) soft(() => near(step) >= 1 && near(step) <= count && covers(near(step)));
+  for (let step = 1; step <= Math.min(eps + 1, count); step++) soft(() => near(step) >= 1 && near(step) <= count && covers(near(step)));
   for (let step = 1; step <= eps + 1; step++) {
     const q = down ? p - step : p + step;
     if (q < 1 || q > count) break;
@@ -602,7 +613,7 @@ function lookup(h: Held, r: Run, key: Uint8Array): Entry | null {
     h.once(`page ${r.path} ${i}`, () => decodePage(h.need({ path: r.path, off: i * PAGE, len: PAGE, run: tag }), i === pages));
   const guess = predict(modelPage(h, r, m).model, k);
   // The pages either side come in the same round, as the full client's default.
-  for (const q of [guess - 1, guess + 1]) if (q >= 1 && q <= pages) h.get({ path: r.path, off: q * PAGE, len: PAGE, run: tag });
+  for (const q of [guess - 1, guess + 1]) if (q >= 1 && q <= pages) soft(() => h.get({ path: r.path, off: q * PAGE, len: PAGE, run: tag }));
   const p = search(guess, pages, r.ref.eps, (q) => cmp(key, page(q).lo) < 0, (q) => {
     const pg = page(q);
     return cmp(key, pg.lo) >= 0 && (cmp(key, pg.hi) < 0 || (q === pages && cmp(key, pg.hi) <= 0));
@@ -821,6 +832,7 @@ export type Answer = {
 /** Read one account, and one of its slots or its code, proven against the attested head. */
 export function read(h: Held, q: Query): Answer {
   if (q.address.length !== 20) refuse("an address is 20 bytes");
+  if (q.slot !== undefined && (q.slot < 0n || q.slot >= 2n ** 256n)) refuse("a slot is a 256-bit unsigned number");
   const head = verifyHead(h, q.now);
   const tables = runs(h, head);
   const hashed = keccak(q.address);

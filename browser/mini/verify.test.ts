@@ -1,7 +1,7 @@
 // bun test mini — RLP, SSZ, key encoding, the walk, and page decoding.
 import { describe, expect, test } from "bun:test";
 import {
-  beaconRoot, CHECKPOINT, decodeAccount, decodeNode, decodePage, decodeWord, EMPTY_ROOT, executionRoot, hex, keccak,
+  beaconRoot, CHECKPOINT, decodeAccount, Held, read, decodeNode, decodePage, decodeWord, EMPTY_ROOT, executionRoot, hex, keccak,
   KECCAK_EMPTY, merkleize, nibbles, Refused, rlpItem, storageKey, tableKey, unhex, walk,
 } from "./verify.ts";
 
@@ -135,5 +135,20 @@ describe("pages", () => {
     const dirty = p.slice();
     dirty[4000] = 1;
     expect(() => decodePage(dirty, true)).toThrow(/padding/);
+  });
+});
+
+describe("queries and fetches", () => {
+  test("a slot outside 256 bits is refused, not wrapped", () => {
+    const address = new Uint8Array(20);
+    for (const slot of [-1n, 2n ** 256n]) expect(() => read(new Held(), { address, slot, now: Date.now() })).toThrow(/256-bit/);
+  });
+  test("a failed fetch is a refusal for whoever needs it", () => {
+    const h = new Held();
+    const w = { path: "x.run", off: 4096, len: 4096 };
+    expect(h.get(w)).toBeUndefined();
+    h.fail(w, "fetch failed: HTTP 404");
+    expect(() => h.get(w)).toThrow(Refused);
+    expect(() => h.need(w)).toThrow(/404/);
   });
 });

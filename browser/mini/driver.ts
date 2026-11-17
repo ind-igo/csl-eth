@@ -48,21 +48,17 @@ export async function run(base: string, q: Query, mutate?: Mutate): Promise<Outc
       if (m && w.off !== undefined && m.off !== undefined && m.path === w.path && m.off + m.len! === w.off) m.len! += w.len!;
       else merged.push({ path: w.path, off: w.off, len: w.len });
     }
-    let got: Uint8Array[];
-    try {
-      got = await Promise.all(merged.map((w) => fetchWant(base, w)));
-    } catch (e) {
-      return done({ refused: `fetch failed: ${e instanceof Error ? e.message : e}` });
-    }
+    // A failed request fails only its own wants: the verifier refuses whatever needed them, and may answer from another run.
+    const got = await Promise.allSettled(merged.map((w) => fetchWant(base, w)));
     stats.requests += merged.length;
-    stats.bytes += got.reduce((n, b) => n + b.length, 0);
-    const bodies = wants.map((w) => {
+    stats.bytes += got.reduce((n, r) => n + (r.status === "fulfilled" ? r.value.length : 0), 0);
+    wants.forEach((w) => {
       const i = merged.findIndex((m) => m.path === w.path && (w.off === undefined || (m.off! <= w.off && w.off + w.len! <= m.off! + m.len!)));
-      return w.off === undefined ? got[i]! : got[i]!.slice(w.off - merged[i]!.off!, w.off - merged[i]!.off! + w.len!);
-    });
-    wants.forEach((w, i) => {
-      if (mutate && !tampered) tampered = mutate(w, bodies[i]!, stats.rounds) ?? undefined;
-      h.put(w, bodies[i]!);
+      const r = got[i]!;
+      if (r.status === "rejected") return h.fail(w, `fetch failed: ${r.reason instanceof Error ? r.reason.message : r.reason}`);
+      const body = w.off === undefined ? r.value : r.value.slice(w.off - merged[i]!.off!, w.off - merged[i]!.off! + w.len!);
+      if (mutate && !tampered) tampered = mutate(w, body, stats.rounds) ?? undefined;
+      h.put(w, body);
     });
   }
 }
