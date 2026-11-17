@@ -24,7 +24,8 @@ beside it. The page is served from the same Cloud Storage bucket it reads.
 
 Before the full state, the PoC kept 1/4096 of the state (account-trie prefix
 `1a7`) fresh every epoch, fetched over devp2p `snap` with no node. That
-producer is stopped (2026-11-16); its numbers below are kept for the record.
+producer is stopped (2026-11-16) and its R2 bucket and Worker deleted
+(2026-11-17); its numbers below are kept for the record.
 
 ## How a read is verified
 
