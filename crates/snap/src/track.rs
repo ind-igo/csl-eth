@@ -1774,7 +1774,47 @@ impl Heads {
         }
     }
 
+    /// The root heads are verified from.
+    pub fn checkpoint(&self) -> B256 {
+        self.checkpoint
+    }
+
+    /// Verify heads from `to` from now on: a root a head verified from the
+    /// current one proved finalized (what [`Heads::rotation`] suggests and
+    /// checks), once the mirror's `head/finality` verifies from it. None
+    /// when `to` is not newer than the current root (a newer
+    /// `--checkpoint`); an error, and the root stays, when it fails.
+    pub fn advance(
+        &mut self,
+        to: &Pointer,
+        now: SystemTime,
+    ) -> Result<Option<VerifiedHead>, String> {
+        if to.slot <= self.bootstrap_slot()? {
+            return Ok(None);
+        }
+        let vh = verify_tier(
+            &DirSource(self.root.clone()),
+            &self.chain,
+            to.root,
+            now,
+            Tier::Finalized,
+        )
+        .map_err(|e| e.to_string())?;
+        if vh.checkpoint_slot != to.slot {
+            return Err(format!(
+                "bootstrap at slot {}, not {}",
+                vh.checkpoint_slot, to.slot
+            ));
+        }
+        self.checkpoint = to.root;
+        Ok(Some(vh))
+    }
+
     fn bootstrap_period(&self) -> Result<u64, String> {
+        Ok(csl_eth_head::period_of(self.bootstrap_slot()?))
+    }
+
+    fn bootstrap_slot(&self) -> Result<u64, String> {
         let p = self.root.join(paths::bootstrap(&self.checkpoint));
         let boot = match fs::read(&p) {
             Ok(b) => b,
@@ -1792,7 +1832,7 @@ impl Heads {
                     .and_then(|s| s.parse::<u64>().ok())
             })
             .ok_or("bootstrap without a slot")?;
-        Ok(csl_eth_head::period_of(slot))
+        Ok(slot)
     }
 
     /// Fetch period updates `lo..=hi` into the mirror; with `all`, also
@@ -2737,7 +2777,10 @@ pub async fn run(args: Args) -> Result<(), String> {
         }
     }
     h.log.emit(json!({"ev": "start", "base": h.st.base, "head": h.st.head.block_number, "layers": h.st.layers.len(), "runs": h.store.run_counts()}));
-    let heads = Heads::new(&args.beacon, args.checkpoint, &root);
+    // Heads are verified from `--checkpoint` until the loop moves to the
+    // newest root the tracker has published in `head/checkpoint` (kept in
+    // track.json, so a restart moves on again).
+    let mut heads = Heads::new(&args.beacon, args.checkpoint, &root);
     let peer_cfg = heal::Config {
         peers: args.peers,
         udp_port: args.udp_port,
@@ -2788,6 +2831,21 @@ pub async fn run(args: Args) -> Result<(), String> {
                             Err(e) => {
                                 rotate_after = Some(Instant::now() + Duration::from_secs(600));
                                 h.log.emit(json!({"ev": "rotate_failed", "error": e}));
+                            }
+                        }
+                    }
+                    // The tracker's own root follows: the same root the page
+                    // adopts, proven finalized from the root it holds.
+                    if let Some(p) = h.st.checkpoint.filter(|p| p.root != heads.checkpoint()) {
+                        if rotate_after.is_none_or(|t| Instant::now() >= t) {
+                            let from = heads.checkpoint();
+                            match heads.advance(&p, SystemTime::now()) {
+                                Ok(None) => {}
+                                Ok(Some(vh)) => h.log.emit(json!({"ev": "checkpoint_advanced", "from": from, "to": p.root, "slot": p.slot, "head": vh.execution.block_number})),
+                                Err(e) => {
+                                    rotate_after = Some(Instant::now() + Duration::from_secs(600));
+                                    h.log.emit(json!({"ev": "advance_failed", "to": p.root, "error": e}));
+                                }
                             }
                         }
                     }
@@ -3334,6 +3392,26 @@ mod tests {
             ..p
         };
         assert_eq!(heads.rotation(&vh, Some(&gone)).unwrap(), Some(p));
+        // The tracker's own root follows: verified from the new root over
+        // the mirror, and never back.
+        let mut heads = heads;
+        let older = Pointer {
+            slot: 15_548_416,
+            ..p
+        };
+        assert_eq!(heads.advance(&older, now).unwrap(), None);
+        assert_eq!(heads.checkpoint(), cp);
+        let wrong_slot = Pointer {
+            slot: 15_556_609,
+            ..p
+        };
+        assert!(heads.advance(&wrong_slot, now).is_err());
+        assert_eq!(heads.checkpoint(), cp);
+        let vh2 = heads.advance(&p, now).unwrap().unwrap();
+        assert_eq!(heads.checkpoint(), r);
+        assert_eq!(vh2.execution, vh.execution);
+        assert_eq!(vh2.updates_applied, 1);
+        assert_eq!(heads.advance(&p, now).unwrap(), None, "already there");
         // The pointer is what the head crate adopts from the same head.
         let boot = fs::read(root.join(paths::bootstrap(&r))).unwrap();
         assert!(adopt(
