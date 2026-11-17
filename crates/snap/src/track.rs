@@ -2608,6 +2608,7 @@ pub async fn run(args: Args) -> Result<(), String> {
         peers: args.peers,
         udp_port: args.udp_port,
         out: args.work.join("peers.jsonl"),
+        known: Some(args.work.join("known-peers.json")),
         ..heal::Config::default()
     };
     let mut pool = Pool::start(&peer_cfg).map_err(|e| e.to_string())?;

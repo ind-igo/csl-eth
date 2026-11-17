@@ -79,6 +79,9 @@ pub struct Config {
     /// one before as soon as its header is out, back to back.
     pub per_block: bool,
     pub out: PathBuf,
+    /// Peers that served snap/1 nodes, kept across restarts and dialed
+    /// before discovery's candidates (see [`Known`]). None: not kept.
+    pub known: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -98,6 +101,7 @@ impl Default for Config {
             prefix: None,
             ages: vec![0, 16, 32, 64, 96, 112, 120, 124, 127, 128, 129, 132, 160, 192, 256, 512, 1024],
             max_cycle: Duration::from_secs(1200),
+            known: None,
             per_block: false,
             out: PathBuf::from("heal-probe.jsonl"),
         }
@@ -209,6 +213,70 @@ struct Shared {
     accepted: AtomicUsize,
     no_snap: AtomicUsize,
     dial_errors: Mutex<HashMap<String, usize>>,
+    known: Known,
+}
+
+/// Peers that served snap/1 nodes at the head, newest first: the file
+/// (`{"<enode>": <unix secs last served>}`) is rewritten when a peer first
+/// serves in a session and when it goes. A restart dials them before
+/// discovery's candidates, so the pool refills from peers known to serve
+/// instead of from the about one dial in a hundred discovery yields.
+pub struct Known {
+    path: Option<PathBuf>,
+    peers: Mutex<HashMap<String, u64>>,
+}
+
+/// The most peers [`Known`] keeps (the oldest served go first).
+const KNOWN_MAX: usize = 64;
+/// A known peer not served within this long is not dialed on startup.
+const KNOWN_FOR_SECS: u64 = 3 * 24 * 3600;
+
+impl Known {
+    pub fn open(path: Option<PathBuf>) -> Known {
+        let peers = path
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<HashMap<String, u64>>(&b).ok())
+            .unwrap_or_default();
+        Known { path, peers: Mutex::new(peers) }
+    }
+
+    /// The records to dial, last served first; unparsable or stale ones
+    /// are skipped.
+    pub fn records(&self) -> Vec<reth_network_peers::NodeRecord> {
+        let now = unix_f64() as u64;
+        let mut v: Vec<(u64, reth_network_peers::NodeRecord)> = self
+            .peers
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|(_, &t)| now.saturating_sub(t) <= KNOWN_FOR_SECS)
+            .filter_map(|(e, &t)| e.parse().ok().map(|r| (t, r)))
+            .collect();
+        v.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+        v.into_iter().map(|(_, r)| r).collect()
+    }
+
+    pub fn contains(&self, r: &reth_network_peers::NodeRecord) -> bool {
+        self.peers.lock().expect("lock").contains_key(&r.to_string())
+    }
+
+    /// Note that `r` served just now, and save.
+    pub fn served(&self, r: &reth_network_peers::NodeRecord) {
+        let mut m = self.peers.lock().expect("lock");
+        m.insert(r.to_string(), unix_f64() as u64);
+        while m.len() > KNOWN_MAX {
+            let oldest = m.iter().min_by_key(|(_, &t)| t).map(|(k, _)| k.clone()).expect("non-empty");
+            m.remove(&oldest);
+        }
+        let Some(path) = &self.path else { return };
+        let bytes = serde_json::to_vec(&*m).expect("serialize");
+        drop(m);
+        let tmp = path.with_extension("tmp");
+        if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, path)) {
+            warn!(path = %path.display(), error = %e, "known peers: not saved");
+        }
+    }
 }
 
 fn error_kind(e: &PeerError) -> String {
@@ -278,6 +346,9 @@ async fn worker_task(mut peer: Peer, shared: Arc<Shared>, idle_tx: mpsc::Sender<
                         } else {
                             empty_streak = 0;
                             served += 1;
+                            if served == 1 {
+                                shared.known.served(&peer.record);
+                            }
                         }
                         let _ = reply.send(NodesDone { peer: id, got, failed: false });
                         // A peer that has answered nothing for many current
@@ -351,6 +422,9 @@ async fn worker_task(mut peer: Peer, shared: Arc<Shared>, idle_tx: mpsc::Sender<
         }
     };
     shared.connected.fetch_sub(1, Ordering::Relaxed);
+    if served > 0 {
+        shared.known.served(&peer.record);
+    }
     log.emit(json!({"ev": "peer_down", "peer": id.to_string()[..16], "client": client, "reason": reason, "served": served}));
     peer.close().await;
     served
@@ -358,6 +432,8 @@ async fn worker_task(mut peer: Peer, shared: Arc<Shared>, idle_tx: mpsc::Sender<
 
 /// How long after a peer that served goes before it is dialed again.
 const REDIAL_AFTER: Duration = Duration::from_secs(60);
+/// Failed dials of a known peer before it is left to discovery.
+const KNOWN_RETRIES: u32 = 3;
 
 fn spawn_connector(shared: Arc<Shared>, idle_tx: mpsc::Sender<Worker>) {
     tokio::spawn(async move {
@@ -366,10 +442,20 @@ fn spawn_connector(shared: Arc<Shared>, idle_tx: mpsc::Sender<Worker>) {
         let mut candidates = discovery::start(key, shared.cfg.udp_port, fork_filter.clone(), true, true).await;
         let dials = Arc::new(tokio::sync::Semaphore::new(shared.cfg.dial_parallel));
         // Discovery hands out each node once, but full nodes evict peers
-        // at random to free slots: one that served is dialed again later.
+        // at random to free slots: one that served is dialed again later,
+        // and the peers that served before a restart are dialed first.
         let (redial_tx, mut redial_rx) = mpsc::unbounded_channel::<reth_network_peers::NodeRecord>();
+        let known = shared.known.records();
+        shared.log.emit(json!({"ev": "known_peers", "n": known.len()}));
+        for r in known {
+            let _ = redial_tx.send(r);
+        }
+        // Consecutive failed dials of a known peer, which is retried a few
+        // times (it may still hold our previous connection's slot).
+        let fails: Arc<Mutex<HashMap<PeerId, u32>>> = Default::default();
         loop {
             let record = tokio::select! {
+                biased;
                 Some(r) = redial_rx.recv() => r,
                 r = candidates.recv() => match r {
                     Some(r) => r,
@@ -384,6 +470,7 @@ fn spawn_connector(shared: Arc<Shared>, idle_tx: mpsc::Sender<Worker>) {
             let idle_tx = idle_tx.clone();
             let fork_filter = fork_filter.clone();
             let redial_tx = redial_tx.clone();
+            let fails = fails.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 shared.dialed.fetch_add(1, Ordering::Relaxed);
@@ -397,7 +484,21 @@ fn spawn_connector(shared: Arc<Shared>, idle_tx: mpsc::Sender<Worker>) {
                         }
                         peer.timeout = shared.cfg.timeout;
                         drop(_permit);
-                        if worker_task(peer, shared, idle_tx).await > 0 {
+                        let served = worker_task(peer, shared.clone(), idle_tx).await;
+                        // On every drop: a peer that served, or a known one
+                        // a few times more though it served nothing now.
+                        let again = {
+                            let mut f = fails.lock().expect("lock");
+                            if served > 0 {
+                                f.remove(&record.id);
+                                true
+                            } else {
+                                let n = f.entry(record.id).or_default();
+                                *n += 1;
+                                shared.known.contains(&record) && *n <= KNOWN_RETRIES
+                            }
+                        };
+                        if again {
                             tokio::time::sleep(REDIAL_AFTER).await;
                             let _ = redial_tx.send(record);
                         }
@@ -408,6 +509,18 @@ fn spawn_connector(shared: Arc<Shared>, idle_tx: mpsc::Sender<Worker>) {
                     Err(e) => {
                         debug!(addr = %record.address, error = %e, "dial failed");
                         *shared.dial_errors.lock().expect("lock").entry(error_kind(&e)).or_default() += 1;
+                        if shared.known.contains(&record) {
+                            let n = {
+                                let mut f = fails.lock().expect("lock");
+                                let n = f.entry(record.id).or_default();
+                                *n += 1;
+                                *n
+                            };
+                            if n <= KNOWN_RETRIES {
+                                tokio::time::sleep(REDIAL_AFTER * n).await;
+                                let _ = redial_tx.send(record);
+                            }
+                        }
                     }
                 }
             });
@@ -488,6 +601,7 @@ impl Pool {
             accepted: AtomicUsize::new(0),
             no_snap: AtomicUsize::new(0),
             dial_errors: Mutex::new(HashMap::new()),
+            known: Known::open(cfg.known.clone()),
         });
         let (idle_tx, idle_rx) = mpsc::channel::<Worker>(1024);
         spawn_connector(shared.clone(), idle_tx);
@@ -1062,6 +1176,7 @@ pub async fn run(cfg: Config) -> std::io::Result<()> {
         accepted: AtomicUsize::new(0),
         no_snap: AtomicUsize::new(0),
         dial_errors: Mutex::new(HashMap::new()),
+        known: Known::open(cfg.known.clone()),
     });
     let (idle_tx, idle_rx) = mpsc::channel::<Worker>(1024);
     spawn_connector(shared.clone(), idle_tx);
@@ -1429,5 +1544,42 @@ mod tests {
         // Nothing changed: nothing fetched.
         let c = diff(&mut mem, &cfg, new.root, new.root, (0, 0), deadline).await;
         assert_eq!(c.account.nodes + c.storage.nodes, 0);
+    }
+}
+
+#[cfg(test)]
+mod known_tests {
+    use super::*;
+
+    #[test]
+    fn known_peers_survive_a_restart_newest_first() {
+        let dir = std::env::temp_dir().join(format!("csl-known-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known-peers.json");
+        let _ = std::fs::remove_file(&path);
+        let rec = |i: u8| -> reth_network_peers::NodeRecord {
+            format!("enode://{}@10.0.0.{i}:30303", hex::encode([i; 64])).parse().unwrap()
+        };
+        let k = Known::open(Some(path.clone()));
+        assert!(k.records().is_empty());
+        k.served(&rec(1));
+        k.served(&rec(2));
+        // An older entry and a stale one, as a previous run would leave.
+        {
+            let mut m = k.peers.lock().unwrap();
+            m.insert(rec(1).to_string(), unix_f64() as u64 - 100);
+            m.insert(rec(3).to_string(), unix_f64() as u64 - KNOWN_FOR_SECS - 10);
+        }
+        k.served(&rec(4));
+        let again = Known::open(Some(path.clone()));
+        let got = again.records();
+        assert_eq!(got.len(), 3, "the stale peer is not dialed");
+        assert_eq!(got.last().unwrap(), &rec(1), "oldest served last");
+        assert!(again.contains(&rec(2)) && again.contains(&rec(3)));
+        for i in 10..(10 + KNOWN_MAX as u8 + 5) {
+            again.served(&rec(i));
+        }
+        assert_eq!(Known::open(Some(path.clone())).peers.lock().unwrap().len(), KNOWN_MAX);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
