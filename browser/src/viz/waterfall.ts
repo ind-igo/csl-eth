@@ -23,6 +23,8 @@ export function reqLabel(scene: Scene, file: string, offset: number | null, leng
   if (file.startsWith("head/")) return file;
   if (file.endsWith("manifest.json") || file.includes("manifest")) return "manifest";
   if (file.startsWith("blobs/")) return `blob ${file.slice(6, 14)}…`;
+  if (file.endsWith(".owners")) return `owner index ${file.slice(5, 13)}…`;
+  if (file.endsWith(".hints")) return `hints ${file.slice(5, 13)}…`;
   return fileShort(file);
 }
 

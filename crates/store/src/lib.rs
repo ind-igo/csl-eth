@@ -36,7 +36,8 @@ pub use export::{
     MIN_WORKER_BYTES,
 };
 pub use layer::{
-    layer_hints, layer_sorter, merge_layers, write_layer, write_layer_sorted,
+    index_owners, lacks_owner_index, layer_hints, layer_sorter, merge_layers, write_layer,
+    write_layer_sorted,
     write_layered_manifest, LayerRows, SORT_ACCOUNT, SORT_STORAGE,
 };
 pub use producer::{

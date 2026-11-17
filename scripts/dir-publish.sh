@@ -14,8 +14,8 @@ case "${1:-}" in
   put)
     [ $# -eq 3 ]
     mkdir -p "$(dirname "$root/$2")"
-    cp "$3" "$root/$2.part"
-    mv "$root/$2.part" "$root/$2"
+    cp "$3" "$root/$2.part.$$"
+    mv "$root/$2.part.$$" "$root/$2"
     ;;
   delete)
     [ $# -eq 2 ]

@@ -1826,6 +1826,7 @@ dependencies = [
  "ethereum_ssz_derive 0.9.1",
  "futures",
  "hex",
+ "libc",
  "rand 0.9.5",
  "rand_chacha 0.9.0",
  "reth-chainspec",

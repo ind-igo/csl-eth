@@ -43,10 +43,10 @@ use csl_eth_head::{
 use csl_eth_store::{
     blob_path,
     hints::{StoragePaths, StoragePathsBuilder},
-    layer_hints, layer_sorter, manifest_path, merge_layers, write_layer_sorted,
-    write_layered_manifest, Head, Layer, LayerRows, Manifest, CODE_BLOB_THRESHOLD, EPSILON,
-    LATEST_FILE, RUN_FORMAT, SORT_ACCOUNT, SORT_STORAGE, TABLE_ACCOUNT_NODES, TABLE_CODE,
-    TABLE_STORAGE_NODES,
+    index_owners, lacks_owner_index, layer_hints, layer_sorter, manifest_path, merge_layers,
+    write_layer_sorted, write_layered_manifest, Head, Layer, LayerRows, Manifest,
+    CODE_BLOB_THRESHOLD, EPSILON, LATEST_FILE, RUN_FORMAT, SORT_ACCOUNT, SORT_STORAGE,
+    TABLE_ACCOUNT_NODES, TABLE_CODE, TABLE_STORAGE_NODES,
 };
 use csl_eth_trie::{decode_word, Account, Nibbles, NodeKey, EMPTY_ROOT, KECCAK_EMPTY};
 use csl_run::Reader;
@@ -1673,14 +1673,16 @@ pub struct Tiered {
     pub tier: u8,
 }
 
-/// Merge the newest layers while a tier is full. The list stays ordered
-/// oldest first with tiers non-increasing, since merges only ever take the
-/// newest suffix. Returns the merges made.
+/// Merge the newest layers while a tier below the top is full. The list
+/// stays ordered oldest first with tiers non-increasing, since merges only
+/// ever take the newest suffix. Returns the merges made.
 ///
 /// The oldest layer is everything since the base, so it is the top tier
-/// whatever it was made as: a catch-up's one step made it at tier 0, and
-/// until 2026-11-17 it was then merged with the tier-0 layers after it, a
-/// rewrite of all of it (3 GB, 70 to 95 s) after 4 steps, then 16, then 64.
+/// whatever it was made as (a catch-up's one step made it at tier 0). A
+/// merge that makes a top-tier layer leaves it after the since-base layer;
+/// folding the two is [`top_job`]'s, which the tracker runs in the
+/// background (a rewrite of the whole since-base layer, 68 s at 3.4 GB and
+/// growing with it), never here.
 pub fn compact(
     root: &Path,
     layers: &mut Vec<Tiered>,
@@ -1691,20 +1693,16 @@ pub fn compact(
         first.tier = top;
     }
     let mut merges = 0;
-    loop {
-        let Some(last) = layers.last() else { break };
+    while let Some(last) = layers.last() {
         let tier = last.tier;
-        let same = layers.iter().rev().take_while(|l| l.tier == tier).count();
-        let take = if tier >= top {
-            if same < 2 {
-                break;
-            }
-            same
-        } else if same >= fanout.max(2) {
-            fanout.max(2)
-        } else {
+        if tier >= top {
             break;
-        };
+        }
+        let same = layers.iter().rev().take_while(|l| l.tier == tier).count();
+        let take = fanout.max(2);
+        if same < take {
+            break;
+        }
         let from = layers.len() - take;
         let group: Vec<Layer> = layers[from..].iter().map(|l| l.layer.clone()).collect();
         let merged = merge_layers(root, &group, EPSILON).map_err(|e| format!("merge: {e}"))?;
@@ -1716,6 +1714,203 @@ pub fn compact(
         merges += 1;
     }
     Ok(merges)
+}
+
+/// The since-base layer's next job, from the leading top-tier layers:
+/// fold them into one when there are two or more (the since-base layer and
+/// what has reached the top tier since), else give the since-base layer an
+/// owner index if it has storage and no owner hint. `None`: nothing to do.
+pub fn top_job(root: &Path, layers: &[Tiered], top: u8) -> Option<Vec<Layer>> {
+    let lead: Vec<Layer> = layers
+        .iter()
+        .take_while(|l| l.tier >= top)
+        .map(|l| l.layer.clone())
+        .collect();
+    match lead.len() {
+        0 => None,
+        1 => lacks_index(root, &lead[0]).then_some(lead),
+        _ => Some(lead),
+    }
+}
+
+/// [`lacks_owner_index`], read once a process per hint file (a hint file
+/// never changes under its name), not at every step.
+fn lacks_index(root: &Path, l: &Layer) -> bool {
+    static LACKS: std::sync::Mutex<BTreeMap<[u8; 32], bool>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let Some(n) = l.hints_file else {
+        return lacks_owner_index(root, l);
+    };
+    if let Some(v) = LACKS.lock().unwrap().get(&n) {
+        return *v;
+    }
+    let v = lacks_owner_index(root, l);
+    if root.join(csl_eth_store::hints::hints_path(&n)).exists() {
+        LACKS.lock().unwrap().insert(n, v);
+    }
+    v
+}
+
+/// Run a [`top_job`]: the merged layer, or the one layer with its owner
+/// index. Writes only new files under `root`; the inputs stay as they are.
+pub fn run_top(root: &Path, inputs: &[Layer]) -> Result<Layer, String> {
+    match inputs {
+        [] => Err("no layers".into()),
+        [one] => index_owners(root, one).map_err(|e| format!("owner index: {e}")),
+        _ => merge_layers(root, inputs, EPSILON).map_err(|e| format!("merge: {e}")),
+    }
+}
+
+/// Put a finished job's layer in place of its inputs, if they are still
+/// the leading layers. Whether it did.
+pub fn swap_top(layers: &mut Vec<Tiered>, inputs: &[Layer], out: Layer, top: u8) -> bool {
+    let k = inputs.len();
+    if k == 0 || layers.len() < k || !layers[..k].iter().map(|l| &l.layer).eq(inputs.iter()) {
+        return false;
+    }
+    layers.splice(
+        ..k,
+        [Tiered {
+            layer: out,
+            tier: top,
+        }],
+    );
+    true
+}
+
+/// The files under `runs/` a layer reaches: its runs, its hint file and
+/// its owner index's file.
+fn layer_files(root: &Path, l: &Layer) -> Vec<String> {
+    // A hint file never changes under its name, so what it names is read
+    // once a process, not at every step.
+    static OWNERS_OF: std::sync::Mutex<BTreeMap<[u8; 32], Option<[u8; 32]>>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let read = || layer_hints(root, l).owners.map(|o| o.file);
+    let owners = match l.hints_file {
+        None => read(),
+        Some(n) => {
+            let cached = OWNERS_OF.lock().unwrap().get(&n).copied();
+            cached.unwrap_or_else(|| {
+                let o = read();
+                if root.join(csl_eth_store::hints::hints_path(&n)).exists() {
+                    OWNERS_OF.lock().unwrap().insert(n, o);
+                }
+                o
+            })
+        }
+    }
+    .map(|f| format!("{}.owners", hex::encode(f)));
+    l.tables
+        .iter()
+        .map(|t| format!("{}.run", hex::encode(t.root)))
+        .chain(l.hints_file.map(|n| format!("{}.hints", hex::encode(n))))
+        .chain(owners)
+        .collect()
+}
+
+/// A [`top_job`] running on its own thread.
+struct TopRun {
+    inputs: Vec<Layer>,
+    handle: std::thread::JoinHandle<Result<TopDone, String>>,
+}
+
+/// What a finished [`TopRun`] made and sent.
+struct TopDone {
+    layer: Layer,
+    sent: Vec<String>,
+    bytes: u64,
+    build_s: f64,
+    publish_s: f64,
+}
+
+/// Where a since-base job names the files it sends (see [`journal_take`]).
+fn top_journal(work: &Path) -> PathBuf {
+    work.join("since-base-sent")
+}
+
+fn journal_add(journal: &Path, name: &str) -> Result<(), String> {
+    let mut f = File::options()
+        .create(true)
+        .append(true)
+        .open(journal)
+        .map_err(|e| e.to_string())?;
+    f.write_all(format!("{name}\n").as_bytes())
+        .and_then(|_| f.sync_data())
+        .map_err(|e| e.to_string())
+}
+
+/// The files a since-base job sent or was sending, emptied: the caller
+/// counts them as published, so collection deletes those nothing uses.
+fn journal_take(journal: &Path) -> Vec<String> {
+    let names = fs::read_to_string(journal)
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let _ = fs::remove_file(journal);
+    names
+}
+
+/// Lower this thread's CPU priority (Linux; elsewhere a no-op, since there
+/// it would lower the whole process).
+fn nice_this_thread(n: i32) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: setpriority on this thread's own id changes only its nice.
+    unsafe {
+        let tid = libc::gettid();
+        libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, n);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = n;
+}
+
+/// Start a [`top_job`] on a thread at nice 10: build its layer, then send
+/// the files of it not yet published, so the step that swaps it in
+/// publishes only a manifest.
+fn spawn_top(
+    root: PathBuf,
+    inputs: Vec<Layer>,
+    publish: Arc<dyn Publish + Send>,
+    key_prefix: String,
+    published: BTreeSet<String>,
+    journal: PathBuf,
+) -> Result<TopRun, String> {
+    let job = inputs.clone();
+    let handle = std::thread::Builder::new()
+        .name("since-base".into())
+        .spawn(move || {
+            nice_this_thread(10);
+            let t = Instant::now();
+            let layer = run_top(&root, &job)?;
+            let build_s = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let (mut sent, mut bytes) = (Vec::new(), 0);
+            for r in layer_files(&root, &layer) {
+                if published.contains(&r) {
+                    continue;
+                }
+                let rel = format!("runs/{r}");
+                let f = root.join(&rel);
+                // Named before it goes up, so a send that fails or is cut
+                // short by a restart is still collected if nothing uses it.
+                journal_add(&journal, &r)?;
+                publish.put(&format!("{key_prefix}{rel}"), &f)?;
+                bytes += fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
+                sent.push(r);
+            }
+            Ok(TopDone {
+                layer,
+                sent,
+                bytes,
+                build_s,
+                publish_s: t.elapsed().as_secs_f64(),
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(TopRun { inputs, handle })
 }
 
 // ---------------------------------------------------------------------------
@@ -1952,7 +2147,11 @@ impl Publish for DirPublish {
         if let Some(d) = to.parent() {
             fs::create_dir_all(d).map_err(|e| e.to_string())?;
         }
-        let tmp = to.with_extension("tmp-put");
+        let tmp = to.with_extension(format!(
+            "tmp-put-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         fs::copy(file, &tmp).map_err(|e| format!("{key}: {e}"))?;
         fs::rename(&tmp, &to).map_err(|e| format!("{key}: {e}"))
     }
@@ -2275,17 +2474,53 @@ fn collectable(
 }
 
 /// The files under `runs/` a manifest reaches: its layers' runs
-/// (`<root>.run`) and hint files (`<blake3>.hints`).
-fn manifest_runs(m: &Manifest) -> Vec<String> {
-    m.layers
+/// (`<root>.run`), hint files (`<blake3>.hints`) and owner indexes
+/// (`<blake3>.owners`, named in the hints).
+fn manifest_runs(root: &Path, m: &Manifest) -> Vec<String> {
+    m.layers.iter().flat_map(|l| layer_files(root, l)).collect()
+}
+
+/// Published files under `runs/` to collect: those neither a kept
+/// manifest nor the current one reaches. A since-base job's inputs stay
+/// while any kept manifest lists them, whether or not its layer has
+/// replaced them.
+fn dead_runs(
+    published: &BTreeSet<String>,
+    manifests: &VecDeque<(B256, Vec<String>)>,
+    current: &HashSet<String>,
+) -> Vec<String> {
+    let live: HashSet<&String> = manifests.iter().flat_map(|(_, r)| r.iter()).collect();
+    published
         .iter()
-        .flat_map(|l| {
-            l.tables
-                .iter()
-                .map(|t| format!("{}.run", hex::encode(t.root)))
-                .chain(l.hints_file.map(|n| format!("{}.hints", hex::encode(n))))
-        })
+        .filter(|r| !live.contains(r) && !current.contains(*r))
+        .cloned()
         .collect()
+}
+
+/// A file under `runs/` being written: a run's (`.tmp-…`) or a hint
+/// file's or owner index's (`<hash>.tmp`, [`write_atomic`]).
+fn is_temp(name: &str) -> bool {
+    name.starts_with(".tmp-") || name.ends_with(".tmp")
+}
+
+/// Delete local files under `runs/` that nothing `known` names: runs,
+/// hints and owner indexes merged away before they were published, and a
+/// killed job's temporary files. Not while a job writes there.
+fn sweep_local(root: &Path, known: &HashSet<String>) -> usize {
+    let mut n = 0;
+    if let Ok(rd) = fs::read_dir(root.join("runs")) {
+        for e in rd.flatten() {
+            let f = e.file_name().to_string_lossy().to_string();
+            let ours = f.ends_with(".run")
+                || f.ends_with(".hints")
+                || f.ends_with(".owners")
+                || is_temp(&f);
+            if ours && !known.contains(&f) && fs::remove_file(e.path()).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// A state saved before hint files named runs by their bare root.
@@ -2337,8 +2572,12 @@ struct Tracker {
     base: Manifest,
     prefix: Option<Nibbles>,
     store: Store,
-    publish: Box<dyn Publish>,
+    publish: Arc<dyn Publish + Send>,
     log: Log,
+    /// The since-base job in the background ([`top_job`]), if one runs.
+    top_run: Option<TopRun>,
+    /// After a failed job, when the next may start.
+    top_retry: Option<Instant>,
     /// Owners (first eight bytes) hot in a step lately, with the step:
     /// each gets a path hint in every layer that names it while here, so
     /// merges keep it ([`StoragePathsBuilder::finish_sticky`]).
@@ -2348,6 +2587,9 @@ struct Tracker {
 /// How long an owner stays sticky after its last hot step: the
 /// since-base layer's merge period at fanout 4, five tiers.
 const STICKY_STEPS: u64 = 1024;
+
+/// After a since-base job fails, how long until it is tried again.
+const TOP_RETRY: Duration = Duration::from_secs(600);
 
 impl Tracker {
     /// The step's storage path hints: hot owners and sticky ones.
@@ -2360,6 +2602,79 @@ impl Tracker {
         self.hot
             .retain(|_, s| step.saturating_sub(*s) < STICKY_STEPS);
         b.finish_sticky(&sticky)
+    }
+
+    /// Take in a finished since-base job: what it sent is published, and
+    /// its layer replaces its inputs.
+    fn tend_top(&mut self) -> Value {
+        if !self
+            .top_run
+            .as_ref()
+            .is_some_and(|r| r.handle.is_finished())
+        {
+            return Value::Null;
+        }
+        let r = self.top_run.take().expect("running");
+        let k = r.inputs.len();
+        let done = match r.handle.join() {
+            Ok(d) => d,
+            Err(_) => Err("the job panicked".into()),
+        };
+        self.st
+            .published_runs
+            .extend(journal_take(&top_journal(&self.args.work)));
+        match done {
+            Ok(d) => {
+                self.st.published_runs.extend(d.sent.iter().cloned());
+                let (from, to) = (d.layer.from_block, d.layer.to_block);
+                let swapped = swap_top(&mut self.st.layers, &r.inputs, d.layer, self.args.tiers);
+                let v = json!({"inputs": k, "swapped": swapped, "from": from, "to": to,
+                    "build_s": d.build_s, "publish_s": d.publish_s, "files": d.sent.len(), "bytes": d.bytes});
+                self.log.emit(json!({"ev": "since_base_done", "job": v}));
+                json!({"done": v})
+            }
+            Err(e) => {
+                self.top_retry = Some(Instant::now() + TOP_RETRY);
+                self.log
+                    .emit(json!({"ev": "since_base_failed", "inputs": k, "error": e}));
+                json!({"failed": e})
+            }
+        }
+    }
+
+    /// Start the since-base job there is, if none runs.
+    fn start_top(&mut self) -> Result<Value, String> {
+        if let Some(r) = &self.top_run {
+            return Ok(json!({"running": r.inputs.len()}));
+        }
+        if self.top_retry.is_some_and(|t| Instant::now() < t) {
+            return Ok(Value::Null);
+        }
+        let Some(inputs) = top_job(&self.root, &self.st.layers, self.args.tiers) else {
+            return Ok(Value::Null);
+        };
+        let v = json!({
+            "inputs": inputs.len(),
+            "kind": if inputs.len() == 1 { "owner index" } else { "merge" },
+            "from": inputs[0].from_block,
+            "to": inputs[inputs.len() - 1].to_block,
+        });
+        // Not the job's to send: what is published, and what this step's
+        // manifest reaches, which the step sends itself.
+        let mut skip = self.st.published_runs.clone();
+        for l in &self.st.layers {
+            skip.extend(layer_files(&self.root, &l.layer));
+        }
+        self.top_run = Some(spawn_top(
+            self.root.clone(),
+            inputs,
+            self.publish.clone(),
+            self.args.key_prefix.clone(),
+            skip,
+            top_journal(&self.args.work),
+        )?);
+        self.log.emit(json!({"ev": "since_base_started", "job": v}));
+        Ok(json!({"started": v}))
     }
 
     fn manifest(&self, head: &Head, latest: bool) -> Result<Manifest, String> {
@@ -2393,6 +2708,7 @@ impl Tracker {
             timestamp: e.timestamp,
             state_root: e.state_root,
         };
+        let since_base_done = self.tend_top();
         let before = self.st.layers.clone();
         if !h.rows.is_empty() {
             let paths = self.storage_paths(std::mem::take(&mut h.rows.paths));
@@ -2415,6 +2731,7 @@ impl Tracker {
             self.args.fanout,
             self.args.tiers,
         )?;
+        let since_base = self.start_top()?;
         let manifest = self.manifest(&head, tier == Some(Tier::Attested))?;
         let layer_s = t0.elapsed().as_secs_f64();
         let t_check = Instant::now();
@@ -2444,6 +2761,7 @@ impl Tracker {
             "merges": merges, "runs": self.store.run_counts(), "check": check, "sent": sent,
             "collected": collected, "build_s": built_s, "layer_s": layer_s, "readback_s": readback_s,
             "publish_s": t1.elapsed().as_secs_f64(),
+            "since_base": json!({"done": since_base_done, "now": since_base}),
         }))
     }
 
@@ -2471,7 +2789,7 @@ impl Tracker {
         tier: Option<Tier>,
     ) -> Result<Value, String> {
         let mut sent = (0u64, 0u64);
-        for r in manifest_runs(m) {
+        for r in manifest_runs(&self.root, m) {
             if !self.st.published_runs.contains(&r) {
                 self.put(&format!("runs/{r}"), &mut sent)?;
                 self.st.published_runs.insert(r);
@@ -2489,7 +2807,7 @@ impl Tracker {
         self.publish_updates(&mut sent)?;
         self.st
             .manifests
-            .push_back((head.block_hash, manifest_runs(m)));
+            .push_back((head.block_hash, manifest_runs(&self.root, m)));
         match tier {
             Some(Tier::Attested) => {
                 write_atomic(&self.root.join(paths::OPTIMISTIC), update)?;
@@ -2612,20 +2930,13 @@ impl Tracker {
             let _ = fs::remove_dir(self.root.join(manifest_path(&h)).parent().expect("dir"));
             gone_manifests += 1;
         }
-        let live: HashSet<&String> = self
-            .st
-            .manifests
-            .iter()
-            .flat_map(|(_, r)| r.iter())
-            .collect();
-        let cur: HashSet<String> = manifest_runs(current).into_iter().collect();
-        let dead: Vec<String> = self
-            .st
-            .published_runs
-            .iter()
-            .filter(|r| !live.contains(r) && !cur.contains(*r))
-            .cloned()
-            .collect();
+        // A since-base job reads its inputs and writes files the state does
+        // not know yet: no run is collected while it runs.
+        if self.top_run.is_some() {
+            return Ok(json!({"manifests": gone_manifests, "runs": "deferred"}));
+        }
+        let cur: HashSet<String> = manifest_runs(&self.root, current).into_iter().collect();
+        let dead = dead_runs(&self.st.published_runs, &self.st.manifests, &cur);
         for r in &dead {
             let rel = format!("runs/{r}");
             self.publish.delete(&self.key(&rel))?;
@@ -2634,16 +2945,7 @@ impl Tracker {
         }
         // Runs merged away before they were ever published.
         let known: HashSet<String> = self.st.published_runs.iter().cloned().chain(cur).collect();
-        let mut local = 0;
-        if let Ok(rd) = fs::read_dir(self.root.join("runs")) {
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().to_string();
-                if (n.ends_with(".run") || n.ends_with(".hints")) && !known.contains(&n) {
-                    let _ = fs::remove_file(e.path());
-                    local += 1;
-                }
-            }
-        }
+        let local = sweep_local(&self.root, &known);
         Ok(json!({"manifests": gone_manifests, "runs": dead.len(), "unpublished_runs": local}))
     }
 }
@@ -2723,13 +3025,13 @@ pub async fn run(args: Args) -> Result<(), String> {
     } else {
         Some(crate::produce::parse_prefix(&base.prefix)?)
     };
-    let publish: Box<dyn Publish> = match (&args.publish, &args.to_dir) {
-        (Some(p), _) => Box::new(Program {
+    let publish: Arc<dyn Publish + Send> = match (&args.publish, &args.to_dir) {
+        (Some(p), _) => Arc::new(Program {
             program: p.clone(),
             timeout: Duration::from_secs(300),
         }),
-        (None, Some(d)) => Box::new(DirPublish(d.clone())),
-        (None, None) => Box::new(DryRun),
+        (None, Some(d)) => Arc::new(DirPublish(d.clone())),
+        (None, None) => Arc::new(DryRun),
     };
     let log = Log(File::options()
         .create(true)
@@ -2767,7 +3069,25 @@ pub async fn run(args: Args) -> Result<(), String> {
         publish,
         log,
         hot: HashMap::new(),
+        top_run: None,
+        top_retry: None,
     };
+    // A job killed with the process (a restart, a preemption) left its
+    // temporary files; it runs again from its inputs.
+    if let Ok(rd) = fs::read_dir(root.join("runs")) {
+        for e in rd.flatten() {
+            if is_temp(&e.file_name().to_string_lossy()) {
+                let _ = fs::remove_file(e.path());
+            }
+        }
+    }
+    // What it was sending counts as published: collection deletes what
+    // nothing uses.
+    let sent = journal_take(&top_journal(&args.work));
+    if !sent.is_empty() {
+        h.st.published_runs.extend(sent);
+        h.st.save(&h.state_path)?;
+    }
     // Sticky from the start: the owners the current layers hint.
     for l in &h.st.layers {
         if let Some(p) = layer_hints(&h.root, &l.layer).storage_paths {
@@ -3468,6 +3788,23 @@ mod tests {
         fanout: usize,
         top: u8,
     ) -> (Store, Manifest) {
+        commit_with(dir, base, layers, from, to, h, fanout, top, true)
+    }
+
+    /// [`commit`], with the since-base job run in the step when
+    /// `inline_top`, else left to the caller (the tracker's background).
+    #[allow(clippy::too_many_arguments)]
+    fn commit_with(
+        dir: &Path,
+        base: &Manifest,
+        layers: &mut Vec<Tiered>,
+        from: &Head,
+        to: &Head,
+        h: &mut Tracked,
+        fanout: usize,
+        top: u8,
+        inline_top: bool,
+    ) -> (Store, Manifest) {
         if !h.rows.is_empty() {
             let layer = write_layer_sorted(
                 dir,
@@ -3483,6 +3820,12 @@ mod tests {
             layers.push(Tiered { layer, tier: 0 });
         }
         compact(dir, layers, fanout, top).unwrap();
+        if inline_top {
+            if let Some(inputs) = top_job(dir, layers, top) {
+                let out = run_top(dir, &inputs).unwrap();
+                assert!(swap_top(layers, &inputs, out, top));
+            }
+        }
         let m = write_layered_manifest(
             dir,
             to,
@@ -4599,6 +4942,160 @@ mod tests {
         // Fanout 2 and a top tier of 3: at most one run per tier below it.
         assert!(max_layers <= 4, "{max_layers}");
         assert!(layers.iter().any(|l| l.tier == 3));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The since-base merge in the background: while it is pending, every
+    /// step publishes over the since-base layer and the top-tier layer(s)
+    /// after it, and every state reads; a job killed mid-merge leaves only
+    /// a temporary file, and run again from the same inputs swaps in; a
+    /// job whose inputs are no longer the leading layers is not swapped;
+    /// collection keeps the inputs while a kept manifest lists them; the
+    /// thread sends the merged layer's files before the swap.
+    #[tokio::test]
+    async fn the_since_base_merge_runs_beside_the_steps() {
+        let mut s0 = states().remove(0);
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        s0.insert(
+            key(&mut rng),
+            Acct {
+                balance: U256::from(1u64),
+                storage: (0..50)
+                    .map(|_| (key(&mut rng), U256::from(rng.random::<u64>() | 1)))
+                    .collect(),
+                code: Some(bytes(&mut rng, 100)),
+            },
+        );
+        let dir = scratch("since-base");
+        let h0 = head_of(&s0, 0);
+        let base = produce(&dir, &h0, "", leaves(&s0), &code_of(&s0))
+            .unwrap()
+            .manifest;
+        let mut store = Store::open(&dir, &base).unwrap();
+        let mut db = NodeDb::open(&dir.join("nodes"), h0.state_root).unwrap();
+        let mut layers: Vec<Tiered> = Vec::new();
+        let (mut s, mut h) = (s0, h0);
+        // Fanout 2, top tier 3: a top-tier layer forms every 8 steps.
+        let (fanout, top) = (2, 3);
+        let mut manifests: VecDeque<(B256, Vec<String>)> = VecDeque::new();
+        let mut job: Option<Vec<Layer>> = None;
+        let mut pending_steps = 0;
+        let mut swapped_at = None;
+        for n in 1..=20u64 {
+            let next = churn(&s, &mut rng);
+            let hn = head_of(&next, n);
+            let mut src = Mem::of(&next, &hn);
+            let mut tracked = step(&mut src, &mut store, &mut db, &h, &hn, &dir, 64 << 20)
+                .await
+                .unwrap();
+            let m;
+            (store, m) = commit_with(
+                &dir,
+                &base,
+                &mut layers,
+                &h,
+                &hn,
+                &mut tracked,
+                fanout,
+                top,
+                false,
+            );
+            db.reset(hn.state_root).unwrap();
+            manifests.push_back((hn.block_hash, manifest_runs(&dir, &m)));
+            // Every state reads, merge pending or not.
+            reads_as(&dir, &next, &[], &hn);
+            assert!(layers.windows(2).all(|w| w[0].tier >= w[1].tier));
+            if job.is_none() {
+                job = top_job(&dir, &layers, top).filter(|j| j.len() >= 2);
+            }
+            if let Some(inputs) = &job {
+                pending_steps += 1;
+                // The pending inputs stay the leading layers, in order.
+                assert!(layers.len() > inputs.len() - 1);
+                assert!(layers[..inputs.len()]
+                    .iter()
+                    .map(|l| &l.layer)
+                    .eq(inputs.iter()));
+                // Four steps publish over it; at the fourth the job,
+                // "killed" at the first, runs again and swaps in.
+                if pending_steps == 1 {
+                    fs::write(dir.join("runs/.tmp-1-1-1"), b"half a run").unwrap();
+                }
+                if pending_steps == 4 {
+                    swapped_at = Some(n);
+                    let inputs = inputs.clone();
+                    let out = run_top(&dir, &inputs).unwrap();
+                    // Not the leading layers: refused, nothing changes.
+                    let mut shifted = layers.clone();
+                    shifted.remove(0);
+                    assert!(!swap_top(&mut shifted, &inputs, out.clone(), top));
+                    // On a thread, sending its files first.
+                    let sent_to = dir.join("bucket");
+                    let run = spawn_top(
+                        dir.clone(),
+                        inputs.clone(),
+                        Arc::new(DirPublish(sent_to.clone())),
+                        "full/".into(),
+                        BTreeSet::new(),
+                        top_journal(&dir),
+                    )
+                    .unwrap();
+                    let done = run.handle.join().unwrap().unwrap();
+                    assert_eq!(done.layer, out);
+                    for f in layer_files(&dir, &done.layer) {
+                        assert!(sent_to.join("full/runs").join(&f).exists(), "{f} not sent");
+                    }
+                    // Each send was named first, so a job cut short still
+                    // leaves its sends to collection.
+                    let named: BTreeSet<String> =
+                        journal_take(&top_journal(&dir)).into_iter().collect();
+                    assert_eq!(named, done.sent.iter().cloned().collect());
+                    assert!(!done.sent.is_empty());
+                    assert!(journal_take(&top_journal(&dir)).is_empty());
+                    // Hint and owner-index temporaries are swept too.
+                    assert!(is_temp("ab.tmp") && is_temp(".tmp-1-2") && !is_temp("ab.hints"));
+                    assert!(swap_top(&mut layers, &run.inputs, done.layer, top));
+                    assert_eq!(layers[0].tier, top);
+                    assert_eq!(layers[0].layer.from_block, inputs[0].from_block);
+                    assert_eq!(layers[0].layer.to_block, inputs[inputs.len() - 1].to_block);
+                    // Collection: the inputs' files stay while a kept
+                    // manifest lists them; once none does, they go.
+                    let all: BTreeSet<String> = manifests
+                        .iter()
+                        .flat_map(|(_, r)| r.iter().cloned())
+                        .collect();
+                    let cur: HashSet<String> = layers
+                        .iter()
+                        .flat_map(|l| layer_files(&dir, &l.layer))
+                        .collect();
+                    let inputs_files: BTreeSet<String> = inputs
+                        .iter()
+                        .flat_map(|l| layer_files(&dir, l))
+                        .filter(|f| !cur.contains(f))
+                        .collect();
+                    assert!(!inputs_files.is_empty());
+                    let dead = dead_runs(&all, &manifests, &cur);
+                    assert!(dead.iter().all(|d| !inputs_files.contains(d)));
+                    // (Every manifest so far was written over the inputs.)
+                    let dead = dead_runs(&all, &VecDeque::new(), &cur);
+                    assert!(inputs_files.iter().all(|f| dead.contains(f)));
+                    // The killed job's temporary file is swept with them.
+                    let known: HashSet<String> = all.iter().cloned().chain(cur).collect();
+                    sweep_local(&dir, &known);
+                    assert!(!dir.join("runs/.tmp-1-1-1").exists());
+                    job = None;
+                }
+            }
+            (s, h) = (next, hn);
+        }
+        let at = swapped_at.expect("a since-base merge ran");
+        assert!(at < 20, "{at}");
+        assert!(pending_steps >= 4);
+        // The since-base layer's owner index came from the merge, and lists
+        // what it holds.
+        let hs = layer_hints(&dir, &layers[0].layer);
+        assert!(hs.storage.is_some() || hs.owners.is_some());
+        reads_as(&dir, &s, &[], &h);
         fs::remove_dir_all(&dir).ok();
     }
 }

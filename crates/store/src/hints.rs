@@ -63,6 +63,11 @@ pub struct Hints {
     /// without one may hold any position in its trie.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_paths: Option<StoragePaths>,
+    /// The storage owners of a layer with too many for `storage`, paged
+    /// (an [`OwnerIndex`]). A reader asks the layer for an owner's storage
+    /// only when the owner's page lists it. Only when `storage` is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owners: Option<OwnerIndex>,
 }
 
 impl Hints {
@@ -71,6 +76,7 @@ impl Hints {
             && self.storage.is_none()
             && self.code.is_none()
             && self.storage_paths.is_none()
+            && self.owners.is_none()
     }
 
     /// May the layer hold the storage position at `depth` on the path whose
@@ -106,6 +112,106 @@ impl Hints {
 /// Where a layer's hints file lives: `runs/<blake3>.hints`.
 pub fn hints_path(name: &[u8; 32]) -> String {
     format!("runs/{}.hints", hex::encode(name))
+}
+
+/// Where a layer's owner index lives: `runs/<blake3>.owners`.
+pub fn owners_path(name: &[u8; 32]) -> String {
+    format!("runs/{}.owners", hex::encode(name))
+}
+
+/// Owners on one page of an owner index: 4 KiB of 8-byte keys.
+pub const OWNERS_PER_PAGE: usize = 512;
+
+/// The storage owners of a layer too big for a [`KeySet`] (the since-base
+/// layer holds a few hundred thousand): their first eight bytes, sorted
+/// and distinct, big-endian, in `runs/<file>.owners`, [`OWNERS_PER_PAGE`]
+/// to a 4 KiB page; here, each page's first owner. A reader fetches the
+/// one page an owner would be on with its first round.
+///
+/// Scheduling only, like every hint. A page is not checked against
+/// `file` (that takes the whole file), only against this index; a page
+/// that lies costs repair rounds, a page that is missing or does not fit
+/// the index costs the layer's skip, and neither changes an answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerIndex {
+    #[serde(with = "crate::hex32")]
+    pub file: [u8; 32],
+    pub count: u64,
+    pub first: KeySet,
+}
+
+impl OwnerIndex {
+    /// The index of a sorted, distinct owner list written to `root`, or
+    /// `None` when there are none.
+    pub fn write(root: &std::path::Path, owners: &BTreeSet<u64>) -> std::io::Result<Option<Self>> {
+        if owners.is_empty() {
+            return Ok(None);
+        }
+        let mut bytes = Vec::with_capacity(owners.len() * 8);
+        let mut first = Vec::new();
+        for (i, o) in owners.iter().enumerate() {
+            if i % OWNERS_PER_PAGE == 0 {
+                first.push(*o);
+            }
+            bytes.extend_from_slice(&o.to_be_bytes());
+        }
+        let file = *blake3::hash(&bytes).as_bytes();
+        let p = root.join(owners_path(&file));
+        if !p.exists() {
+            crate::producer::write_atomic(&p, &bytes)?;
+        }
+        Ok(Some(OwnerIndex {
+            file,
+            count: owners.len() as u64,
+            first: KeySet(first),
+        }))
+    }
+
+    pub fn path(&self) -> String {
+        owners_path(&self.file)
+    }
+
+    /// One first owner a page, and at least one page.
+    pub fn is_well_formed(&self) -> bool {
+        self.count > 0 && self.first.0.len() as u64 == self.count.div_ceil(OWNERS_PER_PAGE as u64)
+    }
+
+    /// The page `owner` would be on; `None` when it sorts before every
+    /// owner, so is not listed.
+    pub fn page_of(&self, owner: &[u8; 32]) -> Option<usize> {
+        match self.first.0.binary_search(&prefix8(owner)) {
+            Ok(i) => Some(i),
+            Err(0) => None,
+            Err(i) => Some(i - 1),
+        }
+    }
+
+    /// Page `i`'s byte range in the file.
+    pub fn page_range(&self, i: usize) -> (u64, usize) {
+        let lo = i * OWNERS_PER_PAGE;
+        let n = (self.count as usize)
+            .saturating_sub(lo)
+            .min(OWNERS_PER_PAGE);
+        ((lo * 8) as u64, n * 8)
+    }
+
+    /// Whether page `i`'s bytes list `owner`; `None` when the page is not
+    /// the one this index describes (wrong length, unsorted, a first owner
+    /// that differs, an owner past the next page's first).
+    pub fn page_lists(&self, i: usize, page: &[u8], owner: &[u8; 32]) -> Option<bool> {
+        let (_, len) = self.page_range(i);
+        if len == 0 || page.len() != len {
+            return None;
+        }
+        let v: Vec<u64> = page
+            .chunks(8)
+            .map(|c| u64::from_be_bytes(c.try_into().expect("8")))
+            .collect();
+        let ok = v.windows(2).all(|w| w[0] < w[1])
+            && Some(&v[0]) == self.first.0.get(i)
+            && self.first.0.get(i + 1).is_none_or(|n| v[v.len() - 1] < *n);
+        ok.then(|| v.binary_search(&prefix8(owner)).is_ok())
+    }
 }
 
 /// Whether a run may hold a position.
@@ -207,7 +313,7 @@ pub fn top8(key: &[u8; 32]) -> u32 {
     u32::from_be_bytes(key[..4].try_into().expect("4 bytes"))
 }
 
-fn prefix8(key: &[u8; 32]) -> u64 {
+pub(crate) fn prefix8(key: &[u8; 32]) -> u64 {
     u64::from_be_bytes(key[..8].try_into().expect("8 bytes"))
 }
 
@@ -615,6 +721,73 @@ mod tests {
     use super::*;
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
+
+    /// An owner index pages its owners 512 to 4 KiB, finds the one page an
+    /// owner would be on, and says whether a page lists it only when the
+    /// page fits the index.
+    #[test]
+    fn an_owner_index_pages_its_owners() {
+        let dir = std::env::temp_dir().join(format!("csl-owners-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("runs")).unwrap();
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        let set: BTreeSet<u64> = (0..1300).map(|_| rng.random::<u64>() | 1).collect();
+        let idx = OwnerIndex::write(&dir, &set).unwrap().unwrap();
+        assert!(idx.is_well_formed());
+        assert_eq!((idx.count, idx.first.0.len()), (set.len() as u64, 3));
+        let file = std::fs::read(dir.join(idx.path())).unwrap();
+        assert_eq!(file.len(), set.len() * 8);
+        assert_eq!(*blake3::hash(&file).as_bytes(), idx.file);
+        let page = |i: usize| {
+            let (off, len) = idx.page_range(i);
+            file[off as usize..off as usize + len].to_vec()
+        };
+        assert_eq!(idx.page_range(2).1, (1300 - 1024) * 8);
+        let owner = |o: u64| {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&o.to_be_bytes());
+            k
+        };
+        for o in set.iter().step_by(7) {
+            let i = idx.page_of(&owner(*o)).unwrap();
+            assert_eq!(idx.page_lists(i, &page(i), &owner(*o)), Some(true));
+        }
+        // Absent: even keys are never listed.
+        for _ in 0..200 {
+            let o = rng.random::<u64>() & !1;
+            match idx.page_of(&owner(o)) {
+                None => assert!(o < idx.first.0[0]),
+                Some(i) => assert_eq!(idx.page_lists(i, &page(i), &owner(o)), Some(false)),
+            }
+        }
+        // A page that is not the one the index describes is no evidence
+        // either way.
+        let o = *set.iter().nth(600).unwrap();
+        assert_eq!(idx.page_of(&owner(o)), Some(1));
+        assert_eq!(idx.page_lists(1, &page(0), &owner(o)), None);
+        assert_eq!(idx.page_lists(1, &page(1)[8..], &owner(o)), None);
+        let mut zeros = page(1);
+        zeros.iter_mut().for_each(|b| *b = 0);
+        assert_eq!(idx.page_lists(1, &zeros, &owner(o)), None);
+        assert_eq!(idx.page_lists(5, &page(1), &owner(o)), None);
+        let bad = OwnerIndex {
+            count: 2000,
+            ..idx.clone()
+        };
+        assert!(!bad.is_well_formed());
+        // Through the hints' JSON and back.
+        let h = Hints {
+            owners: Some(idx.clone()),
+            ..Hints::default()
+        };
+        let back: Hints = serde_json::from_slice(&h.to_bytes()).unwrap();
+        assert_eq!(back, h);
+        // Hints without the field (every manifest before it) read as before.
+        let old: Hints = serde_json::from_str("{}").unwrap();
+        assert!(old.owners.is_none());
+        assert!(OwnerIndex::write(&dir, &BTreeSet::new()).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn key(path: &[u8], depth: usize) -> [u8; 32] {
         let mut k = [0u8; 32];

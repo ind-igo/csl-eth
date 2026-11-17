@@ -10,16 +10,20 @@
 //! to, so a stale node in an older run is never accepted, a missing one is
 //! `Insufficient`, and nothing ever needs deleting for a read to be right.
 
-use crate::hints::{hints_path, Hints, KeySet, PathHintBuilder, StoragePaths, HINT_INLINE};
+use crate::hints::{
+    hints_path, Hints, KeySet, OwnerIndex, PathHintBuilder, StoragePaths, HINT_INLINE,
+};
 use crate::producer::Head;
 use crate::{
     blob_path, manifest_path, producer::write_atomic, profile_id, run_path, Layer, Manifest,
     ProduceError, Rows, TableRef, CODE_BLOB_THRESHOLD, FORMAT_VERSION_LAYERED, LATEST_FILE,
     RUN_FORMAT, TABLE_ACCOUNT_NODES, TABLE_CODE, TABLE_STORAGE_NODES,
 };
+use alloy_primitives::B256;
+use csl_eth_trie::{Nibbles, NodeKey};
 use csl_run::{Config, Entry, Reader, RunRef, Writer};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File},
     path::Path,
 };
@@ -205,9 +209,9 @@ pub fn write_layer(
         tables,
         Hints {
             account: account.finish(),
-            storage: rows.owners.as_ref().and_then(|o| KeySet::of(o.iter())),
             code: KeySet::of(rows.code.keys()),
             storage_paths: rows.storage_paths.clone(),
+            ..owner_hints(root, rows.owners.as_ref())?
         },
     )
 }
@@ -274,11 +278,127 @@ pub fn write_layer_sorted(
         tables,
         Hints {
             account: account.finish(),
-            storage: owners.and_then(|o| KeySet::of(o.iter())),
             code: KeySet::of(code.keys()),
             storage_paths,
+            ..owner_hints(root, owners)?
         },
     )
+}
+
+/// The storage owners as hints: a key set when they fit one, else an
+/// owner index (its file written under `root`); nothing when not known.
+fn owner_hints(root: &Path, owners: Option<&BTreeSet<[u8; 32]>>) -> std::io::Result<Hints> {
+    let Some(o) = owners else {
+        return Ok(Hints::default());
+    };
+    if let Some(s) = KeySet::of(o.iter()) {
+        return Ok(Hints {
+            storage: Some(s),
+            ..Hints::default()
+        });
+    }
+    let set: BTreeSet<u64> = o.iter().map(crate::hints::prefix8).collect();
+    Ok(Hints {
+        owners: OwnerIndex::write(root, &set)?,
+        ..Hints::default()
+    })
+}
+
+/// The storage owners a layer's runs hold, from the runs alone (a layer
+/// whose owners are not known, or too many for a key set): every owner
+/// whose account leaf is in the account run with a non-empty storage
+/// root, and whose storage root position is in the storage run. A layer
+/// holding any of an owner's storage nodes holds its root position (every
+/// change to a trie rewrites its root) and its account leaf (whose storage
+/// root changed), so none is missed; the root check keeps out accounts
+/// whose balance or nonce alone changed.
+#[derive(Default)]
+struct OwnerScan {
+    /// Root positions' table keys, to the owner's first eight bytes.
+    roots: HashMap<[u8; 32], u64>,
+    found: BTreeSet<u64>,
+}
+
+impl OwnerScan {
+    fn account(&mut self, key: &[u8; 32], node: &[u8]) {
+        use alloy_rlp::Decodable;
+        use alloy_trie::nodes::TrieNode;
+        let mut buf = node;
+        let Ok(TrieNode::Leaf(l)) = TrieNode::decode(&mut buf) else {
+            return;
+        };
+        let depth = key[31] as usize;
+        if depth > 62 {
+            return;
+        }
+        let mut full = Nibbles::unpack(&key[..31]);
+        full.truncate(depth);
+        let full = full.join(&l.key);
+        if full.len() != 64 {
+            return;
+        }
+        let Ok(a) = csl_eth_trie::Account::decode(&l.value) else {
+            return;
+        };
+        if a.storage_root == alloy_trie::EMPTY_ROOT_HASH {
+            return;
+        }
+        let owner = B256::from_slice(&full.pack());
+        if let Ok(k) = NodeKey::prefix(&Nibbles::default(), 0).storage_table_key(&owner) {
+            self.roots.insert(k, crate::hints::prefix8(&owner.0));
+        }
+    }
+
+    fn storage(&mut self, key: &[u8; 32]) {
+        if let Some(o) = self.roots.remove(key) {
+            self.found.insert(o);
+        }
+    }
+
+    /// The owners found, as a key set when they fit one (none at all is
+    /// the empty set, so the layer is not scanned again), else an index.
+    fn hints(self, root: &Path) -> std::io::Result<(Option<KeySet>, Option<OwnerIndex>)> {
+        if self.found.len() <= crate::hints::HINT_CAP {
+            return Ok((Some(KeySet(self.found.into_iter().collect())), None));
+        }
+        Ok((None, OwnerIndex::write(root, &self.found)?))
+    }
+}
+
+/// A layer's owner index from its runs ([`OwnerScan`]), its other hints
+/// kept: for a layer written before owner indexes, or merged from layers
+/// whose owners were not all known. Reads the account and storage runs
+/// once; writes the owners file and the hints, not the runs.
+pub fn index_owners(root: &Path, l: &Layer) -> Result<Layer, ProduceError> {
+    let mut scan = OwnerScan::default();
+    for t in [TABLE_ACCOUNT_NODES, TABLE_STORAGE_NODES] {
+        let Some(x) = l.tables.iter().find(|x| x.table_id == t) else {
+            continue;
+        };
+        let mut rref = x.run_ref(l.from_block);
+        rref.block_hi = l.to_block;
+        merged(vec![Cursor::open(root, x, rref)?], |e| {
+            if t == TABLE_ACCOUNT_NODES {
+                scan.account(&e.key, &e.value);
+            } else {
+                scan.storage(&e.key);
+            }
+            Ok(())
+        })?;
+    }
+    let mut hints = layer_hints(root, l);
+    hints.storage_paths = None;
+    (hints.storage, hints.owners) = scan.hints(root)?;
+    with_hints(root, l.from_block, l.to_block, l.tables.clone(), hints)
+}
+
+/// Whether a layer would gain from [`index_owners`]: it has storage
+/// nodes and neither a key set nor an index of their owners.
+pub fn lacks_owner_index(root: &Path, l: &Layer) -> bool {
+    let h = layer_hints(root, l);
+    l.tables.iter().any(|t| t.table_id == TABLE_STORAGE_NODES)
+        && h.storage.is_none()
+        && h.owners.is_none()
 }
 
 /// A layer with `hints` in the manifest, or, past [`HINT_INLINE`] bytes,
@@ -505,6 +625,16 @@ pub fn merge_layers(root: &Path, layers: &[Layer], epsilon: u16) -> Result<Layer
     let (Some(first), Some(last)) = (layers.first(), layers.last()) else {
         return Err(ProduceError::Io(std::io::Error::other("nothing to merge")));
     };
+    // Owners and positions are not in the storage table's hashed keys: the
+    // union of the layers' sets and hints, or, when that is not known or
+    // too big, read from the merged runs as they stream ([`OwnerScan`]).
+    let hints: Vec<Hints> = layers.iter().map(|l| layer_hints(root, l)).collect();
+    let storage = hints
+        .iter()
+        .map(|h| h.storage.clone())
+        .reduce(|a, b| KeySet::union(a.as_ref(), b.as_ref()))
+        .flatten();
+    let mut scan = storage.is_none().then(OwnerScan::default);
     let mut tables = Vec::new();
     let mut account = PathHintBuilder::default();
     let mut codes: Option<BTreeSet<[u8; 32]>> = Some(BTreeSet::new());
@@ -527,11 +657,18 @@ pub fn merge_layers(root: &Path, layers: &[Layer], epsilon: u16) -> Result<Layer
         }
         // Two passes, streamed: the writer needs the count first.
         let cursors = open()?;
-        let (account, codes) = (&mut account, &mut codes);
+        let (account, codes, scan) = (&mut account, &mut codes, &mut scan);
         tables.push(write_run_with(root, t, epsilon, count, |push| {
             merged(cursors, |e| {
                 if t == TABLE_ACCOUNT_NODES {
                     account.push(&e.key);
+                    if let Some(s) = scan.as_mut() {
+                        s.account(&e.key, &e.value);
+                    }
+                } else if t == TABLE_STORAGE_NODES {
+                    if let Some(s) = scan.as_mut() {
+                        s.storage(&e.key);
+                    }
                 } else if t == TABLE_CODE {
                     if let Some(c) = codes.as_mut() {
                         c.insert(e.key);
@@ -545,14 +682,6 @@ pub fn merge_layers(root: &Path, layers: &[Layer], epsilon: u16) -> Result<Layer
             .map(|_| ())
         })?);
     }
-    // Owners and positions are not in the storage table's hashed keys: the
-    // union of the layers' sets and hints.
-    let hints: Vec<Hints> = layers.iter().map(|l| layer_hints(root, l)).collect();
-    let storage = hints
-        .iter()
-        .map(|h| h.storage.clone())
-        .reduce(|a, b| KeySet::union(a.as_ref(), b.as_ref()))
-        .flatten();
     let storage_paths = StoragePaths::merge(
         &hints
             .iter()
@@ -560,6 +689,10 @@ pub fn merge_layers(root: &Path, layers: &[Layer], epsilon: u16) -> Result<Layer
             .collect::<Vec<_>>(),
     )
     .filter(|_| storage.is_some());
+    let (storage, owners) = match scan {
+        Some(s) => s.hints(root)?,
+        None => (storage, None),
+    };
     with_hints(
         root,
         first.from_block,
@@ -570,6 +703,7 @@ pub fn merge_layers(root: &Path, layers: &[Layer], epsilon: u16) -> Result<Layer
             storage,
             code: codes.and_then(|c| KeySet::of(c.iter())),
             storage_paths,
+            owners,
         },
     )
 }

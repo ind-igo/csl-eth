@@ -51,6 +51,7 @@ blake3.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
+libc = "0.2"
 # Beacon blocks as SSZ, for the accumulator route's body proofs.
 ssz_types = "0.11"
 ethereum_ssz = "0.9"

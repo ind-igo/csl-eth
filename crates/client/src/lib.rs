@@ -32,7 +32,7 @@ use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{Nibbles, EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use csl_eth_store::{
     blob_path,
-    hints::{hints_path, top8, Holds},
+    hints::{hints_path, top8, Holds, OwnerIndex},
     manifest_path, table_path, Manifest, D_ACCOUNT, D_STORAGE, FORMAT_VERSION,
     FORMAT_VERSION_LAYERED, LATEST_FILE, RUN_FORMAT, TABLE_COUNT,
 };
@@ -1159,7 +1159,10 @@ impl<D: Driver> Snapshot<D> {
                     .account
                     .as_ref()
                     .map_or(Holds::Maybe, |p| p.holds(top8, depth)),
-                Scope::Storage { owner, top8 } => h.storage_holds(&owner.0, top8, depth),
+                Scope::Storage { owner, top8 } => match &h.owners {
+                    Some(idx) if h.storage.is_none() => self.owner_holds(idx, &owner),
+                    _ => h.storage_holds(&owner.0, top8, depth),
+                },
             };
             match v {
                 Holds::No => {}
@@ -1171,6 +1174,30 @@ impl<D: Driver> Snapshot<D> {
             }
         }
         ask
+    }
+
+    /// Whether a layer with an owner index may hold `owner`'s storage: the
+    /// page it would be on lists it. That page is wanted with the round
+    /// that first asks (a storage read's first, with the account's pages);
+    /// until it is here the layer is not asked, and a read that needs it
+    /// then asks every run, as for any hint that was wrong. A page that
+    /// failed or does not fit the index costs the skip, not the answer.
+    fn owner_holds(&self, idx: &OwnerIndex, owner: &B256) -> Holds {
+        if !idx.is_well_formed() {
+            return Holds::Maybe;
+        }
+        let Some(i) = idx.page_of(&owner.0) else {
+            return Holds::No;
+        };
+        let (off, len) = idx.page_range(i);
+        match self.store.range(&idx.path(), off, len) {
+            Err(Pending) => Holds::No,
+            Ok(Ok(page)) => match idx.page_lists(i, &page, &owner.0) {
+                Some(false) => Holds::No,
+                Some(true) | None => Holds::Maybe,
+            },
+            Ok(Err(_)) => Holds::Maybe,
+        }
     }
 
     fn speculative(&self, path: &Nibbles, max_depth: usize, cache: bool) -> (Vec<NodeKey>, Nodes) {

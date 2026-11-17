@@ -827,6 +827,7 @@ fn layer_faults_never_become_false_answers() {
         storage: Some(KeySet(vec![])),
         code: Some(KeySet(vec![])),
         storage_paths: None,
+        owners: None,
     };
     let lying = |file: Option<[u8; 32]>| {
         let mut l = f.l2.clone();
@@ -1184,4 +1185,175 @@ fn read_cost_over_n_layers_and_merged() {
     }
     assert!(hot_hinted.iter().all(|&h| h), "{hot_hinted:?}");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A layer whose owners are not known (written without them, as the
+/// catch-up wrote the since-base layer) gets an owner index from its runs,
+/// when merged or on its own: it lists every owner whose storage nodes the
+/// layer holds and who still has storage, and no owner it holds nothing
+/// of. Reads over it answer as before, a quiet contract's slot does not
+/// ask the layer, and an index that lies, does not fit, or is gone costs
+/// requests, never an answer.
+#[test]
+fn an_owner_index_skips_quiet_contracts_and_never_lies() {
+    use csl_eth_store::{
+        hints::{Hints, OwnerIndex},
+        index_owners,
+    };
+    let f = fixture("owners");
+    let ps = probes(&f);
+    let want = truth(&f, &ps);
+    let r = [
+        rows(&f.s[0], &f.heads[0]),
+        rows(&f.s[1], &f.heads[1]),
+        rows(&f.s[2], &f.heads[2]),
+    ];
+    let (b0, b1, b2) = (
+        f.heads[0].block_number,
+        f.heads[1].block_number,
+        f.heads[2].block_number,
+    );
+    let u1 = write_layer(&f.dir, b0, b1, &LayerRows::diff(&r[0], &r[1]), EPSILON).unwrap();
+    let u2 = write_layer(&f.dir, b1, b2, &LayerRows::diff(&r[1], &r[2]), EPSILON).unwrap();
+    assert!(layer_hints(&f.dir, &u2).storage.is_none());
+    let p8 = |o: &[u8; 32]| u64::from_be_bytes(o[..8].try_into().unwrap());
+    // The owners a layer's hints name: a key set when they fit one (as
+    // here), else an owner index's file.
+    let listed = |l: &csl_eth_store::Layer| -> BTreeSet<u64> {
+        let h = layer_hints(&f.dir, l);
+        if let Some(k) = h.storage {
+            assert!(h.owners.is_none());
+            return k.0.into_iter().collect();
+        }
+        let idx = h.owners.expect("an owner hint");
+        assert!(idx.is_well_formed());
+        std::fs::read(f.dir.join(idx.path()))
+            .unwrap()
+            .chunks(8)
+            .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let live = |o: &[u8; 32]| {
+        f.s[2]
+            .get(&B256::from(*o))
+            .is_some_and(|a| !a.storage.is_empty())
+    };
+    // One layer, indexed on its own: exactly its owners.
+    let i2 = index_owners(&f.dir, &u2).unwrap();
+    assert_eq!(i2.tables, u2.tables);
+    let want2: BTreeSet<u64> = owners(&f.s[1], &f.s[2]).iter().map(p8).collect();
+    assert_eq!(listed(&i2), want2);
+    // Two merged: every owner held that still has storage, nothing else.
+    let merged = merge_layers(&f.dir, &[u1.clone(), u2.clone()], EPSILON).unwrap();
+    let held: BTreeSet<[u8; 32]> = owners(&f.s[0], &f.s[1])
+        .union(&owners(&f.s[1], &f.s[2]))
+        .copied()
+        .collect();
+    let got = listed(&merged);
+    for o in held.iter().filter(|o| live(o)) {
+        assert!(got.contains(&p8(o)), "{} not listed", hex::encode(o));
+    }
+    let held8: BTreeSet<u64> = held.iter().map(p8).collect();
+    assert!(got.is_subset(&held8));
+    eprintln!("merged: {} owners listed, {} held", got.len(), held.len());
+
+    // The same owners as an owner index (what a layer past the hint cap
+    // gets), the layer otherwise as merged.
+    let index = OwnerIndex::write(&f.dir, &got).unwrap().unwrap();
+    let with_index = |idx: OwnerIndex| {
+        let mut l = merged.clone();
+        l.hints = Hints {
+            storage: None,
+            storage_paths: None,
+            owners: Some(idx),
+            ..layer_hints(&f.dir, &merged)
+        };
+        l.hints_file = None;
+        claim(&f, vec![l]);
+    };
+    with_index(index.clone());
+    let (ins, _) = check(&f.dir, &f, &ps, &want, false, 0, "owner index");
+    assert_eq!(ins, 0);
+
+    // A quiet contract's slot, one cold read each: with the index the
+    // layer is not asked; without it (no owner hint at all) it is.
+    let quiet: Vec<Probe> = ps
+        .iter()
+        .filter(|p| matches!(p, Probe::Slot(h, _) if live(&h.0) && !held.contains(&h.0)))
+        .cloned()
+        .collect();
+    assert!(!quiet.is_empty());
+    let cold = |label: &str| {
+        let mut t = Tally::default();
+        for p in &quiet {
+            let mut snap = Snapshot::open(
+                DirDriver::new(&f.dir),
+                Some(f.heads[2].block_hash),
+                f.heads[2].state_root,
+            )
+            .unwrap();
+            let (a, c) = ask(&mut snap, p);
+            assert!(!insufficient(&a), "{label}: {p:?}");
+            t.add(&c);
+        }
+        eprintln!("{label}: {}", t.line());
+        t
+    };
+    let indexed = cold("quiet slots, owner index");
+    let mut plain = merged.clone();
+    plain.hints = Hints {
+        storage: None,
+        storage_paths: None,
+        owners: None,
+        ..layer_hints(&f.dir, &merged)
+    };
+    plain.hints_file = None;
+    claim(&f, vec![plain]);
+    let unhinted = cold("quiet slots, no owner hint");
+    assert!(
+        indexed.requests < unhinted.requests,
+        "{} vs {}",
+        indexed.requests,
+        unhinted.requests
+    );
+    assert!(indexed.layers < unhinted.layers);
+
+    // Lies. An index of other owners (well formed, so it says No for
+    // every real one): repairs, right answers.
+    let mut rng = ChaCha8Rng::seed_from_u64(77);
+    let fake: BTreeSet<u64> = (0..700).map(|_| rng.random::<u64>()).collect();
+    let fake = OwnerIndex::write(&f.dir, &fake).unwrap().unwrap();
+    with_index(fake.clone());
+    let (ins, _) = check(&f.dir, &f, &ps, &want, false, 0, "index of other owners");
+    assert_eq!(ins, 0);
+    // A count that does not fit its pages.
+    with_index(OwnerIndex {
+        count: fake.count + 1000,
+        ..fake.clone()
+    });
+    let (ins, _) = check(&f.dir, &f, &ps, &want, false, 0, "index that does not fit");
+    assert_eq!(ins, 0);
+    // The real index's file overwritten with zeros, then gone.
+    let real = index;
+    let path = f.dir.join(real.path());
+    let clean = std::fs::read(&path).unwrap();
+    with_index(real.clone());
+    std::fs::write(&path, vec![0u8; clean.len()]).unwrap();
+    let (ins, _) = check(&f.dir, &f, &ps, &want, false, 0, "owner pages zeroed");
+    assert_eq!(ins, 0);
+    std::fs::remove_file(&path).unwrap();
+    let (ins, _) = check(&f.dir, &f, &ps, &want, false, 0, "owner file gone");
+    assert_eq!(ins, 0);
+    std::fs::write(&path, &clean).unwrap();
+    // Missing layer runs under an index still end Insufficient, not wrong.
+    let run = f.dir.join(run_path(
+        &merged.tables.iter().find(|t| t.table_id == 1).unwrap().root,
+    ));
+    let saved = std::fs::read(&run).unwrap();
+    std::fs::remove_file(&run).unwrap();
+    let (ins, _) = check(&f.dir, &f, &ps, &want, true, 0, "storage run gone");
+    assert!(ins > 0);
+    std::fs::write(&run, saved).unwrap();
+    std::fs::remove_dir_all(&f.dir).ok();
+    std::fs::remove_dir_all(&f.fresh).ok();
 }
