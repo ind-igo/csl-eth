@@ -36,7 +36,7 @@ use clap::Args as ClapArgs;
 use csl_eth_client::{DirDriver, Read, Snapshot};
 use csl_eth_head::{
     fetch::{named_of, Beacon},
-    paths, verify_tier, Chain, DirSource, HeadSource, Tier, VerifiedHead,
+    paths, verify_tier, Chain, DirSource, ExecutionHead, HeadSource, Tier, VerifiedHead,
 };
 use csl_eth_store::{
     blob_path, layer_sorter, manifest_path, merge_layers, write_layer_sorted,
@@ -2037,6 +2037,90 @@ fn window_secs(ts: u64) -> u64 {
 /// left; a catch-up longer than that targets the attested head instead.
 const FINALIZED_MIN_WINDOW: u64 = 300;
 
+/// Slots in an epoch: a finalized checkpoint names the block at an epoch's
+/// first slot, or the newest before it when that slot is empty.
+const SLOTS_PER_EPOCH: u64 = 32;
+
+fn slot_of(timestamp: u64) -> u64 {
+    timestamp.saturating_sub(csl_eth_store::history::MAINNET_GENESIS_TIME)
+        / csl_eth_store::history::SECONDS_PER_SLOT
+}
+
+/// The first slot of the newest epoch a step from `held` to `target`
+/// would cross without landing on its block: the slot after `held`'s and
+/// before `target`'s (a target on the epoch's first slot is the block).
+fn crossed_boundary(held_ts: u64, target: &ExecutionHead) -> Option<u64> {
+    let (h, t) = (slot_of(held_ts), slot_of(target.timestamp));
+    let b = t / SLOTS_PER_EPOCH * SLOTS_PER_EPOCH;
+    (b > h && b < t).then_some(b)
+}
+
+/// The block a future finalized checkpoint names, when a step from `held`
+/// to `target` would pass over it: the newest block at or before the
+/// newest crossed epoch boundary, and after `held`. `chain` is the headers
+/// some peer gave from `target`'s number down; each is checked against the
+/// verified `target` hash by hash (the child's parent hash), so a peer can
+/// make this fail but not pick another block.
+fn checkpoint_block(
+    held: &HeadRec,
+    target: &ExecutionHead,
+    chain: &[alloy_consensus::Header],
+) -> Result<Option<ExecutionHead>, String> {
+    let Some(boundary) = crossed_boundary(held.timestamp, target) else {
+        return Ok(None);
+    };
+    let mut want = target.block_hash;
+    for hd in chain {
+        let hash = hd.hash_slow();
+        if hash != want {
+            return Err(format!(
+                "header {} does not link to the verified head",
+                hd.number
+            ));
+        }
+        if hd.number <= held.block_number {
+            return Ok(None);
+        }
+        if slot_of(hd.timestamp) <= boundary {
+            return Ok((hash != target.block_hash).then_some(ExecutionHead {
+                block_number: hd.number,
+                block_hash: hash,
+                state_root: hd.state_root,
+                timestamp: hd.timestamp,
+            }));
+        }
+        want = hd.parent_hash;
+    }
+    Err("headers ran out before the epoch boundary".into())
+}
+
+/// [`checkpoint_block`] with the headers from the pool: at most an epoch's
+/// worth, `target`'s first.
+async fn checkpoint_from_peers(
+    pool: &mut Pool,
+    held: &HeadRec,
+    target: &ExecutionHead,
+) -> Result<Option<ExecutionHead>, String> {
+    let Some(boundary) = crossed_boundary(held.timestamp, target) else {
+        return Ok(None);
+    };
+    let mut chain = Vec::new();
+    let mut n = target.block_number;
+    while n > held.block_number && chain.len() <= SLOTS_PER_EPOCH as usize {
+        let hd = pool
+            .header(n)
+            .await
+            .ok_or_else(|| format!("no peer gave header {n}"))?;
+        let done = slot_of(hd.timestamp) <= boundary;
+        chain.push(hd);
+        if done {
+            break;
+        }
+        n -= 1;
+    }
+    checkpoint_block(held, target, &chain)
+}
+
 /// Manifests to collect: the oldest past `keep`, never a pinned one.
 fn collectable(
     manifests: &VecDeque<(B256, Vec<String>)>,
@@ -2129,16 +2213,17 @@ impl Tracker {
     /// Write the step's layer, merge tiers, write the manifest, read the
     /// changes back through the client, publish, collect, save.
     /// A finalized step publishes `head/finality` and pins its manifest,
-    /// and leaves `head/optimistic` and `snapshots/latest` alone.
+    /// and leaves `head/optimistic` and `snapshots/latest` alone; a step
+    /// with no tier (a checkpoint block on the way to the attested head)
+    /// publishes its manifest and moves no pointer.
     fn commit(
         &mut self,
         h: &mut Tracked,
         update: &[u8],
-        vh: &VerifiedHead,
-        tier: Tier,
+        e: &ExecutionHead,
+        tier: Option<Tier>,
     ) -> Result<Value, String> {
         let t0 = Instant::now();
-        let e = &vh.execution;
         let head = Head {
             block_hash: e.block_hash,
             block_number: e.block_number,
@@ -2165,7 +2250,7 @@ impl Tracker {
             self.args.fanout,
             self.args.tiers,
         )?;
-        let manifest = self.manifest(&head, tier == Tier::Attested)?;
+        let manifest = self.manifest(&head, tier == Some(Tier::Attested))?;
         let check = match read_back(&self.root, &head, h) {
             Ok(v) => v,
             Err(err) => {
@@ -2214,7 +2299,7 @@ impl Tracker {
         m: &Manifest,
         h: &Tracked,
         update: &[u8],
-        tier: Tier,
+        tier: Option<Tier>,
     ) -> Result<Value, String> {
         let mut sent = (0u64, 0u64);
         for r in manifest_runs(m) {
@@ -2237,13 +2322,16 @@ impl Tracker {
             .manifests
             .push_back((head.block_hash, manifest_runs(m)));
         match tier {
-            Tier::Attested => {
+            Some(Tier::Attested) => {
                 write_atomic(&self.root.join(paths::OPTIMISTIC), update)?;
                 self.put(paths::OPTIMISTIC, &mut sent)?;
                 self.put(LATEST_FILE, &mut sent)?;
                 self.st.optimistic = Some(head.block_hash);
             }
-            Tier::Finalized => self.publish_finality(head, update, &mut sent)?,
+            Some(Tier::Finalized) => self.publish_finality(head, update, &mut sent)?,
+            // A checkpoint block: its manifest only, for the pin when it
+            // finalizes.
+            None => {}
         }
         Ok(json!({"files": sent.0, "bytes": sent.1}))
     }
@@ -2585,7 +2673,7 @@ pub async fn run(args: Args) -> Result<(), String> {
                 continue;
             }
         };
-        let target = vh.execution;
+        let mut target = vh.execution;
         if target.block_number < h.st.head.block_number + args.every_blocks.max(1)
             || target.block_hash == h.st.head.block_hash
         {
@@ -2595,6 +2683,22 @@ pub async fn run(args: Args) -> Result<(), String> {
         if pool.connected() == 0 {
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
+        }
+        // A step over an epoch boundary would leave the block the next
+        // finalized checkpoint names without a manifest, and `head/finality`
+        // could not move until a later step happened to land on one: step to
+        // that block first, publish its manifest alone, then go on.
+        let mut tier = Some(tier);
+        if tier == Some(Tier::Attested) && target.block_number > h.st.head.block_number + 1 {
+            match checkpoint_from_peers(&mut pool, &h.st.head, &target).await {
+                Ok(Some(b)) => {
+                    h.log.emit(json!({"ev": "checkpoint_first", "block": b.block_number, "head": target.block_number}));
+                    target = b;
+                    tier = None;
+                }
+                Ok(None) => {}
+                Err(e) => h.log.emit(json!({"ev": "checkpoint_unknown", "error": e})),
+            }
         }
         attempt += 1;
         // Peers keep about 128 blocks of roots; stop a little short.
@@ -2644,7 +2748,7 @@ pub async fn run(args: Args) -> Result<(), String> {
             }
             Ok(mut tracked) => {
                 let res =
-                    tokio::task::block_in_place(|| h.commit(&mut tracked, &update, &vh, tier));
+                    tokio::task::block_in_place(|| h.commit(&mut tracked, &update, &target, tier));
                 if res.is_ok() {
                     db.reset(h.st.head.state_root)?;
                     if let Some(ix) = roots.as_mut() {
@@ -2667,7 +2771,7 @@ pub async fn run(args: Args) -> Result<(), String> {
                             "step"
                         );
                         h.log.emit(json!({
-                            "ev": "step", "tier": format!("{tier:?}"), "step": h.st.steps, "attempt": attempt, "from": from, "to": target.block_number,
+                            "ev": "step", "tier": tier.map_or("Checkpoint".to_string(), |t| format!("{t:?}")), "step": h.st.steps, "attempt": attempt, "from": from, "to": target.block_number,
                             "blocks": target.block_number - from, "block_hash": target.block_hash, "state_root": target.state_root,
                             "step_s": step_s, "lag_s": lag(target.timestamp), "peers": pool.connected(),
                             "head_lag_s": vh.lag_secs, "participants": vh.participants, "stats": tracked.stats, "commit": v,
@@ -3981,6 +4085,91 @@ mod tests {
             got[0].0
         );
         assert_eq!(got[0].1, got[1].1);
+    }
+
+    /// A step that crosses an epoch boundary goes first to the block the
+    /// boundary's checkpoint will name: the newest at or before the
+    /// boundary slot (an empty boundary slot falls back to the block
+    /// before), found by walking the peers' headers from the verified head.
+    #[test]
+    fn a_step_across_an_epoch_boundary_stops_at_its_checkpoint_block() {
+        use alloy_consensus::Header;
+        let g = csl_eth_store::history::MAINNET_GENESIS_TIME;
+        let at = |slot: u64| g + slot * 12;
+        // Blocks at slots 3_200_000 + i, i = 0..=60, but none at the
+        // boundary slot 3_200_032 (an empty slot).
+        let base_slot = 3_200_000u64;
+        let mut chain: Vec<Header> = Vec::new();
+        let mut parent = B256::repeat_byte(9);
+        let mut n = 1_000u64;
+        for i in 0..=60u64 {
+            if i == 32 {
+                continue;
+            }
+            let hd = Header {
+                parent_hash: parent,
+                number: n,
+                timestamp: at(base_slot + i),
+                state_root: B256::from(U256::from(n)),
+                ..Default::default()
+            };
+            parent = hd.hash_slow();
+            chain.push(hd);
+            n += 1;
+        }
+        let exec = |hd: &Header| ExecutionHead {
+            block_number: hd.number,
+            block_hash: hd.hash_slow(),
+            state_root: hd.state_root,
+            timestamp: hd.timestamp,
+        };
+        let rec = |hd: &Header| HeadRec {
+            block_hash: hd.hash_slow(),
+            block_number: hd.number,
+            timestamp: hd.timestamp,
+            state_root: hd.state_root,
+        };
+        let down = |from: usize| -> Vec<Header> { chain[..=from].iter().rev().cloned().collect() };
+        let last = chain.len() - 1;
+        let target = exec(&chain[last]);
+        // Held at slot +5: the step to slot +60 crosses slot +32, whose
+        // checkpoint names the block at slot +31.
+        let held = rec(&chain[5]);
+        let b = checkpoint_block(&held, &target, &down(last))
+            .unwrap()
+            .unwrap();
+        assert_eq!(slot_of(b.timestamp), base_slot + 31);
+        assert_eq!(b.block_hash, chain[31].hash_slow());
+        assert_eq!(b.state_root, chain[31].state_root);
+        // Held past the boundary: nothing to stop at.
+        assert_eq!(
+            checkpoint_block(&rec(&chain[40]), &target, &down(last)),
+            Ok(None)
+        );
+        // A one-epoch step that ends before the boundary.
+        assert_eq!(
+            checkpoint_block(&held, &exec(&chain[20]), &down(20)),
+            Ok(None)
+        );
+        // Held on the block the checkpoint names: it has its manifest.
+        assert_eq!(
+            checkpoint_block(&rec(&chain[31]), &target, &down(last)),
+            Ok(None)
+        );
+        // A boundary slot with its block: that block.
+        let mut held_early = rec(&chain[0]);
+        held_early.timestamp = at(base_slot - 40);
+        held_early.block_number = 900;
+        let b = checkpoint_block(&held_early, &exec(&chain[31]), &down(31))
+            .unwrap()
+            .unwrap();
+        assert_eq!(slot_of(b.timestamp), base_slot);
+        // A peer's header that does not link to the verified head.
+        let mut bad = down(last);
+        bad[3].gas_used += 1;
+        assert!(checkpoint_block(&held, &target, &bad).is_err());
+        // Headers that stop short of the boundary.
+        assert!(checkpoint_block(&held, &target, &down(last)[..10]).is_err());
     }
 
     #[test]

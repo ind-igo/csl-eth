@@ -549,6 +549,11 @@ impl Pool {
         rx.await.ok().flatten()
     }
 
+    /// Some peer's header at `number` (unchecked: the caller links it).
+    pub async fn header(&mut self, number: u64) -> Option<Header> {
+        self.header_at(number).await
+    }
+
     async fn header_at(&mut self, number: u64) -> Option<Header> {
         for _ in 0..3 {
             let w = self.worker(Duration::from_secs(60)).await?;
