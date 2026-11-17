@@ -64,6 +64,10 @@ if [ ! -f /data/swap ]; then
   fallocate -l 8G /data/swap && chmod 600 /data/swap && mkswap -q /data/swap
 fi
 swapon --show | grep -q /data/swap || swapon /data/swap
+# Swap is for the release build. The tracker's node index must stay in
+# memory: at the default swappiness the kernel swapped it out for page cache
+# and a catch-up's materializing walk slowed to swap speed.
+echo "vm.swappiness = 1" > /etc/sysctl.d/90-csl-eth.conf && sysctl -q vm.swappiness=1
 id csl >/dev/null 2>&1 || useradd --system --home-dir /data/home --create-home --shell /usr/sbin/nologin csl
 mkdir -p /data/produce /opt/csl-eth /etc/csl-eth
 chown csl:csl /data/produce
