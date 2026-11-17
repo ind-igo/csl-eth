@@ -198,6 +198,28 @@ impl csl_eth_trie::Sink for Collect<'_> {
     }
 }
 
+/// A storage trie's nodes keyed by position as account-table keys (the
+/// path's nibbles packed into 31 bytes, the depth last), slots sorted by
+/// hashed key: the positions a layer's storage path hint is built from.
+pub fn storage_positions(slots: &[(B256, U256)]) -> Result<Rows, ProduceError> {
+    let mut keyed = Vec::new();
+    let mut by_hash = Vec::new();
+    let mut b = Builder::new(Collect {
+        keyed: &mut keyed,
+        by_hash: &mut by_hash,
+        owner: None,
+        err: None,
+    });
+    for (slot, word) in slots {
+        b.push(path_of(slot), encode_word(word))?;
+    }
+    let (_, sink) = b.finish();
+    if let Some(e) = sink.err {
+        return Err(e);
+    }
+    Ok(keyed)
+}
+
 /// What the producer may vary per snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {

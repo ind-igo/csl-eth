@@ -13,7 +13,11 @@
 //!   `depth` that have nothing of the layer below them. Above `depth` the
 //!   hint is exact: a layer holds a real node there iff it holds something
 //!   under it.
-//! - Storage nodes: the owners (`keccak(address)`) with nodes in the layer.
+//! - Storage nodes: the owners (`keccak(address)`) with nodes in the layer,
+//!   and for the owners with many (a contract whose storage changes every
+//!   block is in every layer), their positions as an account hint keeps
+//!   them, cut per owner ([`StoragePaths`]). Without that, a read of a hot
+//!   contract's slot would ask every layer at every depth below its root.
 //! - Code: the code hashes.
 //!
 //! Owners and code hashes are kept as their first eight bytes.
@@ -25,7 +29,7 @@
 //! not hash only costs the reader its hints.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// The most entries a table's hint may have: an account hint of up to
 /// 512 KiB of hex, a key set of up to 1 MiB. Mainnet's 64-block layers
@@ -36,6 +40,15 @@ pub const HINT_INLINE: usize = 4096;
 /// The most of the prefixes at its depth an account hint may cover.
 pub const HINT_COVERAGE: f64 = 0.01;
 const MAX_DEPTH: usize = 8;
+/// An owner with at least this many storage nodes in a layer gets a path
+/// hint; one with fewer is only named.
+pub const HOT_MIN: usize = 64;
+/// The most entries all of a layer's storage path hints may have together;
+/// past it, the owners with the most nodes are hinted first.
+pub const STORAGE_PATHS_CAP: usize = 2 * HINT_CAP;
+/// The most storage positions collected for path hints; a step past it (a
+/// long catch-up, whose layer is too big to hint anyway) gets none.
+const COLLECT_CAP: usize = 1 << 22;
 
 /// A layer's hints; a table without one is asked for every key.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,11 +59,35 @@ pub struct Hints {
     pub storage: Option<KeySet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<KeySet>,
+    /// Path hints for the hot owners in `storage`. An owner in `storage`
+    /// without one may hold any position in its trie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_paths: Option<StoragePaths>,
 }
 
 impl Hints {
     pub fn is_empty(&self) -> bool {
-        self.account.is_none() && self.storage.is_none() && self.code.is_none()
+        self.account.is_none()
+            && self.storage.is_none()
+            && self.code.is_none()
+            && self.storage_paths.is_none()
+    }
+
+    /// May the layer hold the storage position at `depth` on the path whose
+    /// first eight nibbles are `top8`, in `owner`'s trie?
+    pub fn storage_holds(&self, owner: &[u8; 32], top8: u32, depth: usize) -> Holds {
+        let Some(s) = &self.storage else {
+            return Holds::Maybe;
+        };
+        if !s.contains(owner) {
+            return Holds::No;
+        }
+        match self.storage_paths.as_ref().and_then(|p| p.get(owner)) {
+            Some(p) => p.holds(top8, depth),
+            // Its storage changed in the layer: its root is there.
+            None if depth == 0 => Holds::Yes,
+            None => Holds::Maybe,
+        }
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -124,6 +161,31 @@ impl PathHint {
 
     pub fn len(&self) -> usize {
         self.cut.len() + self.short.len()
+    }
+
+    /// A hint holding every position either holds (a merged layer's), at
+    /// the shallower depth; `None` past [`HINT_CAP`].
+    pub fn union(&self, other: &PathHint) -> Option<PathHint> {
+        let d = self.depth.min(other.depth);
+        let mut cut: BTreeSet<u32> = BTreeSet::new();
+        let mut short: BTreeSet<(u8, u32)> = BTreeSet::new();
+        for h in [self, other] {
+            let down = 4 * (h.depth - d) as u32;
+            cut.extend(h.cut.iter().map(|&c| c >> down));
+            for &(sd, q) in &h.short {
+                if sd < d {
+                    short.insert((sd, q));
+                } else {
+                    // Shallower than its own cut, at or below the new one.
+                    cut.insert(q >> (4 * (sd - d) as u32));
+                }
+            }
+        }
+        (cut.len() + short.len() <= HINT_CAP).then(|| PathHint {
+            depth: d,
+            cut: cut.into_iter().collect(),
+            short: short.into_iter().collect(),
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -285,6 +347,171 @@ impl TryFrom<String> for KeySet {
     }
 }
 
+/// Path hints for a layer's hot owners, by the owner's first eight bytes:
+/// `{"<16 hex>": <account-style hint over the owner's storage paths>}`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    try_from = "BTreeMap<String, PathHint>",
+    into = "BTreeMap<String, PathHint>"
+)]
+pub struct StoragePaths(pub BTreeMap<u64, PathHint>);
+
+impl StoragePaths {
+    pub fn get(&self, owner: &[u8; 32]) -> Option<&PathHint> {
+        self.0.get(&prefix8(owner))
+    }
+
+    pub fn entries(&self) -> usize {
+        self.0.values().map(PathHint::len).sum()
+    }
+
+    /// For merged layers, oldest first, each `(owners, paths)`: an owner
+    /// keeps a path hint only if every layer that names it has one for it.
+    /// `None` when any layer's owners are unknown.
+    pub fn merge(layers: &[(Option<&KeySet>, Option<&StoragePaths>)]) -> Option<StoragePaths> {
+        let mut acc: BTreeMap<u64, Option<PathHint>> = BTreeMap::new();
+        for (owners, paths) in layers {
+            let owners = (*owners)?;
+            for &o in &owners.0 {
+                let mine = paths.and_then(|p| p.0.get(&o));
+                let e = acc.entry(o);
+                match (e, mine) {
+                    (std::collections::btree_map::Entry::Vacant(v), m) => {
+                        v.insert(m.cloned());
+                    }
+                    (std::collections::btree_map::Entry::Occupied(mut v), Some(m)) => {
+                        let u = v.get().as_ref().and_then(|h| h.union(m));
+                        v.insert(u);
+                    }
+                    (std::collections::btree_map::Entry::Occupied(mut v), None) => {
+                        v.insert(None);
+                    }
+                }
+            }
+        }
+        let mut hot: Vec<(u64, PathHint)> =
+            acc.into_iter().filter_map(|(o, h)| Some((o, h?))).collect();
+        hot.sort_by_key(|(o, h)| (std::cmp::Reverse(h.len()), *o));
+        Some(StoragePaths::capped(hot))
+    }
+
+    /// The hints in order until [`STORAGE_PATHS_CAP`] entries.
+    fn capped(hints: Vec<(u64, PathHint)>) -> StoragePaths {
+        let mut out = BTreeMap::new();
+        let mut n = 0;
+        for (o, h) in hints {
+            if n + h.len() > STORAGE_PATHS_CAP {
+                continue;
+            }
+            n += h.len();
+            out.insert(o, h);
+        }
+        StoragePaths(out)
+    }
+}
+
+impl From<StoragePaths> for BTreeMap<String, PathHint> {
+    fn from(p: StoragePaths) -> Self {
+        p.0.into_iter()
+            .map(|(o, h)| (format!("{o:016x}"), h))
+            .collect()
+    }
+}
+
+impl TryFrom<BTreeMap<String, PathHint>> for StoragePaths {
+    type Error = String;
+    fn try_from(m: BTreeMap<String, PathHint>) -> Result<StoragePaths, String> {
+        let mut out = BTreeMap::new();
+        for (k, h) in m {
+            if k.len() != 16 {
+                return Err(format!("storage path hint owner {k}"));
+            }
+            let o = u64::from_str_radix(&k, 16)
+                .map_err(|e| format!("storage path hint owner {k}: {e}"))?;
+            out.insert(o, h);
+        }
+        Ok(StoragePaths(out))
+    }
+}
+
+/// Collects a step's storage positions per owner for [`StoragePaths`].
+#[derive(Clone, Debug)]
+pub struct StoragePathsBuilder {
+    /// owner's first eight bytes → (top8 << 8 | depth) of each position.
+    per: std::collections::HashMap<u64, Vec<u64>>,
+    n: usize,
+    over: bool,
+    min: usize,
+}
+
+impl Default for StoragePathsBuilder {
+    fn default() -> Self {
+        StoragePathsBuilder {
+            per: Default::default(),
+            n: 0,
+            over: false,
+            min: HOT_MIN,
+        }
+    }
+}
+
+impl StoragePathsBuilder {
+    /// Hint owners with at least `min` positions instead of [`HOT_MIN`]
+    /// (tests hint every owner).
+    pub fn hot_min(mut self, min: usize) -> Self {
+        self.min = min.max(1);
+        self
+    }
+
+    /// A storage node of `owner` at the position `key` (its path's nibbles
+    /// packed into 31 bytes, its depth last, as an account-table key).
+    pub fn push(&mut self, owner: &[u8; 32], key: &[u8; 32]) {
+        if self.over {
+            return;
+        }
+        self.n += 1;
+        if self.n > COLLECT_CAP {
+            self.over = true;
+            self.per = Default::default();
+            return;
+        }
+        self.per
+            .entry(prefix8(owner))
+            .or_default()
+            .push((top8(key) as u64) << 8 | key[31] as u64);
+    }
+
+    /// Hints for the owners with at least [`HOT_MIN`] positions (or the
+    /// [`hot_min`](Self::hot_min) given), most
+    /// positions first, up to [`STORAGE_PATHS_CAP`] entries; `None` past
+    /// the collection cap.
+    pub fn finish(self) -> Option<StoragePaths> {
+        if self.over {
+            return None;
+        }
+        let mut hot: Vec<(u64, Vec<u64>)> = self
+            .per
+            .into_iter()
+            .filter(|(_, v)| v.len() >= self.min)
+            .collect();
+        hot.sort_by_key(|(o, v)| (std::cmp::Reverse(v.len()), *o));
+        let hints = hot
+            .into_iter()
+            .filter_map(|(o, v)| {
+                let mut b = PathHintBuilder::default();
+                for p in v {
+                    let mut k = [0u8; 32];
+                    k[..4].copy_from_slice(&((p >> 8) as u32).to_be_bytes());
+                    k[31] = p as u8;
+                    b.push(&k);
+                }
+                Some((o, b.finish()?))
+            })
+            .collect();
+        Some(StoragePaths::capped(hints))
+    }
+}
+
 /// `{"depth": d, "cut": hex of ⌈d/2⌉-byte entries, "short": hex of
 /// (depth byte, ⌈d/2⌉ bytes)}`.
 #[derive(Serialize, Deserialize)]
@@ -420,5 +647,110 @@ mod tests {
         let j = serde_json::to_string(&ks).unwrap();
         assert_eq!(serde_json::from_str::<KeySet>(&j).unwrap(), ks);
         assert!(serde_json::from_str::<KeySet>("\"02020202020202020101010101010101\"").is_err());
+    }
+
+    fn leaf_and_ancestors(rng: &mut ChaCha8Rng, depth: usize) -> Vec<(Vec<u8>, usize)> {
+        let path: Vec<u8> = (0..64).map(|_| rng.random_range(0..16u8)).collect();
+        (0..=depth).map(|d| (path.clone(), d)).collect()
+    }
+
+    /// A hot owner's path hint, a named owner's root, an unnamed owner:
+    /// no position a layer holds is ever `No`, and a hot owner's random
+    /// slots mostly are. Merged layers keep a path hint only for owners
+    /// every layer hinted, and it holds both layers' positions.
+    #[test]
+    fn storage_path_hints_never_say_no_to_a_position_held() {
+        let mut rng = ChaCha8Rng::seed_from_u64(9);
+        let hot = [7u8; 32];
+        let cold = [9u8; 32];
+        let gone = [11u8; 32];
+        let mut held: Vec<([u8; 32], Vec<u8>, usize)> = Vec::new();
+        let mut b = StoragePathsBuilder::default();
+        for _ in 0..200 {
+            for (p, d) in leaf_and_ancestors(&mut rng, 7) {
+                b.push(&hot, &key(&p, d));
+                held.push((hot, p, d));
+            }
+        }
+        for _ in 0..3 {
+            for (p, d) in leaf_and_ancestors(&mut rng, 5) {
+                b.push(&cold, &key(&p, d));
+                held.push((cold, p, d));
+            }
+        }
+        let paths = b.finish().expect("paths");
+        assert!(paths.get(&hot).is_some(), "the hot owner is hinted");
+        assert!(paths.get(&cold).is_none(), "18 positions is not hot");
+        let h = Hints {
+            storage: KeySet::of([hot, cold].iter()),
+            storage_paths: Some(paths),
+            ..Hints::default()
+        };
+        let top = |p: &[u8]| top8(&key(p, 8));
+        for (o, p, d) in &held {
+            assert_ne!(h.storage_holds(o, top(p), *d), Holds::No, "{o:?} {p:?} {d}");
+        }
+        assert_eq!(h.storage_holds(&cold, 0, 0), Holds::Yes);
+        assert_eq!(h.storage_holds(&cold, 0, 3), Holds::Maybe);
+        assert_eq!(h.storage_holds(&gone, 0, 0), Holds::No);
+        let mut no = 0;
+        for _ in 0..10_000 {
+            let p: Vec<u8> = (0..8).map(|_| rng.random_range(0..16u8)).collect();
+            if h.storage_holds(&hot, top(&p), 6) == Holds::No {
+                no += 1;
+            }
+        }
+        assert!(no > 9_000, "{no}");
+        let j = serde_json::to_string(&h).unwrap();
+        assert_eq!(serde_json::from_str::<Hints>(&j).unwrap(), h);
+        // An old manifest's hints, without the field, read as before.
+        let old: Hints = serde_json::from_str(r#"{"storage":"0707070707070707"}"#).unwrap();
+        assert_eq!(old.storage_holds(&hot, 0, 3), Holds::Maybe);
+
+        // A second layer with other positions of the hot owner.
+        let mut b2 = StoragePathsBuilder::default();
+        let mut held2 = Vec::new();
+        for _ in 0..3000 {
+            for (p, d) in leaf_and_ancestors(&mut rng, 9) {
+                b2.push(&hot, &key(&p, d));
+                held2.push((p, d));
+            }
+        }
+        let h2 = Hints {
+            storage: KeySet::of([hot].iter()),
+            storage_paths: b2.finish(),
+            ..Hints::default()
+        };
+        let d1 = h.storage_paths.as_ref().unwrap().get(&hot).unwrap().depth;
+        let d2 = h2.storage_paths.as_ref().unwrap().get(&hot).unwrap().depth;
+        assert_ne!(d1, d2, "the union has to change one hint's depth");
+        let pair = |a: &Hints, b: &Hints| {
+            StoragePaths::merge(&[
+                (a.storage.as_ref(), a.storage_paths.as_ref()),
+                (b.storage.as_ref(), b.storage_paths.as_ref()),
+            ])
+        };
+        let merged = Hints {
+            storage: KeySet::union(h.storage.as_ref(), h2.storage.as_ref()),
+            storage_paths: pair(&h, &h2),
+            ..Hints::default()
+        };
+        assert!(merged.storage_paths.as_ref().unwrap().get(&hot).is_some());
+        for (o, p, d) in held
+            .iter()
+            .map(|(o, p, d)| (*o, p.clone(), *d))
+            .chain(held2.iter().map(|(p, d)| (hot, p.clone(), *d)))
+        {
+            assert_ne!(merged.storage_holds(&o, top(&p), d), Holds::No, "{p:?} {d}");
+        }
+        // A layer that names the hot owner without a path hint: none after.
+        let named = Hints {
+            storage: KeySet::of([hot].iter()),
+            ..Hints::default()
+        };
+        assert!(pair(&h, &named).unwrap().get(&hot).is_none());
+        assert!(pair(&named, &h).unwrap().get(&hot).is_none());
+        // A layer whose owners are unknown: no path hints at all.
+        assert!(pair(&h, &Hints::default()).is_none());
     }
 }

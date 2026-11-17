@@ -12,7 +12,9 @@ use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{HashBuilder, KECCAK_EMPTY};
 use csl_eth_client::{Cost, DirDriver, Driver, Read, Snapshot};
 use csl_eth_store::{
-    build_rows, manifest_path, merge_layers, produce, run_path, write_layer,
+    build_rows,
+    hints::{StoragePaths, StoragePathsBuilder},
+    layer_hints, manifest_path, merge_layers, produce, run_path, storage_positions, write_layer,
     write_layered_manifest, AccountLeaf, Head, LayerRows, Manifest, ProduceOptions, Rows4, EPSILON,
 };
 use csl_eth_trie::{encode_word, path_of, Account};
@@ -824,6 +826,7 @@ fn layer_faults_never_become_false_answers() {
         }),
         storage: Some(KeySet(vec![])),
         code: Some(KeySet(vec![])),
+        storage_paths: None,
     };
     let lying = |file: Option<[u8; 32]>| {
         let mut l = f.l2.clone();
@@ -931,13 +934,73 @@ fn churn(s: &State, rng: &mut ChaCha8Rng) -> State {
     next
 }
 
+/// A contract whose storage changes every step, as USDT's every block:
+/// 40 of its slots rewritten and 5 added.
+fn churn_hot(s: &mut State, hot: &B256, rng: &mut ChaCha8Rng) {
+    let a = s.get_mut(hot).unwrap();
+    let slots: Vec<B256> = a.storage.keys().copied().collect();
+    for _ in 0..40 {
+        let k = slots[rng.random_range(0..slots.len())];
+        a.storage.insert(k, U256::from(rng.random::<u64>() | 1));
+    }
+    for _ in 0..5 {
+        a.storage
+            .insert(key(rng.random(), rng), U256::from(rng.random::<u64>() | 1));
+    }
+}
+
+/// The storage path hints of the step `old` → `new`, as the tracker makes
+/// them: each owner's trie nodes in `new` that are not in `old`.
+fn storage_paths(old: &State, new: &State) -> Option<StoragePaths> {
+    let mut b = StoragePathsBuilder::default();
+    for o in owners(old, new) {
+        let slots = |s: &State| -> Vec<(B256, U256)> {
+            s.get(&B256::from(o))
+                .map(|a| a.storage.iter().map(|(k, v)| (*k, *v)).collect())
+                .unwrap_or_default()
+        };
+        let was: BTreeSet<_> = storage_positions(&slots(old))
+            .unwrap()
+            .into_iter()
+            .collect();
+        for (k, v) in storage_positions(&slots(new)).unwrap() {
+            if !was.contains(&(k, v)) {
+                b.push(&o, &k);
+            }
+        }
+    }
+    b.finish()
+}
+
 /// The read cost over N layers, against a fresh build of the same state,
 /// and the same layers merged into one: printed for the record, with the
 /// answers checked each time.
+///
+/// The first layer is a catch-up's: 40 steps in one, read as if over the
+/// hints' cap (no hints, as the live one has none). A hot contract changes
+/// in every layer; its slots are read with its path hints, with only the
+/// owner named (as before 2026-11-17), and with no hints.
 #[test]
 fn read_cost_over_n_layers_and_merged() {
-    let (s0, _, _, _) = states();
+    let (mut s0, _, _, _) = states();
     let mut rng = ChaCha8Rng::seed_from_u64(21);
+    let hot = key(0x5a, &mut rng);
+    s0.insert(
+        hot,
+        Acct {
+            nonce: 1,
+            balance: U256::from(1u64),
+            storage: (0..3000)
+                .map(|_| {
+                    (
+                        key(rng.random(), &mut rng),
+                        U256::from(rng.random::<u64>() | 1),
+                    )
+                })
+                .collect(),
+            code: Some(code(&mut rng, 600)),
+        },
+    );
     let dir = scratch("n-layers");
     let h0 = head_of(&s0, 0);
     let base = produce(&dir, &h0, "", leaves(&s0), &code_of(&s0))
@@ -947,22 +1010,39 @@ fn read_cost_over_n_layers_and_merged() {
     let mut r_prev = rows(&s0, &h0);
     let mut layers = Vec::new();
     let mut lines = Vec::new();
+    let mut hot_hinted = Vec::new();
     for n in 1..=16u8 {
-        let next = churn(&s, &mut rng);
+        let steps = if n == 1 { 40 } else { 1 };
+        let mut next = s.clone();
+        for _ in 0..steps {
+            next = churn(&next, &mut rng);
+            churn_hot(&mut next, &hot, &mut rng);
+        }
         let h = head_of(&next, n);
         let r = rows(&next, &h);
         let mut d = LayerRows::diff(&r_prev, &r);
         d.owners = Some(owners(&s, &next));
-        layers.push(
-            write_layer(
-                &dir,
-                h0.block_number + n as u64 - 1,
-                h.block_number,
-                &d,
-                EPSILON,
-            )
-            .unwrap(),
-        );
+        d.storage_paths = storage_paths(&s, &next);
+        let mut l = write_layer(
+            &dir,
+            h0.block_number + n as u64 - 1,
+            h.block_number,
+            &d,
+            EPSILON,
+        )
+        .unwrap();
+        if n == 1 {
+            assert!(l.hints_file.is_some(), "the catch-up's hints are in a file");
+            l.hints = Default::default();
+            l.hints_file = None;
+        } else {
+            hot_hinted.push(
+                layer_hints(&dir, &l)
+                    .storage_paths
+                    .is_some_and(|p| p.get(&hot.0).is_some()),
+            );
+        }
+        layers.push(l);
         s = next;
         r_prev = r;
         if ![1, 2, 4, 8, 16].contains(&n) {
@@ -979,8 +1059,15 @@ fn read_cost_over_n_layers_and_merged() {
             }
             ps.push(Probe::Account(key(rng.random(), &mut rng)));
         }
+        // The hot contract's slots, some just written, and absent ones.
+        let hot_slots: Vec<B256> = s[&hot].storage.keys().copied().collect();
+        let mut hs: Vec<Probe> = (0..150)
+            .map(|_| Probe::Slot(hot, hot_slots[rng.random_range(0..hot_slots.len())]))
+            .collect();
+        hs.extend((0..50).map(|_| Probe::Slot(hot, key(rng.random(), &mut rng))));
         let mut t = Snapshot::open(DirDriver::new(&fresh), None, h.state_root).unwrap();
         let want: Vec<Answer> = ps.iter().map(|p| ask(&mut t, p).0).collect();
+        let hot_want: Vec<Answer> = hs.iter().map(|p| ask(&mut t, p).0).collect();
         let f = Fixture {
             dir: dir.clone(),
             fresh: fresh.clone(),
@@ -995,6 +1082,7 @@ fn read_cost_over_n_layers_and_merged() {
             .iter()
             .map(|l| csl_eth_store::Layer {
                 hints: Default::default(),
+                hints_file: None,
                 ..l.clone()
             })
             .collect();
@@ -1009,11 +1097,37 @@ fn read_cost_over_n_layers_and_merged() {
             &format!("{n} layers, no hints"),
         );
         assert_eq!(ins, 0);
+        let (ins, hot_bare) = check(&dir, &f, &hs, &hot_want, false, 0, "hot, no hints");
+        assert_eq!(ins, 0);
+        let named: Vec<csl_eth_store::Layer> = layers
+            .iter()
+            .map(|l| {
+                let mut l = l.clone();
+                l.hints = layer_hints(&dir, &l);
+                l.hints.storage_paths = None;
+                l.hints_file = None;
+                l
+            })
+            .collect();
+        write_layered_manifest(&dir, &h, &base, named, true).unwrap();
+        let (ins, hot_named) = check(&dir, &f, &hs, &hot_want, false, 0, "hot, owners");
+        assert_eq!(ins, 0);
         let m = write_layered_manifest(&dir, &h, &base, layers.clone(), true).unwrap();
         let mbytes = m.to_json().len();
         let (ins, layered) = check(&dir, &f, &ps, &want, false, 0, &format!("{n} layers"));
         assert_eq!(ins, 0);
+        let (ins, hot_paths) = check(&dir, &f, &hs, &hot_want, false, 0, "hot, paths");
+        assert_eq!(ins, 0);
         let (_, plain) = check(&fresh, &f, &ps, &want, false, 0, "fresh");
+        let (_, hot_plain) = check(&fresh, &f, &hs, &hot_want, false, 0, "hot, fresh");
+        if n >= 4 {
+            assert!(
+                hot_paths.requests * 4 < hot_named.requests * 3,
+                "{n} layers: hot slot reads with path hints {} requests, owners only {}",
+                hot_paths.requests,
+                hot_named.requests
+            );
+        }
         let merged = merge_layers(&dir, &layers, EPSILON).unwrap();
         let hint_file = merged.hints_file.is_some();
         write_layered_manifest(&dir, &h, &base, vec![merged], true).unwrap();
@@ -1026,6 +1140,8 @@ fn read_cost_over_n_layers_and_merged() {
             0,
             &format!("{n} layers merged"),
         );
+        assert_eq!(ins, 0);
+        let (ins, hot_one) = check(&dir, &f, &hs, &hot_want, false, 0, "hot, merged");
         assert_eq!(ins, 0);
         let x = |t: &Tally| {
             format!(
@@ -1043,12 +1159,29 @@ fn read_cost_over_n_layers_and_merged() {
             x(&one),
             plain.rounds as f64 / plain.reads as f64,
             mbytes,
-            layers.iter().map(|l| l.hints.account.as_ref().map(|a| a.depth)).collect::<Vec<_>>(),
+            layers.iter().map(|l| layer_hints(&dir, l).account.map(|a| a.depth)).collect::<Vec<_>>(),
+        ));
+        let y = |t: &Tally| {
+            format!(
+                "{:.2}x ({:.1} req, {:.2} layers/read)",
+                t.requests as f64 / hot_plain.requests as f64,
+                t.requests as f64 / t.reads as f64,
+                t.layers as f64 / t.reads as f64,
+            )
+        };
+        lines.push(format!(
+            "    hot slot: paths {} | owners {} | none {} | merged {} | fresh {:.1} req",
+            y(&hot_paths),
+            y(&hot_named),
+            y(&hot_bare),
+            y(&hot_one),
+            hot_plain.requests as f64 / hot_plain.reads as f64,
         ));
         std::fs::remove_dir_all(&fresh).ok();
     }
     for l in &lines {
         eprintln!("{l}");
     }
+    assert!(hot_hinted.iter().all(|&h| h), "{hot_hinted:?}");
     std::fs::remove_dir_all(&dir).ok();
 }

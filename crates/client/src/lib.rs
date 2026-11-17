@@ -561,7 +561,7 @@ struct RunSlot {
 #[derive(Clone, Copy)]
 enum Scope {
     Account { top8: u32 },
-    Storage { owner: B256 },
+    Storage { owner: B256, top8: u32 },
 }
 
 /// What every run of a table holds at one key: the candidates, each with
@@ -1159,14 +1159,7 @@ impl<D: Driver> Snapshot<D> {
                     .account
                     .as_ref()
                     .map_or(Holds::Maybe, |p| p.holds(top8, depth)),
-                // An owner's storage changed in a layer: its root is there.
-                Scope::Storage { owner } => h.storage.as_ref().map_or(Holds::Maybe, |s| {
-                    match (s.contains(&owner.0), depth) {
-                        (false, _) => Holds::No,
-                        (true, 0) => Holds::Yes,
-                        (true, _) => Holds::Maybe,
-                    }
-                }),
+                Scope::Storage { owner, top8 } => h.storage_holds(&owner.0, top8, depth),
             };
             match v {
                 Holds::No => {}
@@ -1429,7 +1422,10 @@ impl<D: Driver> Snapshot<D> {
             account.storage_root,
             *hashed_slot,
             &path,
-            Scope::Storage { owner },
+            Scope::Storage {
+                owner,
+                top8: top8(&hashed_slot.0),
+            },
             |nk| nk.storage_table_key(&owner).expect("walk depth ≤ 62"),
             d,
             false,
@@ -1624,7 +1620,13 @@ impl<D: Driver> Snapshot<D> {
             self.note_key(TABLE_STORAGE_NODES, Trie::Storage, d, *k);
         }
         let asks: Vec<Vec<bool>> = (0..skeys.len())
-            .map(|d| self.plan(TABLE_STORAGE_NODES, Scope::Storage { owner }, d))
+            .map(|d| {
+                let scope = Scope::Storage {
+                    owner,
+                    top8: top8(&hashed_slot.0),
+                };
+                self.plan(TABLE_STORAGE_NODES, scope, d)
+            })
             .collect();
         self.want_pages_of(TABLE_STORAGE_NODES, &skeys, Some(&asks));
         let (acct, ar, an) = self.account_walk(hashed)?;

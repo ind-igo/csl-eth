@@ -40,8 +40,8 @@ pub use layer::{
     write_layered_manifest, LayerRows, SORT_ACCOUNT, SORT_STORAGE,
 };
 pub use producer::{
-    build_rows, produce, produce_with, AccountLeaf, Head, Options as ProduceOptions, ProduceError,
-    Produced, Rows, Rows4, Stats as ProduceStats,
+    build_rows, produce, produce_with, storage_positions, AccountLeaf, Head,
+    Options as ProduceOptions, ProduceError, Produced, Rows, Rows4, Stats as ProduceStats,
 };
 
 /// Bumped to 2 on 2026-10-31 when the run format paged its model

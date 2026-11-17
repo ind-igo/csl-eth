@@ -10,7 +10,7 @@
 //! to, so a stale node in an older run is never accepted, a missing one is
 //! `Insufficient`, and nothing ever needs deleting for a read to be right.
 
-use crate::hints::{hints_path, Hints, KeySet, PathHintBuilder, HINT_INLINE};
+use crate::hints::{hints_path, Hints, KeySet, PathHintBuilder, StoragePaths, HINT_INLINE};
 use crate::producer::Head;
 use crate::{
     blob_path, manifest_path, producer::write_atomic, profile_id, run_path, Layer, Manifest,
@@ -35,6 +35,8 @@ pub struct LayerRows {
     /// The owners (`keccak(address)`) of the storage nodes, for the
     /// layer's hint; `None` when not known (no storage hint then).
     pub owners: Option<BTreeSet<[u8; 32]>>,
+    /// The hot owners' storage positions, for the layer's hint.
+    pub storage_paths: Option<StoragePaths>,
 }
 
 impl LayerRows {
@@ -73,6 +75,7 @@ impl LayerRows {
                 .map(|(k, v)| (*k, v.clone()))
                 .collect(),
             owners: None,
+            storage_paths: None,
         }
     }
 }
@@ -204,6 +207,7 @@ pub fn write_layer(
             account: account.finish(),
             storage: rows.owners.as_ref().and_then(|o| KeySet::of(o.iter())),
             code: KeySet::of(rows.code.keys()),
+            storage_paths: rows.storage_paths.clone(),
         },
     )
 }
@@ -222,7 +226,8 @@ pub fn layer_sorter(dir: &Path, budget: u64) -> crate::extsort::ExtSort {
 
 /// [`write_layer`] from rows streamed into a [`layer_sorter`] (any order)
 /// and code by hash: a step too big for memory. `owners`: the storage
-/// nodes' owners, for the hint (`None`: not known, no storage hint).
+/// nodes' owners, for the hint (`None`: not known, no storage hint);
+/// `storage_paths`: the hot owners' path hints.
 #[allow(clippy::too_many_arguments)]
 pub fn write_layer_sorted(
     root: &Path,
@@ -231,6 +236,7 @@ pub fn write_layer_sorted(
     sort: &mut crate::extsort::ExtSort,
     code: &BTreeMap<[u8; 32], Vec<u8>>,
     owners: Option<&BTreeSet<[u8; 32]>>,
+    storage_paths: Option<StoragePaths>,
     epsilon: u16,
 ) -> Result<Layer, ProduceError> {
     sort.prepare().map_err(sort_err)?;
@@ -270,6 +276,7 @@ pub fn write_layer_sorted(
             account: account.finish(),
             storage: owners.and_then(|o| KeySet::of(o.iter())),
             code: KeySet::of(code.keys()),
+            storage_paths,
         },
     )
 }
@@ -538,13 +545,21 @@ pub fn merge_layers(root: &Path, layers: &[Layer], epsilon: u16) -> Result<Layer
             .map(|_| ())
         })?);
     }
-    // Owners are not in the storage table's hashed keys: the union of the
-    // layers' sets.
-    let storage = layers
+    // Owners and positions are not in the storage table's hashed keys: the
+    // union of the layers' sets and hints.
+    let hints: Vec<Hints> = layers.iter().map(|l| layer_hints(root, l)).collect();
+    let storage = hints
         .iter()
-        .map(|l| layer_hints(root, l).storage)
+        .map(|h| h.storage.clone())
         .reduce(|a, b| KeySet::union(a.as_ref(), b.as_ref()))
         .flatten();
+    let storage_paths = StoragePaths::merge(
+        &hints
+            .iter()
+            .map(|h| (h.storage.as_ref(), h.storage_paths.as_ref()))
+            .collect::<Vec<_>>(),
+    )
+    .filter(|_| storage.is_some());
     with_hints(
         root,
         first.from_block,
@@ -554,6 +569,7 @@ pub fn merge_layers(root: &Path, layers: &[Layer], epsilon: u16) -> Result<Layer
             account: account.finish(),
             storage,
             code: codes.and_then(|c| KeySet::of(c.iter())),
+            storage_paths,
         },
     )
 }

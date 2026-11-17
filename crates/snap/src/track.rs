@@ -683,6 +683,8 @@ pub struct Rows {
     /// Owners with storage rows, for the layer's hint; `None` past the
     /// hint's cap.
     pub owners: Option<BTreeSet<[u8; 32]>>,
+    /// Their storage rows' positions, for the hot owners' path hints.
+    pub paths: csl_eth_store::hints::StoragePathsBuilder,
     _scratch: csl_eth_store::extsort::Scratch,
 }
 
@@ -697,6 +699,7 @@ impl Rows {
             account_rows: 0,
             storage_rows: 0,
             owners: Some(BTreeSet::new()),
+            paths: Default::default(),
             _scratch: scratch,
         })
     }
@@ -711,6 +714,7 @@ impl Rows {
         let mut out = LayerRows {
             code: self.code.clone(),
             owners: self.owners.clone(),
+            storage_paths: self.paths.clone().finish(),
             ..LayerRows::default()
         };
         for (t, m) in [
@@ -1522,6 +1526,9 @@ fn materialize(
                                 rows.owners = None;
                             }
                         }
+                        if let Ok(pk) = nk.table_key() {
+                            rows.paths.push(&o.0, &pk);
+                        }
                         st.storage_nodes += 1;
                     }
                 }
@@ -1665,12 +1672,20 @@ pub struct Tiered {
 /// Merge the newest layers while a tier is full. The list stays ordered
 /// oldest first with tiers non-increasing, since merges only ever take the
 /// newest suffix. Returns the merges made.
+///
+/// The oldest layer is everything since the base, so it is the top tier
+/// whatever it was made as: a catch-up's one step made it at tier 0, and
+/// until 2026-11-17 it was then merged with the tier-0 layers after it, a
+/// rewrite of all of it (3 GB, 70 to 95 s) after 4 steps, then 16, then 64.
 pub fn compact(
     root: &Path,
     layers: &mut Vec<Tiered>,
     fanout: usize,
     top: u8,
 ) -> Result<usize, String> {
+    if let Some(first) = layers.first_mut() {
+        first.tier = top;
+    }
     let mut merges = 0;
     loop {
         let Some(last) = layers.last() else { break };
@@ -2267,6 +2282,7 @@ impl Tracker {
                 &mut h.rows.sort,
                 &h.rows.code,
                 h.rows.owners.as_ref(),
+                std::mem::take(&mut h.rows.paths).finish(),
                 EPSILON,
             )
             .map_err(|e| format!("layer: {e}"))?;
@@ -3183,6 +3199,7 @@ mod tests {
                 &mut h.rows.sort,
                 &h.rows.code,
                 h.rows.owners.as_ref(),
+                std::mem::take(&mut h.rows.paths).finish(),
                 EPSILON,
             )
             .unwrap();
@@ -4227,10 +4244,25 @@ mod tests {
         assert!(collectable(&m, 2, &all_but_newest).is_empty());
     }
 
+    /// The layers merge by tier, the oldest (everything since the base) is
+    /// the top tier from the first step and so is rewritten only when a
+    /// top-tier layer reaches it, and a contract whose storage changes
+    /// every step gets path hints in each layer the tracker writes.
     #[tokio::test]
     async fn tiers_merge_and_every_state_still_reads() {
-        let s0 = states().remove(0);
+        let mut s0 = states().remove(0);
         let mut rng = ChaCha8Rng::seed_from_u64(99);
+        let hot = key(&mut rng);
+        s0.insert(
+            hot,
+            Acct {
+                balance: U256::from(1u64),
+                storage: (0..2000)
+                    .map(|_| (key(&mut rng), U256::from(rng.random::<u64>() | 1)))
+                    .collect(),
+                code: Some(bytes(&mut rng, 300)),
+            },
+        );
         let dir = scratch("tiers");
         let h0 = head_of(&s0, 0);
         let base = produce(&dir, &h0, "", leaves(&s0), &code_of(&s0))
@@ -4242,7 +4274,13 @@ mod tests {
         let (mut s, mut h) = (s0, h0);
         let mut max_layers = 0;
         for n in 1..=20u64 {
-            let next = churn(&s, &mut rng);
+            let mut next = churn(&s, &mut rng);
+            let a = next.get_mut(&hot).unwrap();
+            let slots: Vec<B256> = a.storage.keys().copied().collect();
+            for _ in 0..40 {
+                let k = slots[rng.random_range(0..slots.len())];
+                a.storage.insert(k, U256::from(rng.random::<u64>() | 1));
+            }
             let hn = head_of(&next, n);
             let mut src = Mem::of(&next, &hn);
             let mut tracked = step(&mut src, &mut store, &mut db, &h, &hn, &dir, 64 << 20)
@@ -4251,6 +4289,26 @@ mod tests {
             (store, _) = commit(&dir, &base, &mut layers, &h, &hn, &mut tracked, 2, 3);
             db.reset(hn.state_root).unwrap();
             max_layers = max_layers.max(layers.len());
+            // The first step's layer is the top tier at once, and is not
+            // merged until a top-tier layer forms after 2^3 more steps.
+            assert_eq!(layers[0].tier, 3);
+            if n <= 8 {
+                assert_eq!(
+                    (layers[0].layer.from_block, layers[0].layer.to_block),
+                    (h0.block_number, hn.block_number - n + 1)
+                );
+            }
+            let newest = &layers.last().unwrap().layer;
+            if newest.to_block == hn.block_number && newest.from_block == h.block_number {
+                assert!(
+                    newest
+                        .hints
+                        .storage_paths
+                        .as_ref()
+                        .is_some_and(|p| p.get(&hot.0).is_some()),
+                    "step {n}: no path hint for the hot contract"
+                );
+            }
             // Tiers never increase toward the newest.
             assert!(
                 layers.windows(2).all(|w| w[0].tier >= w[1].tier),
