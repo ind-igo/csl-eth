@@ -501,3 +501,57 @@ Later the same day: at MTU 1,420 the path carried 1,420-byte packets to Google c
 
 **Open.** Base sharding and compaction (a rebase, which without a local base needs a burst); size-triggered tiers; whether a few-read client should skip hint files.
 
+
+## 2026-11-17: the tracker on mainnet, keeping `full/` current
+
+`csl-eth track` runs without the base on `csl-eth-producer` (e2-medium spot, asia-east1-b, 100 GB pd-balanced), publishing into `full/`. The page reads the attested head by default and `?tier=finalized` reads the latest finalized checkpoint, both verified from the checkpoint root as before.
+
+**Same-region reads of the bucket.** Range reads from the VM: 13 requests/s at 1 in flight up to 895 at 128, p50 64 to 71 ms throughout. Latency, not throughput, is the limit, so the old side of a catch-up is fetched with many reads in flight.
+
+**The first catch-up**, 8,903 blocks from the base (26,422,083 → 26,430,986, committed 00:16:54): 1.21 M changed accounts and 5,794 codes, written as 4.09 M account and 6.14 M storage nodes (2.45 GB of runs), uploaded as 3.05 GB in 1,402 files (238 s). The last attempt took sync 398 s, materialize 433 s, build and read-back 563 s. Wall time from the first start was about 7 hours, most of it the four bugs below and their restarts. The bucket served about 17.8 M range reads for the old side, about $7.
+
+**What mainnet broke, and the fixes:**
+
+- *Done markers named the wrong old node.* A subtree marked complete was complete for its diff against one old node, but the marker's key held only the new node. An extension split above it changes which old node a position is diffed against, so a marker could skip a subtree whose old side had changed, and materialize then found "a node the sync counted as local" missing. The key now includes the old reference (`done_key`); `diskless_markers_hold_for_one_old_node` reproduces the split.
+- *Peers were dialed once.* Discovery hands out each node once, and full nodes evict peers at random, so the pool drained over hours. A peer that served is redialed 60 s after it goes.
+- *Idle peers dropped after about 30 s.* reth's `P2PStream` answers a ping by queueing a pong, which reaches the wire only when the sink is polled; an idle worker never polled it, and Geth closes a connection after 30 s without a frame. `Peer::idle` now flushes control frames every second. Sessions went from about 30 s to 8 to 16 minutes.
+- *Swap.* At the default swappiness the kernel swapped the node index out for page cache during the materializing walk (1.1 GB in swap), which slowed to swap speed. `vm.swappiness = 1` (startup script).
+
+**Finality.** Pinning a step's manifest when the finalized checkpoint lands on it never fired at the head: steps of two or three blocks stepped over the checkpoint block every epoch. Now a step that would cross an epoch boundary stops at the boundary's checkpoint block first (the block at the epoch's first slot, or the newest before it if that slot is empty, read from peers' headers and checked by parent hash up to the target), publishes that manifest with no pointer moved, and goes on to the attested head. When the block finalizes about 13 minutes later its manifest is pinned. From 02:21 to 02:52 five checkpoints in a row were pinned (26,431,695 to 26,431,823). A checkpoint passed while the tracker was behind its window is still `finalized_missed`; the next is not.
+
+**Per block at the head** (02:21 to 02:52 UTC, 31 minutes): 92 steps covering all 162 blocks, 59 of them single-block. Lag from the slot's start to the published pointer: median 35.0 s, p90 46.2 s; no block within its own slot. The parts, medians:
+
+| part | s |
+|---|---|
+| light client knows the attested head, after slot start | 20 |
+| waiting for a peer | 0.6 |
+| fetch and diff (19 levels, about 8,000 nodes, 1,500 old nodes from peers) | 9.1 |
+| materialize | 0.2 |
+| layer write and merge | 0.0 |
+| read-back (every changed account, 2,000 slots) | 3.6 |
+| upload (7 files) | 1.1 |
+
+Before asking for a node's old node in the same wave as the node, fetching took 23.4 s over 26 levels (median lag 51.7 s): an old node was asked for only after its new node arrived, which doubled the dependent rounds. The read-back now samples 256 changed accounts and 256 slots (it read every changed account): 1.1 s, from 3.6 s. Over the next 15 minutes (03:34 to 03:49, after a restart) the lag was still median 39.4 s, p90 53.9 s, because fetching varied more than the read-back saved (median 14.5 s that window, 9.1 s before; about 9,500 nodes a step against 8,000). Uploads are 1.1 s for seven files with a process per file; a shared connection would save under a second. The head itself is the floor: the optimistic update for a block appears about 16 s after its slot starts, and the loop polls it every 3 s when idle. Overlapping a step with the next head's fetch is how the rest would go.
+
+**Build time.** It grew from about 5 s to 12 to 36 s in the minutes before 01:56. That was the deploy's release build on the same two vCPUs: materialize and sync slowed by the same factor. With runs, the read-back grows about 0.4 s per run (3.6 s at two runs per table, 5 to 7 s at six or seven). A merge into the since-base layer takes 70 to 95 s and uploads 3.1 GB. The catch-up's layer started at tier 0, not the top tier, so it was merged as a peer of lower tiers after 16 steps and again after 64; the rewrites grow further apart as it climbs and stop being early once it is at the top. Tagging the since-base layer as the top tier is a one-line fix, held back because it lets up to 13 hinted layers accumulate, which costs hot-contract reads (below) until storage hints are fixed.
+
+**Read cost over layers, live** (`crates/client/examples/layer_cost.rs`, block 26,431,602: the base, the since-base layer of 9,430 blocks, and six hinted layers of 6 to 47 blocks; one cold read each, requests):
+
+| read | base only | hinted | unhinted | layer runs asked, hinted |
+|---|---|---|---|---|
+| vitalik.eth | 13 | 16 (1.2×) | 59 | 3 of 7 |
+| absent account | 10 | 25 (2.5×) | 48 | 3 of 7 |
+| USDT slot 1 | 53 | 188 (3.5×) | 258 | 14 of 14 |
+| WETH slot 0 | 58 | 200 (3.4×) | 281 | 14 of 14 |
+| The DAO slot 0 | 47 | 68 (1.45×) | 262 | 3 of 14 |
+| CryptoPunks slot 0 | 50 | 71 (1.4×) | 270 | 3 of 14 |
+
+The synthetic table (1.09× at eight layers) missed two things mainnet has. Storage hints name only the owners a layer touched, so a contract that changes every block is in every layer, and below its storage root every layer says Maybe: a USDT read asks all seven storage runs at every depth (120 of its 188 requests). The account side of a hot contract has a smaller version of the same problem: its leaf is in every layer, below the hint's cut depth. And the since-base layer is over the hint cap, so every read asks it at every depth the newest layer does not settle; that is most of the absent account's cost and all of a cold contract's extra. The synthetic churn had neither hot owners nor an oversized layer.
+
+The fix for the first is hints keyed by owner and storage path: for an owner with many nodes in a layer, its positions cut at the depth where they cover at most 1% of prefixes, as accounts are; owners with few nodes keep the owner-only hint. A 10-block layer holds about 30,000 storage nodes, which would add tens of KB of hints per layer. About 200 lines in `hints.rs` and the client's `plan` (a new serde field, so old manifests read as before), and a hot owner in the synthetic churn. Expected effect: a USDT slot from 3.5× to about 2×, the rest being the since-base layer. Merging tiers sooner only scales the cost down with the run count and costs build time and uploads. The since-base layer cannot carry a hint at this size (about 1.2 M accounts and a few hundred thousand owners); what bounds it is a rebase, which is a burst.
+
+**Peers after a restart.** Without a list, the pool took 2 to 26 minutes to reach three peers that serve at the head (seven starts on 2026-11-16 and 17; two never reached three before the next restart), and steps re-pivot on a few unserved nodes until it does. The tracker now keeps the peers that served (`work/known-peers.json`, enode and when it last served, up to 64) and dials them before discovery's candidates on startup and after every drop, retrying a known peer up to three times. With seven peers on the list, a restart at 03:23 had five peers serving within a minute, six at three minutes and the cap of twelve at twelve minutes. Without the list, the restart at 03:03 took five minutes to reach three peers and thirteen to reach six.
+
+**The VM.** RSS 765 MB of 4 GB, 2.7 GB available, 63 MB in swap, 20 GB of 99 GB on `/data`. Cost: about $22 a month for the spot VM and its disks, about $8 for about 50,000 writes a day, plus about $3.60 of bucket reads per day of gap.
+
+**Open.** Storage hints by owner and path, then the since-base layer at the top tier. A rebase. Overlapping steps with the head. The beacon accumulator's files for old headers. `head/fcr` is not published by the tracker (the page treats it as optional).

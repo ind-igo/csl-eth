@@ -12,11 +12,15 @@ shows each read's requests and its proof node by node. A checkbox flips one
 byte of a fetched page to show the client refusing it. Nothing on it is
 simulated.
 
-**Scope:** all of mainnet's state at one block, under `full/` in the bucket:
-block 26,422,083, finalized; 432 M accounts, 1.69 G storage slots, 344 GiB.
-The last 22,084 blocks of transactions, receipts and logs sit beside it. The
-page is served from the same Cloud Storage bucket it reads. Keeping the full
-state current, block by block, is the next piece (`docs/delta-producer.md`).
+**Scope:** all of mainnet's state, current to the head, under `full/` in the
+bucket. A base at block 26,422,083 (432 M accounts, 1.69 G storage slots,
+344 GiB) carries layers of changed trie nodes that `csl-eth track` publishes
+block by block from a small spot VM with no node and no copy of the base: it
+fetches the changed nodes from mainnet peers over devp2p `snap/1`, reads
+them back, and publishes each block about 35 s after its slot starts (the
+attested tier) and each finalized checkpoint about 13 minutes later. The
+last 22,084 blocks before the base of transactions, receipts and logs sit
+beside it. The page is served from the same Cloud Storage bucket it reads.
 
 Before the full state, the PoC kept 1/4096 of the state (account-trie prefix
 `1a7`) fresh every epoch, fetched over devp2p `snap` with no node. That
@@ -47,6 +51,30 @@ later. When the producer has one, the page also shows Ankr's fast-confirmation
 report as a named source's claim, which the client does not verify.
 
 ## Numbers
+
+**Keeping it current** (`csl-eth track` on an e2-medium spot VM in the
+bucket's region, 2026-11-17; `docs/decisions.md` has the detail):
+
+- **Per block,** over 31 minutes at the head: all 162 blocks published, in
+  92 steps (59 of one block). Lag from the slot's start to the published
+  pointer: median 35 s, p90 46 s. Of that, the light client knows the
+  attested head 20 s after the slot starts; fetching and diffing the changed
+  nodes takes 9 to 15 s, reading them back 1.1 s (a sample, since; it was
+  3.6 s), uploading 1.1 s. No block was published within its own slot.
+- **Finalized:** each finalized checkpoint's block gets its own step, so
+  `head/finality` moved every epoch (five in a row in the window).
+- **Catch-up:** the first, 8,903 blocks (about 30 hours) from the base,
+  wrote 1.21 M changed accounts as 10.2 M trie nodes (2.45 GB of runs) and
+  uploaded 3.05 GB in 1,402 files. Its last attempt took 27 minutes (fetch 7,
+  materialize 7, build and read-back 9, upload 4); the bucket served the old
+  side by range, about $7 of reads.
+- **Reads over layers,** cold, against the base alone: an account 1.2× the
+  requests, a slot of a contract that changed recently 1.4×, an absent
+  account 2.5×, a slot of a contract that changes every block (USDT, WETH)
+  3.5×. The cause and the fix are in `docs/decisions.md`.
+- **Cost:** about $30 a month (the VM and its disks about $22, about
+  50,000 writes a day about $8), plus about $3.60 of bucket reads per day of
+  gap when it has to catch up.
 
 The full state on Cloud Storage, cold, in headless Chromium from Taipei
 (2026-11-16, no VPN): the page loads, verifies the head and reads an account
@@ -87,11 +115,21 @@ above. Details in `docs/decisions.md`.
 
 ## Limits
 
-- **Full state is one block.** One burst (`deploy/gcp/full-export.sh`: reth's
-  snapshot, a sync, a 2.4 h export, a 2.4 h upload, about $7) publishes it;
-  keeping it current is a diff of changed trie nodes per snapshot, not built.
-  Cold reads against it, from Taipei: an account in 4 rounds and 80 KB
-  (843 ms), a storage slot in 7 rounds and 280 KB.
+- **The base is one block, and the layers grow.** One burst
+  (`deploy/gcp/full-export.sh`: reth's snapshot, a sync, a 2.4 h export, a
+  2.4 h upload, about $7) published the base. The layer since the base grows
+  about 2.3 GB a day and carries no skip hints (it is too large), so every
+  read asks it; folding it into a new base (a rebase, a burst) is not built.
+- **Reads of hot contracts cost 3.5×.** Storage hints name only the
+  contracts a layer touched, so a contract that changes every block makes a
+  read ask every layer at every depth. Hints keyed by contract and path
+  prefix would fix it; not built.
+- **It depends on peers serving `snap/1`.** The tracker has no node: it
+  needs mainnet peers that answer `GetTrieNodes` at the head, which snap/2
+  removes. A restart used to take 2 to 26 minutes to find three such peers;
+  the peers that served are now kept on disk and dialed first, and a restart
+  has five within a minute. A step that
+  no peer can serve re-pivots to a newer head.
 - **History is recent.** `full/history/` covers the 22,084 blocks the node
   kept (three days). Old headers cost a walk (6.4 MB for a transaction a day
   back) until the beacon accumulator's files are published. History from
@@ -123,7 +161,7 @@ above. Details in `docs/decisions.md`.
 | `crates/client` | the client as a sans-I/O state machine: each read returns the ranges it needs next |
 | `crates/head` | the beacon light-client protocol from files, verified with helios |
 | `crates/wasm` | the client and head verifier for the browser |
-| `crates/snap` | bin `csl-eth`: mainnet state over devp2p `snap` with no node; `fetch`, `build`, `check`, `produce` |
+| `crates/snap` | bin `csl-eth`: mainnet state over devp2p `snap` with no node; `fetch`, `build`, `check`, `produce`, `track` |
 
 ```
 cargo test --workspace
@@ -136,13 +174,18 @@ cargo build --release -p csl-eth-snap
 ./target/release/csl-eth produce --prefix 1a7 --work data/produce --checkpoint 0x<root> \
     --publish scripts/r2-publish.sh --every-mins 6 --keep 10   # CSL_ETH_FCR_RPC adds the FCR note
 
+# the tracker: keep a full-state base current from mainnet peers, the base left in the bucket
+./target/release/csl-eth track --root data/track/root --work data/track/work --base 0x<base block hash> \
+    --base-url https://storage.googleapis.com/csl-eth-demo/full/ --checkpoint 0x<root> \
+    --publish scripts/gcs-publish.sh
+
 # the browser page
 mise install && ./scripts/build-wasm.sh
 cd browser && bun install && bun run serve                     # http://127.0.0.1:8791/
 
 # the demo on Google Cloud (project csl-eth): bucket, VM, network, in one Alchemy stack
 cd infra && bun install && bun run plan && bun run deploy --yes
-deploy/gcp/apply.sh        # build the producer on the VM, run it under systemd
+deploy/gcp/apply.sh        # build the tracker on the VM, run it under systemd
 deploy/gcp/site.sh         # build the page (gzipped), upload it into the bucket
 ```
 

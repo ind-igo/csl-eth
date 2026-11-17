@@ -151,7 +151,7 @@ On mainnet the hint sizes decide which tiers are hinted. A block changes about a
 - **Checks.** Each step read its changed accounts back through the client before publishing, and the fourth merged a tier.
 - **Completeness.** `tracked_dir_is_complete` (ignored test, `crates/snap/src/track.rs`) then read every account of the slice from the published directory at block 26,428,391: 105,253 unchanged, 9 changed, 29,355 slots, 2,218 codes, none insufficient.
 
-**What remains before `full/`.** The three gaps the first run left (the finalized tier, catch-up from a stale base, the read-cost trade) are closed above. What is left is running it: a small VM without the base (§ Without a local base), a public IP for inbound peers, and a sustained run to measure the peer window, the bucket's range-read rate from the VM, and the catch-up rate from a multi-day-old base.
+**On `full/` (2026-11-17).** The tracker now keeps the full state current from a spot VM without the base; `docs/decisions.md` (2026-11-17) has the run: the first catch-up of 8,903 blocks, per-block lag (median 35 s from slot start), a finalized checkpoint pinned every epoch, and the read cost over the live layers. On mainnet the synthetic table above is optimistic for two kinds of read: a slot of a contract that changes every block costs about 3.5× the base-only read, because storage hints name only owners, and every read asks the since-base layer, which is too large to hint.
 
 ## Review: what was set aside
 
