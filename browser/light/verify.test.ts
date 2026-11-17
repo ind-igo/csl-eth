@@ -1,9 +1,10 @@
-// bun test mini — RLP, SSZ, key encoding, the walk, and page decoding.
+// bun test light — RLP, SSZ, key encoding, the walk, and page decoding.
 import { describe, expect, test } from "bun:test";
 import {
   beaconRoot, CHECKPOINT, decodeAccount, Held, read, decodeNode, decodePage, decodeWord, EMPTY_ROOT, executionRoot, hex, keccak,
   KECCAK_EMPTY, merkleize, nibbles, Refused, storageKey, tableKey, unhex, walk,
 } from "./verify.ts";
+import { Reader } from "./driver.ts";
 
 const b = (...x: number[]) => Uint8Array.from(x);
 
@@ -150,5 +151,22 @@ describe("queries and fetches", () => {
     h.fail(w, "fetch failed: HTTP 404");
     expect(() => h.get(w)).toThrow(Refused);
     expect(() => h.need(w)).toThrow(/404/);
+  });
+});
+
+describe("remembered checkpoint", () => {
+  const start = (v: string | null) => new Reader("http://unused", { get: () => v, set: () => {} }).session.checkpoint;
+  test("a well-formed root other than the built-in one is where a session starts", () => {
+    const r = "0x5bd5c7450adb03520cb650f2e2cd3b336f90b5c394843a618326fbaae34a0273";
+    expect(start(r)).toBe(r);
+    expect(start(r.toUpperCase().replace("0X", "0x"))).toBe(r);
+  });
+  test("anything else starts from the built-in checkpoint", () => {
+    for (const v of [null, "", "hello", "0x5bd5c745", "5bd5c7450adb03520cb650f2e2cd3b336f90b5c394843a618326fbaae34a0273", `0x${"g".repeat(64)}`, ` 0x${"ab".repeat(32)}`, CHECKPOINT])
+      expect(start(v)).toBe(CHECKPOINT);
+  });
+  test("a store that throws is no store", () => {
+    // light.ts wraps localStorage in try/catch; the Reader itself only sees null.
+    expect(new Reader("http://unused").session.checkpoint).toBe(CHECKPOINT);
   });
 });

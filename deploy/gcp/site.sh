@@ -6,7 +6,8 @@
 #
 #   deploy/gcp/site.sh
 #
-# Uploads only index.html, viz.html (a copy, for old links), dist/ and pkg/;
+# Uploads only index.html, viz.html (a copy, for old links), light.html and
+# the redirect to it from its first name, dist/ and pkg/;
 # never touches head/, snapshots/, blobs/ or full/. Five-minute caching. The
 # text and the wasm are stored gzipped (`--gzip-local-all`): browsers get them
 # compressed, which takes the 1.3 MB client module to about a third; the wasm
@@ -22,7 +23,7 @@ site=browser/site
 cc='public, max-age=300'
 up() { gcloud storage cp --gzip-local-all --cache-control="$cc" "$@"; }
 
-up --content-type=text/html "$site/index.html" "$site/viz.html" "$site/mini.html" "gs://$bucket/"
+up --content-type=text/html "$site"/*.html "gs://$bucket/"
 up --content-type=text/javascript "$site"/dist/*.js "gs://$bucket/dist/"
 up --content-type=text/javascript "$site"/pkg/*.js "gs://$bucket/pkg/"
 up --content-type=application/json "$site"/dist/*.map "gs://$bucket/dist/"

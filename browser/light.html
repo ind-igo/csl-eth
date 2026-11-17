@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>csl-eth · minimal light client</title>
+    <title>csl-eth · TypeScript light client</title>
     <style>
       :root {
         --bg: #0d1016;
@@ -90,7 +90,7 @@
       <header>
         <h1>Ethereum state, checked by one TypeScript file</h1>
         <nav><a href="index.html">Full version</a><a href="https://github.com/ind-igo/csl-eth">GitHub</a></nav>
-        <p class="sub">A minimal light client for the same bucket. It fetches byte ranges of static files, checks the beacon chain's signatures and the state trie's hashes (ox for BLS and RLP, noble for hashes), and shows only what checks out.</p>
+        <p class="sub">A light client in TypeScript for the same bucket. It fetches byte ranges of static files, checks the beacon chain's signatures and the state trie's hashes (ox for BLS and RLP, noble for hashes), and shows only what checks out.</p>
       </header>
 
       <form class="bar" id="form">
@@ -126,10 +126,10 @@
       </div>
 
       <section class="about">
-        <p><b id="lines">The whole verifier is one file.</b> It fetches the head files, the snapshot's manifest and a few dozen 4 KB pages, and refuses the answer if any signature or hash fails. A page byte that is flipped in transit is caught by the trie's keccak hashes; a flipped head byte, by the committee's signature or a Merkle branch. The first read also fetches each layer's hints, about 1.4 MB, so that later reads skip the layers that cannot hold their keys; a hint that lies costs a round, never an answer. Later reads reuse the index pages, the account trie's top levels and the sync committees the earlier ones checked.</p>
-        <p>Left out, compared with the full version: checkpoint rotation, the by-hash table, the finalized tier and the visualization. None of them is needed for correctness.</p>
+        <p><b id="lines">The whole verifier is one file.</b> It fetches the head files, the snapshot's manifest and a few dozen 4 KB pages, and refuses the answer if any signature or hash fails. A page byte that is flipped in transit is caught by the trie's keccak hashes; a flipped head byte, by the committee's signature or a Merkle branch. The first read asks every layer of the snapshot; while the page is idle afterwards it fetches each layer's hints, so that later reads skip the layers that cannot hold their keys. A hint that lies costs a round, never an answer. Later reads reuse the index pages, the account trie's top levels and the sync committees the earlier ones checked, and the page remembers the newest checkpoint it proved finalized, so the next visit has fewer committee handovers to check.</p>
+        <p>Left out, compared with the full version: the by-hash table, the finalized tier and the visualization. None of them is needed for correctness.</p>
       </section>
     </div>
-    <script type="module" src="dist/mini.js"></script>
+    <script type="module" src="dist/light.js"></script>
   </body>
 </html>

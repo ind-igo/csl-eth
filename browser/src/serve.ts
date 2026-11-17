@@ -1,10 +1,10 @@
-// The dev server: bundles `src/viz.ts` and the minimal client's
-// `mini/mini.ts` into `dist/` with Bun, then serves `index.html`,
-// `mini.html`, `dist/*` and the wasm-bindgen output
+// The dev server: bundles `src/viz.ts` and the TypeScript light client's
+// `light/light.ts` into `dist/` with Bun, then serves `index.html`,
+// `light.html`, `dist/*` and the wasm-bindgen output
 // in `pkg/*` (`.wasm` as `application/wasm`, so the module compiles while
 // streaming). With `--site <dir>` it instead assembles a static site there
-// (index.html, viz.html as a copy for old links, mini.html; dist/, pkg/) for
-// hosting, and exits.
+// (index.html, viz.html as a copy for old links, light.html and a redirect
+// to it under its first name; dist/, pkg/) for hosting, and exits.
 //
 //   bun src/serve.ts [--port 8791]
 //   bun src/serve.ts --site site
@@ -24,11 +24,11 @@ const TYPES: Record<string, string> = {
 };
 
 export async function build(): Promise<void> {
-  // The minimal client's page states its verifier's length, counted here.
-  const lines = readFileSync(join(ROOT, "mini/verify.ts"), "utf8").trimEnd().split("\n").length;
+  // The light client's page states its verifier's length, counted here.
+  const lines = readFileSync(join(ROOT, "light/verify.ts"), "utf8").trimEnd().split("\n").length;
   for (const [entry, define] of [
     ["src/viz.ts", {}],
-    ["mini/mini.ts", { __VERIFY_LINES__: String(lines) }],
+    ["light/light.ts", { __VERIFY_LINES__: String(lines) }],
   ] as const) {
     const out = await Bun.build({
       entrypoints: [join(ROOT, entry)],
@@ -45,13 +45,17 @@ export async function build(): Promise<void> {
   }
 }
 
+const OLD_LIGHT = "mini.html";
+
 function site(dir: string) {
   const out = resolve(ROOT, dir);
   rmSync(out, { recursive: true, force: true });
   mkdirSync(out, { recursive: true });
   cpSync(join(ROOT, "index.html"), join(out, "index.html"));
   cpSync(join(ROOT, "index.html"), join(out, "viz.html"));
-  cpSync(join(ROOT, "mini.html"), join(out, "mini.html"));
+  cpSync(join(ROOT, "light.html"), join(out, "light.html"));
+  // The light client's page went by another name for a day; old links land on it.
+  Bun.write(join(out, OLD_LIGHT), `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=light.html"><title>csl-eth</title><p><a href="light.html">The TypeScript light client is now at light.html.</a></p>\n`);
   cpSync(join(ROOT, "dist"), join(out, "dist"), { recursive: true });
   cpSync(join(ROOT, "pkg"), join(out, "pkg"), { recursive: true });
   // Static-assets Worker: cache the hashed-by-nothing assets for a short while.

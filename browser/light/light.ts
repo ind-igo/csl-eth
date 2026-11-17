@@ -1,9 +1,9 @@
-// mini.html's script: the form, the tamper toggle, and the result.
-import { run, type Outcome } from "./driver.ts";
-import { hex, Session, tamperSpot, unhex, type Want } from "./verify.ts";
+// light.html's script: the form, the tamper toggle, and the result.
+import { Reader, type CheckpointStore, type Outcome } from "./driver.ts";
+import { CHECKPOINT, hex, tamperSpot, unhex, type Want } from "./verify.ts";
 
 declare const __VERIFY_LINES__: number;
-const SOURCE = "https://github.com/ind-igo/csl-eth/blob/main/browser/mini/verify.ts";
+const SOURCE = "https://github.com/ind-igo/csl-eth/blob/main/browser/light/verify.ts";
 
 // From the bucket, the state under `full/` beside this page; anywhere else, the demo bucket.
 const BASE =
@@ -53,8 +53,29 @@ function flipRoot(w: Want, body: Uint8Array): string | null {
   return `Tampered: byte ${(w.off + at).toLocaleString()} of ${w.path} flipped (${x(before)} → ${x(body[at]!)}) before the verifier saw it. That page holds the account trie's root node in the newest layer.`;
 }
 
-// What earlier reads checked: index pages, the account trie's top levels, the committees.
-const session = new Session();
+// The newest checkpoint this page proved, for the next visit (see `Reader` on why that is safe).
+// Shared with the full page, which keeps the same kind of root under the same key. Without storage,
+// every visit starts from the built-in checkpoint.
+const KEY = "csl-eth.checkpoint";
+const store: CheckpointStore = {
+  get: () => {
+    try {
+      return localStorage.getItem(KEY);
+    } catch {
+      return null;
+    }
+  },
+  set: (root) => {
+    try {
+      if (root) localStorage.setItem(KEY, root);
+      else localStorage.removeItem(KEY);
+    } catch {
+      // Storage blocked: the next visit starts from the built-in checkpoint.
+    }
+  },
+};
+// What earlier reads checked: index pages, the account trie's top levels, the committees, the hint files.
+const reader = new Reader(BASE, store);
 
 const esc = (s: string) => s.replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`);
 const short = (b: Uint8Array) => hex(b);
@@ -97,7 +118,10 @@ function show(o: Outcome, what: { slot?: bigint; code: boolean }, reused: number
   }
   const h = a.head;
   const steps = [
-    `Started from the checkpoint at slot ${h.checkpointSlot.toLocaleString("en-US")}, built into the page.`,
+    o.fellBack ? `The checkpoint remembered from an earlier visit was refused (${esc(o.fellBack)}), so this read started again from the built-in one.` : "",
+    h.checkpoint === CHECKPOINT
+      ? `Started from the checkpoint at slot ${h.checkpointSlot.toLocaleString("en-US")}, built into the page.`
+      : `Started from the checkpoint at slot ${h.checkpointSlot.toLocaleString("en-US")}, which an earlier visit proved finalized from the one built into the page; its bootstrap was checked again.`,
     `Followed ${h.updates} sync committee ${h.updates === 1 ? "handover" : "handovers"}, each signed by two thirds of the outgoing committee.`,
     `Slot ${h.slot.toLocaleString("en-US")} was signed by ${h.participants} of 512 committee members (two thirds needed), BLS aggregate verified.`,
     `Its execution header is in the signed block by a Merkle branch: block ${h.block.toLocaleString("en-US")}, state root <span class="mono">${short(h.stateRoot)}</span>.`,
@@ -127,10 +151,9 @@ form.onsubmit = async (ev) => {
   status.className = "";
   status.textContent = tamp ? "Reading; one byte of one fetched page will be flipped…" : "Reading…";
   try {
-    // A tampered read starts from nothing, so the targeted page is fetched rather than answered from what earlier reads kept.
-    const s = tamp ? new Session() : session;
-    const reused = s.keep.size + s.nodes.size;
-    const o = await run(BASE, q, tamp ? flipRoot : undefined, s);
+    const s = reader.session;
+    const reused = tamp ? 0 : s.keep.size + s.nodes.size;
+    const o = await reader.read(q, tamp ? flipRoot : undefined);
     if (tamp && !o.tampered) o.tampered = "Tamper: no fetched page held the targeted node, so nothing was changed.";
     show(o, q, reused);
   } finally {
@@ -139,4 +162,4 @@ form.onsubmit = async (ev) => {
   }
 };
 // For the browser tests.
-(globalThis as unknown as { __mini: unknown }).__mini = { busy: () => button.disabled };
+(globalThis as unknown as { __light: unknown }).__light = { busy: () => button.disabled, idle: () => reader.idle, checkpoint: () => reader.session.checkpoint };

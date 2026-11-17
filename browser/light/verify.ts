@@ -1,4 +1,4 @@
-// The minimal light client's whole trust path, in one file.
+// The light client's whole trust path, in one file.
 //
 // Everything here is a pure function over bytes already held. A function
 // that needs bytes it does not hold records the byte range in `Held.wants`
@@ -21,9 +21,10 @@
 //
 // Mirrors the Rust client (crates/head, crates/csl-run, crates/trie,
 // crates/client) for the current mainnet fork only, its read-cost tricks
-// included: layer hints, the owner index, one speculative round, and what a
-// session keeps between reads. Left out: the by-hash baseline, the finalized
-// tier, checkpoint rotation, history, tracing and every fork but fulu.
+// included: layer hints, the owner index, one speculative round, what a
+// session keeps between reads, and checkpoint rotation. Left out: the
+// by-hash baseline, the finalized tier, history, tracing and every fork but
+// fulu.
 //
 // ox (wevm) for RLP, hex, bytes and BLS; @noble/hashes for keccak, sha256
 // and blake3, which ox's own hashes are.
@@ -39,8 +40,13 @@ import * as Rlp from "ox/Rlp";
 
 // ---------------------------------------------------------------- trust
 
-/** The one trust input: a finalized beacon block root (slot 15,661,216). */
+/**
+ * The one trust input: a finalized beacon block root. A session may start
+ * from a newer one instead, a root an earlier visit proved finalized from
+ * this one and remembered (`adopt`, and driver.ts on why that is safe).
+ */
 export const CHECKPOINT = "0x431b33af8452e2d644377405e69d4f382182ab906f31461190ca24cb3401d70b";
+export const CHECKPOINT_SLOT = 15_661_216;
 
 const GENESIS_TIME = 1_606_824_023;
 const GENESIS_VALIDATORS_ROOT = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
@@ -53,11 +59,14 @@ const BLS_DST = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 const CURRENT_COMMITTEE = [6, 22] as const; // 86 in the beacon state
 const NEXT_COMMITTEE = [6, 23] as const; // 87 in the beacon state
 const EXECUTION_PAYLOAD = [4, 9] as const; // 25 in the block body
+const FINALIZED_ROOT = [7, 41] as const; // 169 in the beacon state: finalized_checkpoint.root
 
 // ---------------------------------------------------------------- bytes
 
-/** Every failure is a refusal: the read returns nothing. */
-export class Refused extends Error {}
+/** Every failure is a refusal: the read returns nothing. `head`: refused while proving the head. */
+export class Refused extends Error {
+  head = false;
+}
 const refuse = (why: string): never => {
   throw new Refused(why);
 };
@@ -127,10 +136,16 @@ const PENDING = new Pending("pending");
  * `TOP_LEVELS` by their keccak, and the sync committees proven so far.
  */
 export class Session {
+  /** `checkpoint`: the root this session's head chain starts from. */
+  constructor(readonly checkpoint = CHECKPOINT) {}
   readonly keep = new Map<string, Uint8Array>();
   readonly nodes = new Map<string, Uint8Array>();
   readonly keys = new Map<number, Uint8Array[]>();
   readonly parsed = new Map<string, Hints | undefined>();
+  /** Hint files named by a read that planned without them: `hintsLater` fetches them for the next. */
+  readonly hintFiles = new Map<string, Uint8Array>();
+  /** Beacon roots (hex) proven finalized by the period updates applied, with their slots. */
+  readonly finalized = new Map<string, number>();
   bootSlot?: number;
 }
 
@@ -287,6 +302,7 @@ const period = (slot: number) => Math.floor(slot / SLOTS_PER_PERIOD);
 // ---------------------------------------------------------------- head
 
 export type Head = {
+  checkpoint: string;
   checkpointSlot: number;
   updates: number;
   slot: number;
@@ -345,10 +361,29 @@ function signed(u: J, keys: Uint8Array[] | undefined, what: string, nowSlot: num
  * is the reader's clock in ms, to refuse a stale head.
  */
 export function verifyHead(h: Held, now: number): Head {
-  return h.once("head", () => {
+  try {
+    return h.once("head", () => head(h, now));
+  } catch (e) {
+    if (e instanceof Refused) e.head = true;
+    throw e;
+  }
+}
+
+/** A bootstrap: its header must hash to `root`, and its state must name the committee. */
+function bootstrap(b: Uint8Array, root: string): { slot: number; keys: Uint8Array[] } {
+  const boot = envelope(b, "bootstrap");
+  if (!eq(beaconRoot(boot?.header?.beacon), unhex(root, 32))) refuse("bootstrap header is not the checkpoint");
+  const c0 = committee(boot.current_sync_committee, "bootstrap committee");
+  if (!branchOk(c0.root, branch(boot.current_sync_committee_branch, "committee branch"), CURRENT_COMMITTEE, b32(boot.header.beacon.state_root, "state_root")))
+    refuse("bootstrap committee is not in the checkpoint's state");
+  return { slot: num(boot.header.beacon.slot, "bootstrap slot"), keys: c0.keys };
+}
+
+function head(h: Held, now: number): Head {
+  {
     const keys = h.s.keys; // committees proven on earlier reads of this session
     const ob = h.get({ path: "head/optimistic" });
-    const bb = keys.size ? null : h.get({ path: `head/bootstrap/${CHECKPOINT}` });
+    const bb = keys.size ? null : h.get({ path: `head/bootstrap/${h.s.checkpoint}` });
     if (!ob || bb === undefined) throw PENDING;
     const opt = envelope(ob, "head/optimistic");
     const sigSlot = num(opt?.signature_slot, "head/optimistic signature_slot");
@@ -359,13 +394,12 @@ export function verifyHead(h: Held, now: number): Head {
     if (signedIn + 1 < current) refuse(`stale head: signed in period ${signedIn}, the clock is in ${current}`);
     if (bb) {
       // The checkpoint names the bootstrap header; its state names the committee.
-      const boot = envelope(bb, "bootstrap");
-      if (!eq(beaconRoot(boot?.header?.beacon), unhex(CHECKPOINT))) refuse("bootstrap header is not the checkpoint");
-      const c0 = committee(boot.current_sync_committee, "bootstrap committee");
-      if (!branchOk(c0.root, branch(boot.current_sync_committee_branch, "committee branch"), CURRENT_COMMITTEE, b32(boot.header.beacon.state_root, "state_root")))
-        refuse("bootstrap committee is not in the checkpoint's state");
-      h.s.bootSlot = num(boot.header.beacon.slot, "bootstrap slot");
-      keys.set(period(h.s.bootSlot), c0.keys);
+      const boot = bootstrap(bb, h.s.checkpoint);
+      // A remembered checkpoint must be newer than the built-in one, and not from the future.
+      if (h.s.checkpoint !== CHECKPOINT && (boot.slot <= CHECKPOINT_SLOT || boot.slot > nowSlot))
+        refuse(`checkpoint at slot ${boot.slot} is not between the built-in one and the clock`);
+      h.s.bootSlot = boot.slot;
+      keys.set(period(boot.slot), boot.keys);
     }
     const bootSlot = h.s.bootSlot!;
     const first = Math.max(...[...keys.keys()].filter((p) => p <= signedIn), period(bootSlot));
@@ -382,8 +416,16 @@ export function verifyHead(h: Held, now: number): Head {
       if (period(num(u?.attested_header?.beacon?.slot, `${what} slot`)) !== p) refuse(`${what} attests a header of another period`);
       signed(u, keys.get(period(num(u.signature_slot, what))), what, nowSlot);
       const next = committee(u.next_sync_committee, `${what} next committee`);
-      if (!branchOk(next.root, branch(u.next_sync_committee_branch, what), NEXT_COMMITTEE, b32(u.attested_header.beacon.state_root, what)))
-        refuse(`${what}: next committee is not in the signed state`);
+      const state = b32(u.attested_header.beacon.state_root, what);
+      if (!branchOk(next.root, branch(u.next_sync_committee_branch, what), NEXT_COMMITTEE, state)) refuse(`${what}: next committee is not in the signed state`);
+      // Its finalized header, by the finality branch from the same signed state (slot 0: none), as helios checks it.
+      const fin = u.finalized_header?.beacon;
+      const finSlot = num(fin?.slot, `${what} finalized slot`);
+      if (finSlot !== 0) {
+        const root = beaconRoot(fin);
+        if (!branchOk(root, branch(u.finality_branch, `${what} finality branch`), FINALIZED_ROOT, state)) refuse(`${what}: finalized header is not in the signed state`);
+        h.s.finalized.set(hex(root), finSlot);
+      }
       keys.set(p + 1, next.keys);
     });
 
@@ -397,6 +439,7 @@ export function verifyHead(h: Held, now: number): Head {
     if (!branchOk(executionRoot(exec), branch(opt.attested_header.execution_branch, "execution branch"), EXECUTION_PAYLOAD, b32(beacon.body_root, "body_root")))
       refuse("execution header is not in the signed block");
     return {
+      checkpoint: h.s.checkpoint,
       checkpointSlot: bootSlot,
       updates: Math.max(signedIn - period(bootSlot), 0),
       slot,
@@ -407,7 +450,34 @@ export function verifyHead(h: Held, now: number): Head {
       stateRoot: b32(exec.state_root, "state_root"),
       timestamp: num(exec.timestamp, "timestamp"),
     };
-  });
+  }
+}
+
+/**
+ * head::adopt: the checkpoint `head/checkpoint` names, taken only if a
+ * period update this session applied proved it finalized, at the slot the
+ * pointer claims, newer than the checkpoint started from, and its bootstrap
+ * checks. The same committees signed it finalized, so starting from it
+ * next time trusts nothing more. A pointer that lies only keeps the
+ * checkpoint where it is.
+ */
+export function adopt(h: Held): { root: string; slot: number } {
+  const from = h.s.bootSlot ?? refuse("no head proven in this session");
+  let p: J;
+  try {
+    p = JSON.parse(new TextDecoder().decode(h.need({ path: "head/checkpoint" })));
+  } catch (e) {
+    if (e instanceof Pending) throw e;
+    return refuse("head/checkpoint: not JSON");
+  }
+  const root = hex(b32(p?.root, "head/checkpoint root"));
+  const slot = num(p?.slot, "head/checkpoint slot");
+  const proven = h.s.finalized.get(root);
+  if (proven === undefined) refuse(`${root} is not proven finalized by this session's updates`);
+  if (proven !== slot) refuse(`head/checkpoint says slot ${slot}, the proof says ${proven}`);
+  if (slot <= from) refuse(`slot ${slot} is not newer than the checkpoint's ${from}`);
+  if (bootstrap(h.need({ path: `head/bootstrap/${root}` }), root).slot !== slot) refuse("bootstrap header is at another slot");
+  return { root, slot };
 }
 
 // ---------------------------------------------------------------- manifest
@@ -552,24 +622,40 @@ function parseHints(j: J): Hints {
   return o;
 }
 
-/** Each layer's hints. A hint file must hash to its name; one that is missing, does not hash or does not parse leaves its layer unhinted. */
+/**
+ * Each layer's hints. Unlike the Rust client, a read does not wait for a
+ * layer's hint file: it plans that layer as unhinted (asked for every
+ * position) and notes the file for `hintsLater`. On a cold read the files
+ * (about 1.4 MB on mainnet's eight layers) cost more than the pages they
+ * save; across a session's later reads they pay.
+ */
 function layerHints(h: Held, t: Tables): (Hints | undefined)[] {
   return h.once("hints", () =>
-    each(t.hints, (src) => {
+    t.hints.map((src) => {
       if (!(src instanceof Uint8Array)) return src;
-      const w = { path: `runs/${hex(src).slice(2)}.hints` };
-      if (h.s.parsed.has(w.path)) return h.s.parsed.get(w.path);
-      let out: Hints | undefined;
-      try {
-        const b = h.need(w);
-        out = eq(blake3(b), src) ? parseHints(JSON.parse(new TextDecoder().decode(b))) : undefined;
-      } catch (e) {
-        if (e instanceof Pending) throw e;
-      }
-      h.s.parsed.set(w.path, out);
-      return out;
+      const path = hintPath(src);
+      if (!h.s.parsed.has(path)) h.s.hintFiles.set(path, src);
+      return h.s.parsed.get(path);
     }),
   );
+}
+
+const hintPath = (name: Uint8Array) => `runs/${hex(name).slice(2)}.hints`;
+
+/** The hint files a read planned without, to fetch while the page is idle. */
+export const hintsLater = (s: Session): Want[] => [...s.hintFiles.keys()].filter((p) => !s.parsed.has(p)).map((path) => ({ path }));
+
+/** Take a fetched hint file: it must hash to its name and parse, or its layer stays unhinted. */
+export function takeHints(s: Session, path: string, b: Uint8Array | null) {
+  const name = s.hintFiles.get(path);
+  if (!name) return;
+  let out: Hints | undefined;
+  try {
+    out = b && eq(blake3(b), name) ? parseHints(JSON.parse(new TextDecoder().decode(b))) : undefined;
+  } catch {
+    out = undefined;
+  }
+  s.parsed.set(path, out);
 }
 
 /** PathHint::holds: exact above the cut depth (a held position or a "nothing under it" one), a prefix test at and below it. */
@@ -1061,9 +1147,8 @@ export function read(h: Held, q: Query): Answer {
   const head = verifyHead(h, q.now);
   const t = runs(h, head);
   const tables = t.runs;
-  // As the Rust client opens a snapshot: every page 0 and hint file in one round.
+  // As the Rust client opens a snapshot: every page 0 in one round.
   for (const r of tables.flat()) soft(() => top(h, r));
-  soft(() => layerHints(h, t));
   const hashed = keccak(q.address);
   const apath = nibbles(hashed);
   const slotHash = q.slot === undefined ? null : keccak(le(q.slot).reverse());
