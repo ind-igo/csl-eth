@@ -147,9 +147,9 @@ above. Details in `docs/decisions.md`.
   finalized root's bootstrap and a pointer, `head/checkpoint`. After each
   open, the page adopts that root only if the open proved it finalized from
   the root it held, then remembers it in localStorage (`docs/decisions.md`).
-  A first visit still starts from the built-in root, and so does the
-  tracker itself. `?checkpoint=` pins a root and is never rotated. The page
-  accepts it and `?bucket=` from the URL without a warning.
+  The tracker moves its own root the same way. A first visit still starts
+  from the built-in root. `?checkpoint=` pins a root and is never rotated.
+  The page accepts it and `?bucket=` from the URL without a warning.
 - **Gloas.** EIP-7732 removes the state root from the light-client header, so
   after that fork the head verifier needs the execution header from another
   source.
