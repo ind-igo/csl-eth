@@ -46,6 +46,28 @@ const DEFAULT_BASE =
     ? new URL("full", location.href).href.replace(/\/+$/, "")
     : "https://storage.googleapis.com/csl-eth-demo/full";
 const DEFAULT_CHECKPOINT = "0x431b33af8452e2d644377405e69d4f382182ab906f31461190ca24cb3401d70b";
+/// Where the page remembers a checkpoint it adopted (see `rotate`). Only
+/// ever a root this page proved finalized from the one it held.
+const CHECKPOINT_KEY = "csl-eth.checkpoint";
+const ROOT_RE = /^0x[0-9a-fA-F]{64}$/;
+
+function storedCheckpoint(): string | null {
+  try {
+    const v = localStorage.getItem(CHECKPOINT_KEY);
+    return v && ROOT_RE.test(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeCheckpoint(root: string | null) {
+  try {
+    if (root) localStorage.setItem(CHECKPOINT_KEY, root);
+    else localStorage.removeItem(CHECKPOINT_KEY);
+  } catch {
+    // Storage blocked: the page still works from the built-in checkpoint.
+  }
+}
 /// Display time each node check takes in a replay or after a live read.
 const CHECK_MS = 160;
 
@@ -83,7 +105,9 @@ const el = {
 
 const params = new URLSearchParams(location.search);
 el.base.value = params.get("bucket") ?? DEFAULT_BASE;
-el.checkpoint.value = params.get("checkpoint") ?? DEFAULT_CHECKPOINT;
+// A checkpoint in the URL is pinned: used as given, never rotated.
+const pinnedCheckpoint = params.get("checkpoint");
+el.checkpoint.value = pinnedCheckpoint ?? storedCheckpoint() ?? DEFAULT_CHECKPOINT;
 // The attested head when it is newer than the finalized one (the tracker
 // publishes both), unless the URL forces a tier.
 el.tier.value = tierParam(params);
@@ -234,6 +258,39 @@ function newClient(cfg: Config): ClientLike {
   return new wasm!.Client(cfg.checkpoint, Date.now(), cfg.prefetch, cfg.topLevels, cfg.tier);
 }
 
+/// After an open: fetch `head/checkpoint` and its bootstrap and let the
+/// client adopt the root, which it does only when this open proved it
+/// finalized and it is newer than the checkpoint opened from. Remembered
+/// for the next open; nothing else changes (this client keeps its head).
+async function rotate(c: ClientLike, cfg: Config): Promise<NonNullable<Scene["rotation"]>> {
+  const get = async (rel: string) => {
+    try {
+      const r = await fetch(`${cfg.bucket}/${rel}`, { cache: "no-store", signal: AbortSignal.timeout(15_000) });
+      return r.ok ? new Uint8Array(await r.arrayBuffer()) : null;
+    } catch {
+      return null;
+    }
+  };
+  const ptr = await get("head/checkpoint");
+  if (!ptr) return { state: "none", text: "head/checkpoint: none published; the checkpoint stays" };
+  let root = "";
+  try {
+    root = String(JSON.parse(new TextDecoder().decode(ptr)).root ?? "");
+  } catch {
+    // The client refuses it below.
+  }
+  const boot = ROOT_RE.test(root) ? await get(`head/bootstrap/${root}`) : null;
+  const r = JSON.parse(c.adopt(ptr, boot)) as { adopted?: { root: string; slot: number }; refused?: string; error?: string };
+  if (r.adopted) {
+    storeCheckpoint(r.adopted.root);
+    if (el.checkpoint.value.trim() === cfg.checkpoint) el.checkpoint.value = r.adopted.root;
+    return { state: "adopted", text: `${short(r.adopted.root, 6)} (slot ${r.adopted.slot.toLocaleString()}) · proven finalized by this open, adopted for the next one` };
+  }
+  const why = r.refused ?? r.error ?? "?";
+  if (root.toLowerCase() === cfg.checkpoint.toLowerCase()) return { state: "current", text: `${short(root, 6)} · already the checkpoint` };
+  return { state: "refused", text: `head/checkpoint refused, the checkpoint stays: ${why}` };
+}
+
 /// The client's layout, with each recorded request placed in it.
 function adoptTables(s: Scene, c: ClientLike): TableInfo[] {
   const t = JSON.parse(c.tables()) as { tables: TableInfo[]; top_levels: number };
@@ -261,6 +318,7 @@ async function open() {
   status("proving the head from the checkpoint…");
   const lane = newLane("open", 0);
   let c: ClientLike | null = null;
+  let fallback = false;
   try {
     try {
       c = newClient(cfg);
@@ -291,13 +349,32 @@ async function open() {
     const bad = tables.filter((t) => t.error && t.name !== "nodes_by_hash").map((t) => `${t.name} (${t.error})`);
     const fcr = fcrLine(h.fcr);
     status(`Head verified: block ${h.block_number.toLocaleString()}, ${tierLine(h)}.${fcr ? ` ${fcr[0]!.toUpperCase()}${fcr.slice(1)}.` : ""} ${bad.length ? `Unusable: ${bad.join(", ")}.` : ""}`, bad.length > 0);
+    if (pinnedCheckpoint === null) s.rotation = await rotate(cc, cfg);
   } catch (e) {
     if (c && client !== c) c.free();
     status(`not verified: ${e instanceof Error ? e.message : e}`, true);
+    // A remembered checkpoint that does not open (the bucket lost what it
+    // needs): open from the built-in one, which came from the same bucket
+    // as this page's code, so it adds no trust. Never for another bucket
+    // (`?bucket=`), which could otherwise roll a visitor back to the older
+    // root by withholding files; and never over a checkpoint typed since.
+    // The remembered root is kept: a newer adoption replaces it.
+    if (
+      pinnedCheckpoint === null &&
+      cfg.checkpoint !== DEFAULT_CHECKPOINT &&
+      cfg.checkpoint === storedCheckpoint() &&
+      el.checkpoint.value.trim() === cfg.checkpoint &&
+      cfg.bucket === DEFAULT_BASE
+    )
+      fallback = true;
   } finally {
     mode = { kind: "idle" };
     setBusy(false);
     dirtyAll();
+  }
+  if (fallback) {
+    el.checkpoint.value = DEFAULT_CHECKPOINT;
+    await open();
   }
 }
 
@@ -756,7 +833,7 @@ function draw(now: number) {
     // The chain of trust: the opening drive, at its own cursor.
     const os = openScene;
     const oc = os && s === os ? cur : os ? { t: sceneEnd(os) + 1e6, checks: 0 } : cur;
-    const cSig = `${os?.id}|${os === s ? landed : "end"}|${os?.lanes[0]?.sent.length}|${os?.lanes[0]?.steps.length}|${os === s ? Math.floor(cur.t) : 0}|${fSig}`;
+    const cSig = `${os?.id}|${os === s ? landed : "end"}|${os?.lanes[0]?.sent.length}|${os?.lanes[0]?.steps.length}|${os === s ? Math.floor(cur.t) : 0}|${fSig}|${os?.rotation?.text}`;
     if (cSig !== lastChainSig) {
       lastChainSig = cSig;
       el.chain.innerHTML = renderChain(os, oc, s === os ? focus.reqs : new Set());

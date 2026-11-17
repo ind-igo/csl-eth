@@ -16,6 +16,11 @@ export interface ClientLike {
   supply(i: number, status: number, body?: Uint8Array | null, error?: string | null): void;
   step(): string;
   head(): string;
+  /// After `open()`: adopt the checkpoint `head/checkpoint` suggests (its
+  /// bytes, and its bootstrap's when found), only if this open proved it
+  /// finalized and it is newer: `{"adopted": {root, slot}}` or
+  /// `{"refused": reason}`.
+  adopt(pointer: Uint8Array, bootstrap?: Uint8Array | null): string;
   /// The open snapshot's tables and where their pages sit (visualizer).
   tables(): string;
   /// Where the read in progress's entries sit in a response body (the

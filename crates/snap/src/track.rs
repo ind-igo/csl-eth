@@ -35,11 +35,15 @@ use alloy_primitives::{keccak256, Bytes, B256, U256};
 use clap::Args as ClapArgs;
 use csl_eth_client::{DirDriver, Read, Snapshot};
 use csl_eth_head::{
+    adopt,
     fetch::{named_of, Beacon},
-    paths, verify_tier, Chain, DirSource, ExecutionHead, HeadSource, Tier, VerifiedHead,
+    paths, period_of, verify_tier, Chain, DirSource, ExecutionHead, HeadSource, Pointer, Tier,
+    VerifiedHead,
 };
 use csl_eth_store::{
-    blob_path, layer_sorter, manifest_path, merge_layers, write_layer_sorted,
+    blob_path,
+    hints::{StoragePaths, StoragePathsBuilder},
+    layer_hints, layer_sorter, manifest_path, merge_layers, write_layer_sorted,
     write_layered_manifest, Head, Layer, LayerRows, Manifest, CODE_BLOB_THRESHOLD, EPSILON,
     LATEST_FILE, RUN_FORMAT, SORT_ACCOUNT, SORT_STORAGE, TABLE_ACCOUNT_NODES, TABLE_CODE,
     TABLE_STORAGE_NODES,
@@ -1841,6 +1845,59 @@ impl Heads {
             }
         }
     }
+
+    /// The checkpoint to suggest after `vh`, a head verified from this
+    /// tracker's checkpoint: the newest block it proved finalized through
+    /// a period update (the update for the period before the head was
+    /// signed in). None when `published` already names it, or names an
+    /// older block still proven in a period no older (once a period, and
+    /// again if the update it came from changed). Otherwise its bootstrap
+    /// and the pointer are written into the mirror, after checking that
+    /// [`adopt`] takes them from `vh`: what the page will check.
+    pub fn rotation(
+        &self,
+        vh: &VerifiedHead,
+        published: Option<&Pointer>,
+    ) -> Result<Option<Pointer>, String> {
+        // The period updates' proofs: all but the head's own, which a
+        // finalized head appends last (in a finality stall an update's
+        // finalized block can be the head's, and still counts).
+        let n = vh.proven_finalized.len();
+        let updates = match vh.tier {
+            Tier::Finalized => &vh.proven_finalized[..n.saturating_sub(1)],
+            Tier::Attested => &vh.proven_finalized[..],
+        };
+        let Some(r) = updates
+            .iter()
+            .filter(|p| p.slot > vh.checkpoint_slot)
+            .max_by_key(|p| p.slot)
+            .copied()
+        else {
+            return Ok(None);
+        };
+        let period = period_of(r.slot);
+        if let Some(p) = published {
+            let still = vh.proven_finalized.iter().any(|x| x.root == p.root);
+            if p.root == r.root || (still && p.period >= period) {
+                return Ok(None);
+            }
+        }
+        let boot_path = self.root.join(paths::bootstrap(&r.root));
+        let boot = match fs::read(&boot_path) {
+            Ok(b) => b,
+            Err(_) => self.beacon.bootstrap(r.root)?.0,
+        };
+        let ptr = Pointer {
+            root: r.root,
+            slot: r.slot,
+            period,
+        };
+        let pb = serde_json::to_vec(&ptr).map_err(|e| e.to_string())?;
+        adopt(vh, &pb, Some(&boot), &self.chain).map_err(|e| format!("self-check: {e}"))?;
+        write_atomic(&boot_path, &boot)?;
+        write_atomic(&self.root.join(paths::CHECKPOINT), &pb)?;
+        Ok(Some(ptr))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2020,6 +2077,9 @@ struct TrackState {
     /// The block `head/optimistic` and `snapshots/latest` name.
     #[serde(default)]
     optimistic: Option<B256>,
+    /// The checkpoint `head/checkpoint` suggests.
+    #[serde(default)]
+    checkpoint: Option<Pointer>,
 }
 
 impl TrackState {
@@ -2239,9 +2299,29 @@ struct Tracker {
     store: Store,
     publish: Box<dyn Publish>,
     log: Log,
+    /// Owners (first eight bytes) hot in a step lately, with the step:
+    /// each gets a path hint in every layer that names it while here, so
+    /// merges keep it ([`StoragePathsBuilder::finish_sticky`]).
+    hot: HashMap<u64, u64>,
 }
 
+/// How long an owner stays sticky after its last hot step: the
+/// since-base layer's merge period at fanout 4, five tiers.
+const STICKY_STEPS: u64 = 1024;
+
 impl Tracker {
+    /// The step's storage path hints: hot owners and sticky ones.
+    fn storage_paths(&mut self, b: StoragePathsBuilder) -> Option<StoragePaths> {
+        let step = self.st.steps;
+        let sticky: HashSet<u64> = self.hot.keys().copied().collect();
+        for o in b.hot_owners() {
+            self.hot.insert(o, step);
+        }
+        self.hot
+            .retain(|_, s| step.saturating_sub(*s) < STICKY_STEPS);
+        b.finish_sticky(&sticky)
+    }
+
     fn manifest(&self, head: &Head, latest: bool) -> Result<Manifest, String> {
         write_layered_manifest(
             &self.root,
@@ -2275,6 +2355,7 @@ impl Tracker {
         };
         let before = self.st.layers.clone();
         if !h.rows.is_empty() {
+            let paths = self.storage_paths(std::mem::take(&mut h.rows.paths));
             let layer = write_layer_sorted(
                 &self.root,
                 self.st.head.block_number,
@@ -2282,7 +2363,7 @@ impl Tracker {
                 &mut h.rows.sort,
                 &h.rows.code,
                 h.rows.owners.as_ref(),
-                std::mem::take(&mut h.rows.paths).finish(),
+                paths,
                 EPSILON,
             )
             .map_err(|e| format!("layer: {e}"))?;
@@ -2406,6 +2487,22 @@ impl Tracker {
             }
         }
         Ok(())
+    }
+
+    /// Suggest a newer checkpoint ([`Heads::rotation`]): the period
+    /// updates, then its bootstrap, then `head/checkpoint`, so a reader who
+    /// sees the pointer finds what it needs to check it.
+    fn rotate(&mut self, heads: &Heads, vh: &VerifiedHead) -> Result<Option<Pointer>, String> {
+        let Some(p) = heads.rotation(vh, self.st.checkpoint.as_ref())? else {
+            return Ok(None);
+        };
+        let mut sent = (0u64, 0u64);
+        self.publish_updates(&mut sent)?;
+        self.put(&paths::bootstrap(&p.root), &mut sent)?;
+        self.put(paths::CHECKPOINT, &mut sent)?;
+        self.st.checkpoint = Some(p);
+        self.st.save(&self.state_path)?;
+        Ok(Some(p))
     }
 
     /// Pin the finalized block's published manifest and point
@@ -2570,6 +2667,7 @@ pub async fn run(args: Args) -> Result<(), String> {
                 finalized: None,
                 pinned: VecDeque::new(),
                 optimistic: None,
+                checkpoint: None,
             }
         }
     };
@@ -2628,7 +2726,16 @@ pub async fn run(args: Args) -> Result<(), String> {
         store,
         publish,
         log,
+        hot: HashMap::new(),
     };
+    // Sticky from the start: the owners the current layers hint.
+    for l in &h.st.layers {
+        if let Some(p) = layer_hints(&h.root, &l.layer).storage_paths {
+            for o in p.0.keys() {
+                h.hot.insert(*o, h.st.steps);
+            }
+        }
+    }
     h.log.emit(json!({"ev": "start", "base": h.st.base, "head": h.st.head.block_number, "layers": h.st.layers.len(), "runs": h.store.run_counts()}));
     let heads = Heads::new(&args.beacon, args.checkpoint, &root);
     let peer_cfg = heal::Config {
@@ -2664,6 +2771,7 @@ pub async fn run(args: Args) -> Result<(), String> {
     let mut attempt = 0u64;
     let mut fin_checked: Option<Instant> = None;
     let mut fin_missed = 0u64;
+    let mut rotate_after: Option<Instant> = None;
     while !over(h.st.steps) {
         // The finalized tier, checked every 30 s (it moves once an epoch).
         let mut fin = None;
@@ -2671,6 +2779,18 @@ pub async fn run(args: Args) -> Result<(), String> {
             fin_checked = Some(Instant::now());
             match tokio::task::block_in_place(|| heads.latest(Tier::Finalized)) {
                 Ok((fu, fvh)) => {
+                    if rotate_after.is_none_or(|t| Instant::now() >= t) {
+                        match tokio::task::block_in_place(|| h.rotate(&heads, &fvh)) {
+                            Ok(Some(p)) => {
+                                h.log.emit(json!({"ev": "rotated", "root": p.root, "slot": p.slot, "period": p.period}))
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                rotate_after = Some(Instant::now() + Duration::from_secs(600));
+                                h.log.emit(json!({"ev": "rotate_failed", "error": e}));
+                            }
+                        }
+                    }
                     let fe = fvh.execution;
                     let newer =
                         h.st.finalized
@@ -3145,6 +3265,85 @@ mod tests {
         ));
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// The head crate's p1900 fixtures: checkpoint at slot 15,551,104, a
+    /// finality update signed in 1900, the updates for 1898 and 1899
+    /// applied, and 1899's finalized block (15,556,608) newer than the
+    /// checkpoint, with its bootstrap.
+    #[test]
+    fn rotation_suggests_the_newest_proven_root_once_and_checks_it() {
+        let fix = Path::new(env!("CARGO_MANIFEST_DIR")).join("../head/tests/fixtures/p1900");
+        let read = |f: &str| fs::read(fix.join(f)).unwrap();
+        let meta: Value = serde_json::from_slice(&read("meta.json")).unwrap();
+        let cp: B256 = meta["checkpoint"].as_str().unwrap().parse().unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(meta["now"].as_u64().unwrap());
+        let root = scratch("rotation");
+        write_atomic(&root.join(paths::bootstrap(&cp)), &read("bootstrap.json")).unwrap();
+        for p in [1898, 1899, 1900] {
+            write_atomic(
+                &root.join(paths::update(p)),
+                &read(&format!("update-{p}.json")),
+            )
+            .unwrap();
+        }
+        write_atomic(&root.join(paths::FINALITY), &read("finality.json")).unwrap();
+        let vh = verify_tier(
+            &DirSource(root.clone()),
+            &Chain::mainnet(),
+            cp,
+            now,
+            Tier::Finalized,
+        )
+        .unwrap();
+        let r: B256 = "0x64b56a372f8c4ccc274d9f42c9b4a1d9a18966a20188992bcac15b1c6e7d91ac"
+            .parse()
+            .unwrap();
+        // A beacon that never answers: the bootstrap is the mirror's or none.
+        let heads = Heads::new("http://127.0.0.1:9", cp, &root);
+        assert!(heads.rotation(&vh, None).is_err());
+        assert!(!root.join(paths::CHECKPOINT).exists());
+        // Another block's bootstrap under the root's name: the self-check
+        // refuses it and nothing is pointed at.
+        write_atomic(&root.join(paths::bootstrap(&r)), &read("bootstrap.json")).unwrap();
+        let e = heads.rotation(&vh, None).unwrap_err();
+        assert!(e.contains("self-check"), "{e}");
+        assert!(!root.join(paths::CHECKPOINT).exists());
+        write_atomic(
+            &root.join(paths::bootstrap(&r)),
+            &read("bootstrap-1899.json"),
+        )
+        .unwrap();
+        let p = heads.rotation(&vh, None).unwrap().unwrap();
+        assert_eq!(
+            p,
+            Pointer {
+                root: r,
+                slot: 15_556_608,
+                period: 1899
+            }
+        );
+        let written: Pointer =
+            serde_json::from_slice(&fs::read(root.join(paths::CHECKPOINT)).unwrap()).unwrap();
+        assert_eq!(written, p);
+        // Once: the published pointer already names it.
+        assert_eq!(heads.rotation(&vh, Some(&p)).unwrap(), None);
+        // One the head no longer proves (its update changed) is replaced.
+        let gone = Pointer {
+            root: B256::repeat_byte(1),
+            ..p
+        };
+        assert_eq!(heads.rotation(&vh, Some(&gone)).unwrap(), Some(p));
+        // The pointer is what the head crate adopts from the same head.
+        let boot = fs::read(root.join(paths::bootstrap(&r))).unwrap();
+        assert!(adopt(
+            &vh,
+            &fs::read(root.join(paths::CHECKPOINT)).unwrap(),
+            Some(&boot),
+            &Chain::mainnet()
+        )
+        .is_ok());
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn far() -> Instant {

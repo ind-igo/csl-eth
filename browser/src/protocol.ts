@@ -50,6 +50,8 @@ export interface Trip {
 
 export interface Head {
   checkpoint: string;
+  /// The checkpoint's slot (its bootstrap's header).
+  checkpoint_slot: number;
   slot: number;
   period: number;
   beacon_root: string;

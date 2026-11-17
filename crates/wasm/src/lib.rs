@@ -10,6 +10,7 @@
 use alloy_primitives::{keccak256, B256, U256};
 use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use csl_eth_client::{
+    head::Chain,
     trie::{decode_word, Account, Nibbles, Shape},
     Cost, FcrReport, HeadOpener, Hint, NoDriver, Origin, Pending, Read, Reason, Snapshot,
     TierChoice, Trace, TraceNode, Trie, VerifiedHead, WalkTrace, Want,
@@ -270,6 +271,7 @@ fn head_json(
     let m = snap.manifest();
     serde_json::json!({
         "checkpoint": format!("{}", h.checkpoint),
+        "checkpoint_slot": h.checkpoint_slot,
         "slot": h.slot,
         "period": h.period,
         "beacon_root": format!("{}", h.beacon_root),
@@ -695,6 +697,26 @@ impl Client {
             })
             .collect();
         serde_json::json!({ "targets": list }).to_string()
+    }
+
+    /// After `open()`: adopt the checkpoint `pointer` (the bytes of
+    /// `head/checkpoint`) suggests, with `bootstrap` the bytes of
+    /// `head/bootstrap/<its root>` (absent when that was not found).
+    /// `{"adopted": {"root", "slot"}}` only when this open proved the root
+    /// finalized from its own checkpoint, it is newer than that checkpoint,
+    /// and the bootstrap proves it; else `{"refused": reason}`. The page
+    /// then remembers the root for its next open.
+    pub fn adopt(&self, pointer: &[u8], bootstrap: Option<Vec<u8>>) -> String {
+        let Some(h) = &self.head else {
+            return error_json("not open");
+        };
+        match csl_eth_client::head::adopt(h, pointer, bootstrap.as_deref(), &Chain::mainnet()) {
+            Ok(p) => {
+                serde_json::json!({"adopted": {"root": format!("{}", p.root), "slot": p.slot}})
+                    .to_string()
+            }
+            Err(e) => serde_json::json!({"refused": e.to_string()}).to_string(),
+        }
     }
 
     /// The verified head and the snapshot it named, once open.

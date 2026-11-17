@@ -164,6 +164,10 @@ export interface Scene {
   config: Config;
   /// The head the scene's client(s) proved.
   head?: Head;
+  /// An open's outcome with `head/checkpoint`: adopted, already there,
+  /// none published, or refused (the checkpoint stays); absent when not
+  /// tried (a checkpoint pinned in the URL).
+  rotation?: { state: "adopted" | "current" | "none" | "refused"; text: string };
 }
 
 export function newLane(name: LaneName, offset: number): Lane {

@@ -24,8 +24,11 @@
 
 use crate::{manifest_path, At, Driver, Opener, Pending, Snapshot, Store, PENDING};
 use alloy_primitives::B256;
+pub use csl_eth_head::{
+    adopt, Chain, ExecutionHead, FcrClass, FcrReport, HeadError, Pointer, Proven, Refusal, Tier,
+    VerifiedHead,
+};
 use csl_eth_head::{paths, update_periods_for, verify_tier, HeadSource};
-pub use csl_eth_head::{Chain, ExecutionHead, FcrClass, FcrReport, HeadError, Tier, VerifiedHead};
 use csl_eth_store::Manifest;
 use std::{fmt, sync::Arc, time::SystemTime};
 
@@ -448,6 +451,8 @@ mod tests {
                 state_root: B256::ZERO,
                 timestamp: 0,
             },
+            checkpoint_slot: 0,
+            proven_finalized: Vec::new(),
             lag_secs: 0,
         }
     }

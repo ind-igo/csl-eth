@@ -63,6 +63,9 @@ pub mod paths {
     pub const OPTIMISTIC: &str = "head/optimistic";
     /// The producer's unverified fast-confirmation report; see [`crate::FcrReport`].
     pub const FCR: &str = "head/fcr";
+    /// A newer checkpoint the producer suggests ([`crate::Pointer`]):
+    /// unverified, adopted only through [`crate::adopt`].
+    pub const CHECKPOINT: &str = "head/checkpoint";
 
     pub fn bootstrap(block_root: &B256) -> String {
         format!("head/bootstrap/{block_root}")
@@ -263,11 +266,140 @@ pub struct VerifiedHead {
     /// Period updates applied on the way from the checkpoint.
     pub updates_applied: u64,
     pub execution: ExecutionHead,
+    /// The checkpoint's slot (its bootstrap's header).
+    pub checkpoint_slot: u64,
+    /// Beacon blocks this verification proved finalized, oldest first: the
+    /// finalized header of each period update applied with two thirds of
+    /// the committee signing, and the head itself when it is the finalized
+    /// tier. Each is as good a checkpoint as `checkpoint`; see [`adopt`].
+    pub proven_finalized: Vec<Proven>,
     /// Now minus the head block's timestamp. For the finalized tier
     /// normally 13 to 19 minutes, unbounded in a finality stall; for the
     /// attested tier the producer's cadence and pipeline, minutes; for
     /// either, growing when the producer stops rewriting the file.
     pub lag_secs: u64,
+}
+
+/// A beacon block proven finalized, and its root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Proven {
+    pub slot: u64,
+    pub root: B256,
+}
+
+/// `head/checkpoint`: the root the producer suggests moving to, the
+/// finalized header of a period update, with its bootstrap at
+/// `head/bootstrap/<root>`; `period` is the sync period of `slot`.
+/// Nothing in it is trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pointer {
+    pub root: B256,
+    pub slot: u64,
+    pub period: u64,
+}
+
+/// Why a suggested checkpoint was not adopted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// The pointer file is not a [`Pointer`].
+    Pointer(String),
+    /// The root is not one this verification proved finalized.
+    NotProven(B256),
+    /// Proven, but no newer than the checkpoint already held.
+    NotNewer { slot: u64, checkpoint_slot: u64 },
+    /// The pointer's slot is not the proven block's.
+    WrongSlot { claimed: u64, proven: u64 },
+    /// No bootstrap for the root.
+    NoBootstrap(B256),
+    /// The bootstrap does not prove the root's header and committee.
+    Bootstrap(String),
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Refusal::Pointer(e) => write!(f, "pointer: {e}"),
+            Refusal::NotProven(r) => write!(f, "{r} is not a block this head proved finalized"),
+            Refusal::NotNewer {
+                slot,
+                checkpoint_slot,
+            } => write!(
+                f,
+                "slot {slot} is not after the checkpoint's {checkpoint_slot}"
+            ),
+            Refusal::WrongSlot { claimed, proven } => {
+                write!(
+                    f,
+                    "the pointer says slot {claimed}, the block is at {proven}"
+                )
+            }
+            Refusal::NoBootstrap(r) => write!(f, "no bootstrap for {r}"),
+            Refusal::Bootstrap(e) => write!(f, "bootstrap: {e}"),
+        }
+    }
+}
+
+/// Adopt the checkpoint `pointer` suggests, after `head` verified: only a
+/// root `head` proved finalized from its own checkpoint, newer than it,
+/// whose `bootstrap` proves its header and sync committee. Holding the
+/// returned root instead of `head.checkpoint` trusts nothing more than
+/// before: the same committees signed it finalized. A pointer that lies
+/// can only keep the checkpoint where it is.
+pub fn adopt(
+    head: &VerifiedHead,
+    pointer: &[u8],
+    bootstrap: Option<&[u8]>,
+    chain: &Chain,
+) -> Result<Proven, Refusal> {
+    let p: Pointer =
+        serde_json::from_slice(pointer).map_err(|e| Refusal::Pointer(e.to_string()))?;
+    let proven = *head
+        .proven_finalized
+        .iter()
+        .find(|x| x.root == p.root)
+        .ok_or(Refusal::NotProven(p.root))?;
+    if p.slot != proven.slot {
+        return Err(Refusal::WrongSlot {
+            claimed: p.slot,
+            proven: proven.slot,
+        });
+    }
+    if proven.slot <= head.checkpoint_slot {
+        return Err(Refusal::NotNewer {
+            slot: proven.slot,
+            checkpoint_slot: head.checkpoint_slot,
+        });
+    }
+    let bytes = bootstrap.ok_or(Refusal::NoBootstrap(p.root))?;
+    let b =
+        checked_bootstrap(bytes, p.root, chain).map_err(|e| Refusal::Bootstrap(e.to_string()))?;
+    if b.header().beacon().slot != proven.slot {
+        return Err(Refusal::Bootstrap(format!(
+            "header at slot {}, not {}",
+            b.header().beacon().slot,
+            proven.slot
+        )));
+    }
+    Ok(proven)
+}
+
+/// The finalized header a period update carries, when it carries one
+/// (slot 0 means none) and two thirds of the committee signed it: what
+/// [`verify_tier`] counts as proven once the update applies. Not verified
+/// here.
+pub fn update_finalized(bytes: &[u8]) -> Result<Option<Proven>, HeadError> {
+    let u: Update<Spec> = decode("head/updates", bytes)?;
+    Ok(finalized_of_update(&u))
+}
+
+fn finalized_of_update(u: &Update<Spec>) -> Option<Proven> {
+    let f = u.finalized_header();
+    let b = f.beacon();
+    let signers = get_bits::<Spec>(&u.sync_aggregate().sync_committee_bits);
+    (b.slot != 0 && has_quorum(signers)).then(|| Proven {
+        slot: b.slot,
+        root: b.tree_hash_root(),
+    })
 }
 
 /// A head update of either tier.
@@ -452,6 +584,7 @@ pub fn verify_tier(
     let periods = periods_between(&bootstrap, &head, tier, current_period)?;
 
     let mut updates_applied = 0;
+    let mut proven_finalized = Vec::new();
     for period in periods {
         let update: Update<Spec> = read(src, &paths::update(period))?;
         let attested = calc_sync_period::<Spec>(update.attested_header().beacon().slot);
@@ -474,6 +607,9 @@ pub fn verify_tier(
         })?;
         apply_update::<Spec>(&mut store, &update);
         updates_applied += 1;
+        // Its finality branch was checked against the attested header the
+        // committee signed (helios skips both only at slot 0).
+        proven_finalized.extend(finalized_of_update(&update));
     }
 
     head.verify(current_slot, &store, chain)
@@ -518,9 +654,17 @@ pub fn verify_tier(
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    if tier == Tier::Finalized {
+        proven_finalized.push(Proven {
+            slot: beacon.slot,
+            root: beacon.tree_hash_root(),
+        });
+    }
     Ok(VerifiedHead {
         tier,
         checkpoint,
+        checkpoint_slot: bootstrap.header().beacon().slot,
+        proven_finalized,
         slot: beacon.slot,
         beacon_root: beacon.tree_hash_root(),
         period: calc_sync_period::<Spec>(beacon.slot),

@@ -42,7 +42,7 @@ pub const HINT_COVERAGE: f64 = 0.01;
 const MAX_DEPTH: usize = 8;
 /// An owner with at least this many storage nodes in a layer gets a path
 /// hint; one with fewer is only named.
-pub const HOT_MIN: usize = 64;
+pub const HOT_MIN: usize = 16;
 /// The most entries all of a layer's storage path hints may have together;
 /// past it, the owners with the most nodes are hinted first.
 pub const STORAGE_PATHS_CAP: usize = 2 * HINT_CAP;
@@ -481,18 +481,40 @@ impl StoragePathsBuilder {
             .push((top8(key) as u64) << 8 | key[31] as u64);
     }
 
+    /// The owners (first eight bytes) with at least the minimum positions
+    /// so far: hot by count, whatever is sticky.
+    pub fn hot_owners(&self) -> Vec<u64> {
+        let mut v: Vec<u64> = self
+            .per
+            .iter()
+            .filter(|(_, p)| p.len() >= self.min)
+            .map(|(o, _)| *o)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
     /// Hints for the owners with at least [`HOT_MIN`] positions (or the
     /// [`hot_min`](Self::hot_min) given), most
     /// positions first, up to [`STORAGE_PATHS_CAP`] entries; `None` past
     /// the collection cap.
     pub fn finish(self) -> Option<StoragePaths> {
+        self.finish_sticky(&HashSet::new())
+    }
+
+    /// As [`finish`](Self::finish), and also for each owner in `sticky`
+    /// with any positions: owners hot lately, so that a merge (which keeps
+    /// an owner's hint only when every layer naming it has one) keeps
+    /// theirs through the blocks they change little in.
+    pub fn finish_sticky(self, sticky: &HashSet<u64>) -> Option<StoragePaths> {
         if self.over {
             return None;
         }
+        let min = self.min;
         let mut hot: Vec<(u64, Vec<u64>)> = self
             .per
             .into_iter()
-            .filter(|(_, v)| v.len() >= self.min)
+            .filter(|(o, v)| v.len() >= min || sticky.contains(o))
             .collect();
         hot.sort_by_key(|(o, v)| (std::cmp::Reverse(v.len()), *o));
         let hints = hot
@@ -672,15 +694,23 @@ mod tests {
                 held.push((hot, p, d));
             }
         }
-        for _ in 0..3 {
+        for _ in 0..2 {
             for (p, d) in leaf_and_ancestors(&mut rng, 5) {
                 b.push(&cold, &key(&p, d));
                 held.push((cold, p, d));
             }
         }
+        assert_eq!(b.hot_owners(), vec![prefix8(&hot)]);
+        // Sticky: the cold owner hinted too, an owner it never saw not.
+        let sticky = b
+            .clone()
+            .finish_sticky(&[prefix8(&cold), prefix8(&gone)].into_iter().collect())
+            .expect("paths");
+        assert!(sticky.get(&hot).is_some() && sticky.get(&cold).is_some());
+        assert!(sticky.get(&gone).is_none());
         let paths = b.finish().expect("paths");
         assert!(paths.get(&hot).is_some(), "the hot owner is hinted");
-        assert!(paths.get(&cold).is_none(), "18 positions is not hot");
+        assert!(paths.get(&cold).is_none(), "12 positions is not hot");
         let h = Hints {
             storage: KeySet::of([hot, cold].iter()),
             storage_paths: Some(paths),

@@ -125,6 +125,8 @@ export function renderChain(scene: Scene | null, cur: Cursor, focusReqs: Set<str
   const failedAtStart = refused && l.reqs.length === 0;
 
   items.push({ title: "checkpoint", sub: failedAtStart ? `${short(checkpoint, 6)} · refused: ${l.error}` : `${short(checkpoint, 6)} · the one thing trusted: a beacon block root`, state: failedAtStart ? "bad" : "ok", reqs: [] });
+  // Drawn after the chain below, which is what proved it.
+  const rot = head && scene?.rotation ? { title: "next checkpoint", sub: scene.rotation.text, state: ({ adopted: "ok", current: "ok", none: "wait", refused: "warn" } as const)[scene.rotation.state], reqs: [] } : null;
   const boot = stateOf(l, li, cur, v, 0, (f) => f.startsWith("head/bootstrap/"));
   items.push({ title: "sync committee", sub: boot.state === "ok" ? `the bootstrap's 512 keys, proven against the checkpoint · ${kb(boot.bytes)}` : boot.state === "bad" ? `refused: ${l.error}` : "head/bootstrap", state: boot.state, reqs: boot.reqs });
   // Period updates: each hands over to the next committee, from the
@@ -205,6 +207,7 @@ export function renderChain(scene: Scene | null, cur: Cursor, focusReqs: Set<str
     items.push({ title: "each table's page 0", sub: s.state === "bad" ? `refused: ${l.error}` : "the tables' headers and top models", state: s.state, reqs: s.reqs });
   }
   if (refused) items.push({ title: "refused", sub: l.error ?? "", state: "bad", reqs: [] });
+  if (rot) items.push(rot);
   return draw(items, focusReqs);
 }
 

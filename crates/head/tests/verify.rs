@@ -11,8 +11,8 @@
 
 use alloy_primitives::B256;
 use csl_eth_head::{
-    has_quorum, paths, update_periods_for, verify, verify_attested, Chain, HeadError, HeadSource,
-    Tier, COMMITTEE_SIZE,
+    adopt, has_quorum, paths, update_finalized, update_periods_for, verify, verify_attested, Chain,
+    HeadError, HeadSource, Pointer, Proven, Refusal, Tier, COMMITTEE_SIZE,
 };
 use std::{
     collections::HashMap,
@@ -636,4 +636,191 @@ fn an_attested_header_at_slot_zero_or_missing_is_not_a_head() {
     assert_eq!(r, Err(HeadError::Missing(paths::OPTIMISTIC.to_string())));
     // The finalized tier does not read it at all.
     assert!(verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now).is_ok());
+}
+
+// Checkpoint rotation: p1900's bootstrap is at slot 15,551,104 (period
+// 1898); its head applies the updates for 1898 and 1899, whose finalized
+// headers are at 15,548,416 (before the checkpoint) and 15,556,608.
+// `bootstrap-1899.json` is that second block's bootstrap, fetched from
+// publicnode on 2026-11-17.
+
+fn root(s: &str) -> B256 {
+    s.parse().unwrap()
+}
+
+const R1898: &str = "0xcaa0c55c8f6931eab843a71ff413d2d6a462183e4ac6725e5f4f4a912c60ba13";
+const R1899: &str = "0x64b56a372f8c4ccc274d9f42c9b4a1d9a18966a20188992bcac15b1c6e7d91ac";
+const R1900: &str = "0x96949350abfe8a04e6f1ae22b3064fdcee177dec32133348a2a69d200151e09a";
+
+fn bootstrap_1899() -> Vec<u8> {
+    std::fs::read(format!("{FIX}/p1900/bootstrap-1899.json")).unwrap()
+}
+
+fn pointer(root: &str, slot: u64, period: u64) -> Vec<u8> {
+    serde_json::to_vec(&Pointer {
+        root: root.parse().unwrap(),
+        slot,
+        period,
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_head_proves_its_updates_finalized_headers() {
+    let fx = fixture_1900();
+    let h = verify(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now).unwrap();
+    assert_eq!(h.checkpoint_slot, 15_551_104);
+    assert_eq!(
+        h.proven_finalized,
+        vec![
+            Proven {
+                slot: 15_548_416,
+                root: root(R1898)
+            },
+            Proven {
+                slot: 15_556_608,
+                root: root(R1899)
+            },
+            Proven {
+                slot: h.slot,
+                root: h.beacon_root
+            },
+        ]
+    );
+    // An attested head is not finalized: only the updates' headers.
+    let fx = fixture_attested();
+    let h = verify_attested(&fx.files, &Chain::mainnet(), fx.checkpoint, fx.now).unwrap();
+    assert!(h.proven_finalized.iter().all(|p| p.root != h.beacon_root));
+}
+
+#[test]
+fn a_proven_newer_root_is_adopted_and_verifies_the_same_head() {
+    let fx = fixture_1900();
+    let chain = Chain::mainnet();
+    let h = verify(&fx.files, &chain, fx.checkpoint, fx.now).unwrap();
+    let boot = bootstrap_1899();
+    let got = adopt(&h, &pointer(R1899, 15_556_608, 1899), Some(&boot), &chain).unwrap();
+    assert_eq!(
+        got,
+        Proven {
+            slot: 15_556_608,
+            root: root(R1899)
+        }
+    );
+    // From the adopted root: one update fewer, the same head.
+    let mut files = fx.files.0.clone();
+    files.insert(paths::bootstrap(&root(R1899)), boot);
+    let h2 = verify(&Files(files), &chain, root(R1899), fx.now).unwrap();
+    assert_eq!(h2.checkpoint_slot, 15_556_608);
+    assert_eq!(h2.updates_applied, 1);
+    assert_eq!(h2.execution, h.execution);
+}
+
+#[test]
+fn a_lying_pointer_leaves_the_checkpoint_where_it_is() {
+    let fx = fixture_1900();
+    let chain = Chain::mainnet();
+    let h = verify(&fx.files, &chain, fx.checkpoint, fx.now).unwrap();
+    let boot = bootstrap_1899();
+    let try_ = |p: Vec<u8>| adopt(&h, &p, Some(&boot), &chain);
+    // A block this head did not prove: 1900's update was not applied
+    // (the head was signed in 1900), and a made-up root.
+    assert_eq!(
+        try_(pointer(R1900, 15_564_800, 1900)),
+        Err(Refusal::NotProven(root(R1900)))
+    );
+    let made_up = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    assert_eq!(
+        try_(pointer(made_up, 15_556_608, 1899)),
+        Err(Refusal::NotProven(root(made_up)))
+    );
+    // Proven, but before the checkpoint: never move backwards.
+    assert_eq!(
+        try_(pointer(R1898, 15_548_416, 1898)),
+        Err(Refusal::NotNewer {
+            slot: 15_548_416,
+            checkpoint_slot: 15_551_104
+        })
+    );
+    // The right root under a wrong slot.
+    assert_eq!(
+        try_(pointer(R1899, 15_556_609, 1899)),
+        Err(Refusal::WrongSlot {
+            claimed: 15_556_609,
+            proven: 15_556_608
+        })
+    );
+    // Not a pointer at all.
+    assert!(matches!(
+        try_(b"<html>404</html>".to_vec()),
+        Err(Refusal::Pointer(_))
+    ));
+    assert!(matches!(
+        try_(b"{\"root\": 1}".to_vec()),
+        Err(Refusal::Pointer(_))
+    ));
+}
+
+#[test]
+fn a_missing_or_foreign_bootstrap_is_refused() {
+    let fx = fixture_1900();
+    let chain = Chain::mainnet();
+    let h = verify(&fx.files, &chain, fx.checkpoint, fx.now).unwrap();
+    let p = pointer(R1899, 15_556_608, 1899);
+    assert_eq!(
+        adopt(&h, &p, None, &chain),
+        Err(Refusal::NoBootstrap(root(R1899)))
+    );
+    // The old checkpoint's bootstrap served under the new root's name.
+    let old = std::fs::read(format!("{FIX}/p1900/bootstrap.json")).unwrap();
+    assert!(matches!(
+        adopt(&h, &p, Some(&old), &chain),
+        Err(Refusal::Bootstrap(_))
+    ));
+    // The right header with another committee.
+    let forged = edit_json(&bootstrap_1899(), |v| {
+        v["data"]["current_sync_committee"]["pubkeys"][0] =
+            v["data"]["current_sync_committee"]["pubkeys"][1].clone();
+    });
+    assert!(matches!(
+        adopt(&h, &p, Some(&forged), &chain),
+        Err(Refusal::Bootstrap(_))
+    ));
+}
+
+#[test]
+fn an_update_without_a_quorum_or_finality_proves_nothing() {
+    let u = std::fs::read(format!("{FIX}/p1900/update-1899.json")).unwrap();
+    assert_eq!(
+        update_finalized(&u).unwrap(),
+        Some(Proven {
+            slot: 15_556_608,
+            root: root(R1899)
+        })
+    );
+    // 341 of 512 signers: short of two thirds.
+    let few = edit_json(&u, |v| {
+        let d = if v.get("data").is_some() {
+            &mut v["data"]
+        } else {
+            &mut v[0]["data"]
+        };
+        let mut bits = vec![0u8; 64];
+        for i in 0..341 {
+            bits[i / 8] |= 1 << (i % 8);
+        }
+        d["sync_aggregate"]["sync_committee_bits"] =
+            serde_json::Value::String(format!("0x{}", alloy_primitives::hex::encode(bits)));
+    });
+    assert_eq!(update_finalized(&few).unwrap(), None);
+    // No finalized header (slot 0).
+    let none = edit_json(&u, |v| {
+        let d = if v.get("data").is_some() {
+            &mut v["data"]
+        } else {
+            &mut v[0]["data"]
+        };
+        d["finalized_header"]["beacon"]["slot"] = serde_json::Value::String("0".into());
+    });
+    assert_eq!(update_finalized(&none).unwrap(), None);
 }
