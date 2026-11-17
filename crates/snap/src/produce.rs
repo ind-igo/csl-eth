@@ -372,7 +372,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+    csl_eth_store::durable_rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn now_secs() -> u64 {

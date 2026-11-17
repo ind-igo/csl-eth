@@ -470,7 +470,7 @@ fn write_snapshot(
 }
 
 /// Write to a temporary name and rename, so a reader never sees a partial
-/// file.
+/// file, and a power loss never leaves an empty one ([`durable_rename`]).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -481,7 +481,21 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.write_all(bytes)?;
         f.flush()?;
     }
-    fs::rename(&tmp, path)
+    durable_rename(&tmp, path)
+}
+
+/// Flush `tmp` to disk, rename it to `path`, then flush the directory, so a
+/// power loss leaves the old name or the whole new file. Without the first
+/// flush ext4 can make a new name durable before its data: a spot
+/// preemption on 2026-11-17 left the tracker nine empty run files, one of
+/// them in its committed state, and it would not start.
+pub fn durable_rename(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    File::open(tmp)?.sync_all()?;
+    fs::rename(tmp, path)?;
+    match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => File::open(d)?.sync_all(),
+        _ => File::open(".")?.sync_all(),
+    }
 }
 
 /// Build a `Nibbles` path from a hex prefix string for manifests and tests.

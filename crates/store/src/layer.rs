@@ -15,7 +15,7 @@ use crate::hints::{
 };
 use crate::producer::Head;
 use crate::{
-    blob_path, manifest_path, producer::write_atomic, profile_id, run_path, Layer, Manifest,
+    blob_path, manifest_path, producer::{durable_rename, write_atomic}, profile_id, run_path, Layer, Manifest,
     ProduceError, Rows, TableRef, CODE_BLOB_THRESHOLD, FORMAT_VERSION_LAYERED, LATEST_FILE,
     RUN_FORMAT, TABLE_ACCOUNT_NODES, TABLE_CODE, TABLE_STORAGE_NODES,
 };
@@ -148,7 +148,7 @@ fn write_run_with(
             "run root is not the file's blake3",
         )));
     }
-    fs::rename(&tmp, root.join(run_path(&built.root)))?;
+    durable_rename(&tmp, &root.join(run_path(&built.root)))?;
     Ok(TableRef {
         table_id,
         root: built.root,

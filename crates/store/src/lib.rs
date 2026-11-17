@@ -41,7 +41,7 @@ pub use layer::{
     write_layered_manifest, LayerRows, SORT_ACCOUNT, SORT_STORAGE,
 };
 pub use producer::{
-    build_rows, produce, produce_with, storage_positions, AccountLeaf, Head,
+    build_rows, durable_rename, produce, produce_with, storage_positions, AccountLeaf, Head,
     Options as ProduceOptions, ProduceError, Produced, Rows, Rows4, Stats as ProduceStats,
 };
 

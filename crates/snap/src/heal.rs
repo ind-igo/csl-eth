@@ -273,7 +273,7 @@ impl Known {
         let bytes = serde_json::to_vec(&*m).expect("serialize");
         drop(m);
         let tmp = path.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, path)) {
+        if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|()| csl_eth_store::durable_rename(&tmp, path)) {
             warn!(path = %path.display(), error = %e, "known peers: not saved");
         }
     }

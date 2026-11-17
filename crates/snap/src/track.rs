@@ -221,7 +221,7 @@ pub fn build_root_index(
         .map_err(|e| format!("root index: {e}"))?;
     w.flush().map_err(|e| e.to_string())?;
     drop(w);
-    fs::rename(&tmp, dir.join("roots.idx")).map_err(|e| e.to_string())?;
+    csl_eth_store::durable_rename(&tmp, &dir.join("roots.idx")).map_err(|e| e.to_string())?;
     Ok(n)
 }
 
@@ -600,6 +600,10 @@ impl NodeDb {
     pub fn flush(&mut self) -> Result<(), String> {
         self.flush_log()?;
         if !self.done_pending.is_empty() {
+            // A marker vouches for nodes in the log: make them durable
+            // first, or a power loss keeps the marker and cuts the nodes
+            // (2026-11-17: one wasted step after a preemption).
+            self.log.sync_data().map_err(|e| format!("node log: {e}"))?;
             self.done_f
                 .write_all(&self.done_pending)
                 .map_err(|e| format!("done log: {e}"))?;
@@ -1956,7 +1960,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+    csl_eth_store::durable_rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 impl Heads {
@@ -2153,7 +2157,7 @@ impl Publish for DirPublish {
             std::thread::current().id()
         ));
         fs::copy(file, &tmp).map_err(|e| format!("{key}: {e}"))?;
-        fs::rename(&tmp, &to).map_err(|e| format!("{key}: {e}"))
+        csl_eth_store::durable_rename(&tmp, &to).map_err(|e| format!("{key}: {e}"))
     }
     fn delete(&self, key: &str) -> Result<(), String> {
         match fs::remove_file(self.0.join(key)) {
