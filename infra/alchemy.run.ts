@@ -147,7 +147,7 @@ export default Alchemy.Stack(
     // (what is published, which pointer write is pending). On its own disk so
     // replacing the VM keeps it: a lost state.json leaves old snapshots in the
     // bucket that nothing will ever collect.
-    // 100 GB: the tracker's layers, the since-base layer twice while it
+    // 200 GB (100 until 2026-11-17): the tracker's layers, the since-base layer twice while it
     // merges, the node log and sort spill of a catch-up (see
     // docs/delta-producer.md § Disk without the base). Grows in place
     // (the startup script grows the filesystem).
@@ -155,14 +155,16 @@ export default Alchemy.Stack(
       diskName: "csl-eth-producer-data",
       zone,
       type: "pd-balanced",
-      sizeGb: 100,
+      sizeGb: 200,
     });
     const vm = yield* GCP.Compute.Instance("producer", {
       instanceName: "csl-eth-producer",
       zone,
-      // 2 vCPUs, 4 GB; the release build is the peak, helped by 8 GB of
-      // swap on /data. Changing it replaces the VM and keeps /data.
-      machineType: "e2-medium",
+      // 4 vCPUs, 16 GB (e2-medium until 2026-11-17: the background
+      // since-base merge and the steps shared two vCPUs and slowed each
+      // other). Resized in place by stop, set-machine-type, start; this
+      // file only records it. Changing it here replaces the VM and keeps /data.
+      machineType: "e2-standard-4",
       // Spot: a preemption stops the VM, and the schedule below starts it
       // again; the tracker then catches up from where track.json left it.
       provisioningModel: "SPOT",
