@@ -3,7 +3,7 @@
 // answers or refuses. Nothing here is trusted: it moves bytes, and a byte it
 // gets wrong can only end in a refusal.
 
-import { Held, Pending, read, type Answer, type Query, type Want } from "./verify.ts";
+import { Held, Pending, read, Session, type Answer, type Query, type Want } from "./verify.ts";
 
 export type Stats = { rounds: number; requests: number; bytes: number; ms: number };
 export type Outcome = { answer?: Answer; refused?: string; stats: Stats; tampered?: string };
@@ -22,9 +22,9 @@ async function fetchWant(base: string, w: Want): Promise<Uint8Array> {
   return body;
 }
 
-/** One read from nothing: head, manifest, pages, all fetched and checked afresh. */
-export async function run(base: string, q: Query, mutate?: Mutate): Promise<Outcome> {
-  const h = new Held();
+/** One read: head, manifest and pages fetched and checked; `session` keeps what earlier reads checked. */
+export async function run(base: string, q: Query, mutate?: Mutate, session = new Session()): Promise<Outcome> {
+  const h = new Held(session);
   const stats: Stats = { rounds: 0, requests: 0, bytes: 0, ms: 0 };
   const t0 = performance.now();
   let tampered: string | undefined;

@@ -1,6 +1,6 @@
 // mini.html's script: the form, the tamper toggle, and the result.
 import { run, type Outcome } from "./driver.ts";
-import { hex, tamperSpot, unhex, type Want } from "./verify.ts";
+import { hex, Session, tamperSpot, unhex, type Want } from "./verify.ts";
 
 declare const __VERIFY_LINES__: number;
 const SOURCE = "https://github.com/ind-igo/csl-eth/blob/main/browser/mini/verify.ts";
@@ -53,6 +53,9 @@ function flipRoot(w: Want, body: Uint8Array): string | null {
   return `Tampered: byte ${(w.off + at).toLocaleString()} of ${w.path} flipped (${x(before)} → ${x(body[at]!)}) before the verifier saw it. That page holds the account trie's root node in the newest layer.`;
 }
 
+// What earlier reads checked: index pages, the account trie's top levels, the committees.
+const session = new Session();
+
 const esc = (s: string) => s.replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`);
 const short = (b: Uint8Array) => hex(b);
 function eth(wei: bigint): string {
@@ -62,7 +65,7 @@ function eth(wei: bigint): string {
 }
 const kb = (n: number) => (n >= 1 << 20 ? `${(n / (1 << 20)).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`);
 
-function show(o: Outcome, what: { slot?: bigint; code: boolean }) {
+function show(o: Outcome, what: { slot?: bigint; code: boolean }, reused: number) {
   const a = o.answer;
   status.className = a ? "ok" : "bad";
   status.textContent = a ? "Verified" : `Refused: ${o.refused}`;
@@ -101,6 +104,7 @@ function show(o: Outcome, what: { slot?: bigint; code: boolean }) {
     a.account || a.absent ? `Walked the account trie from that root, every node keccak-checked${a.account ? "" : "; the trie's shape proves the account absent"}.` : "",
     what.slot !== undefined && a.account ? `Walked the account's storage trie from its storage root${a.storage?.absent ? "; its shape proves the slot empty" : ""}.` : "",
     a.code?.length ? `The code's keccak equals the account's code hash.` : "",
+    reused ? `Reused ${reused.toLocaleString("en-US")} index pages and trie nodes that earlier reads on this page checked.` : "",
   ].filter(Boolean);
   chain.innerHTML = steps.map((s) => `<li>${s}</li>`).join("");
 }
@@ -123,9 +127,12 @@ form.onsubmit = async (ev) => {
   status.className = "";
   status.textContent = tamp ? "Reading; one byte of one fetched page will be flipped…" : "Reading…";
   try {
-    const o = await run(BASE, q, tamp ? flipRoot : undefined);
+    // A tampered read starts from nothing, so the targeted page is fetched rather than answered from what earlier reads kept.
+    const s = tamp ? new Session() : session;
+    const reused = s.keep.size + s.nodes.size;
+    const o = await run(BASE, q, tamp ? flipRoot : undefined, s);
     if (tamp && !o.tampered) o.tampered = "Tamper: no fetched page held the targeted node, so nothing was changed.";
-    show(o, q);
+    show(o, q, reused);
   } finally {
     button.disabled = false;
     tamper.checked = false;

@@ -115,7 +115,22 @@ export type Want = {
 export class Pending extends Error {}
 const PENDING = new Pending("pending");
 
+/**
+ * What one page session keeps between reads, all of it checked before it
+ * was kept: ranges of immutable files (page 0s, model pages, hint files,
+ * owner pages) that passed their checks, account-trie nodes above
+ * `TOP_LEVELS` by their keccak, and the sync committees proven so far.
+ */
+export class Session {
+  readonly keep = new Map<string, Uint8Array>();
+  readonly nodes = new Map<string, Uint8Array>();
+  readonly keys = new Map<number, Uint8Array[]>();
+  readonly parsed = new Map<string, Hints | undefined>();
+  bootSlot?: number;
+}
+
 export class Held {
+  constructor(readonly s = new Session()) {}
   readonly bytes = new Map<string, Uint8Array>();
   readonly wants = new Map<string, Want>();
   readonly memo = new Map<string, unknown>();
@@ -124,7 +139,7 @@ export class Held {
   static id = (w: Want) => (w.off === undefined ? w.path : `${w.path}@${w.off}+${w.len}`);
   /** The bytes if held, else noted as wanted. */
   get(w: Want): Uint8Array | undefined {
-    const b = this.bytes.get(Held.id(w));
+    const b = this.bytes.get(Held.id(w)) ?? this.s.keep.get(Held.id(w));
     const f = this.failed.get(Held.id(w));
     if (f !== undefined) refuse(f);
     if (!b) this.wants.set(Held.id(w), w);
@@ -137,6 +152,10 @@ export class Held {
   }
   put(w: Want, b: Uint8Array) {
     this.bytes.set(Held.id(w), b);
+  }
+  /** Keep checked bytes of an immutable file for the session's later reads. */
+  keep(w: Want, b: Uint8Array) {
+    this.s.keep.set(Held.id(w), b);
   }
   fail(w: Want, why: string) {
     this.failed.set(Held.id(w), why);
@@ -157,11 +176,11 @@ function soft(f: () => unknown) {
 }
 
 /** Run `f` on every item, so all their wants land in one round; then rethrow a `Pending`. */
-function each<T, R>(xs: T[], f: (x: T) => R): R[] {
+function each<T, R>(xs: T[], f: (x: T, i: number) => R): R[] {
   let pending = false;
-  const out = xs.map((x) => {
+  const out = xs.map((x, i) => {
     try {
-      return f(x);
+      return f(x, i);
     } catch (e) {
       if (e instanceof Pending) return (pending = true), undefined as R;
       throw e;
@@ -321,31 +340,34 @@ function signed(u: J, keys: Uint8Array[] | undefined, what: string, nowSlot: num
  */
 export function verifyHead(h: Held, now: number): Head {
   return h.once("head", () => {
+    const keys = h.s.keys; // committees proven on earlier reads of this session
     const ob = h.get({ path: "head/optimistic" });
-    const bb = h.get({ path: `head/bootstrap/${CHECKPOINT}` });
-    if (!ob || !bb) throw PENDING;
+    const bb = keys.size ? null : h.get({ path: `head/bootstrap/${CHECKPOINT}` });
+    if (!ob || bb === undefined) throw PENDING;
     const opt = envelope(ob, "head/optimistic");
-    const boot = envelope(bb, "bootstrap");
-
-    const bootSlot = num(boot?.header?.beacon?.slot, "bootstrap slot");
     const sigSlot = num(opt?.signature_slot, "head/optimistic signature_slot");
-    const [first, signedIn] = [period(bootSlot), period(sigSlot)];
+    const signedIn = period(sigSlot);
     const nowSlot = Math.floor((now / 1000 - GENESIS_TIME) / 12);
     const current = period(nowSlot);
     if (signedIn > current) refuse(`head signed in period ${signedIn}, after the clock's ${current}`);
     if (signedIn + 1 < current) refuse(`stale head: signed in period ${signedIn}, the clock is in ${current}`);
+    if (bb) {
+      // The checkpoint names the bootstrap header; its state names the committee.
+      const boot = envelope(bb, "bootstrap");
+      if (!eq(beaconRoot(boot?.header?.beacon), unhex(CHECKPOINT))) refuse("bootstrap header is not the checkpoint");
+      const c0 = committee(boot.current_sync_committee, "bootstrap committee");
+      if (!branchOk(c0.root, branch(boot.current_sync_committee_branch, "committee branch"), CURRENT_COMMITTEE, b32(boot.header.beacon.state_root, "state_root")))
+        refuse("bootstrap committee is not in the checkpoint's state");
+      h.s.bootSlot = num(boot.header.beacon.slot, "bootstrap slot");
+      keys.set(period(h.s.bootSlot), c0.keys);
+    }
+    const bootSlot = h.s.bootSlot!;
+    const first = Math.max(...[...keys.keys()].filter((p) => p <= signedIn), period(bootSlot));
     const periods = Array.from({ length: Math.max(signedIn - first, 0) }, (_, i) => first + i);
     const ups = periods.map((p) => h.get({ path: `head/updates/${p}` }));
     // Fetched now to save a round; checked against the head before use.
     soft(() => h.get({ path: manifestPath(b32(opt?.attested_header?.execution?.block_hash, "block_hash")) }));
     if (ups.some((u) => !u)) throw PENDING;
-
-    // The checkpoint names the bootstrap header; its state names the committee.
-    if (!eq(beaconRoot(boot.header.beacon), unhex(CHECKPOINT))) refuse("bootstrap header is not the checkpoint");
-    const c0 = committee(boot.current_sync_committee, "bootstrap committee");
-    if (!branchOk(c0.root, branch(boot.current_sync_committee_branch, "committee branch"), CURRENT_COMMITTEE, b32(boot.header.beacon.state_root, "state_root")))
-      refuse("bootstrap committee is not in the checkpoint's state");
-    const keys = new Map([[first, c0.keys]]);
 
     // Each period's committee signs a header whose state names the next one.
     periods.forEach((p, i) => {
@@ -370,7 +392,7 @@ export function verifyHead(h: Held, now: number): Head {
       refuse("execution header is not in the signed block");
     return {
       checkpointSlot: bootSlot,
-      updates: periods.length,
+      updates: Math.max(signedIn - period(bootSlot), 0),
       slot,
       signatureSlot: sigSlot,
       participants,
@@ -391,12 +413,15 @@ const D_ACCOUNT = 9; // depths asked for in the first round, as the Rust client
 const D_STORAGE = 7;
 
 type Ref = { root: Uint8Array; pages: number; eps: number; modelBytes: number; modelRoot: Uint8Array };
-export type Run = { path: string; ref: Ref; table: number; index: number; of: number };
+/** One run of a table; `layer` is its layer's index in the manifest, none for the base. */
+export type Run = { path: string; ref: Ref; table: number; index: number; of: number; layer?: number };
+/** Each table's runs, oldest first, and each layer's hints: parsed, or the name of its hint file. */
+type Tables = { runs: Run[][]; hints: (Hints | Uint8Array | undefined)[] };
 
 const manifestPath = (blockHash: Uint8Array) => `snapshots/${hex(blockHash).slice(2)}/manifest.json`;
 
 /** Each table's runs, oldest first: the base snapshot, then its layers. */
-function runs(h: Held, head: Head): Run[][] {
+function runs(h: Held, head: Head): Tables {
   return h.once("runs", () => {
     let m: J;
     try {
@@ -423,17 +448,206 @@ function runs(h: Held, head: Head): Run[][] {
       if (eps > 0xffff) refuse("epsilon_pages is a u16");
       return { root: b32(t.root, "root"), pages, eps, modelBytes: num(t.model_bytes, "model_bytes"), modelRoot: b32(t.model_root, "model_root") };
     };
-    return TABLE_FILES.map((file, table) => {
+    const tables = TABLE_FILES.map((file, table) => {
       const out: Omit<Run, "index" | "of">[] = [];
       const t0 = list(m.tables, "tables").find((t: J) => tid(t) === table);
       if (t0) out.push({ path: `snapshots/${hex(base).slice(2)}/${file}`, ref: ref(t0), table });
-      for (const l of layers) {
-        const t = list((l as J).tables, "layer tables").find((t: J) => tid(t) === table);
-        if (t) out.push({ path: `runs/${hex(ref(t).root).slice(2)}.run`, ref: ref(t), table });
-      }
+      layers.forEach((l: J, layer: number) => {
+        const t = list(l.tables, "layer tables").find((t: J) => tid(t) === table);
+        if (t) out.push({ path: `runs/${hex(ref(t).root).slice(2)}.run`, ref: ref(t), table, layer });
+      });
       return out.map((r, index) => ({ ...r, index, of: out.length }));
     });
+    // A hint file replaces the inline hints; inline hints that do not parse refuse the manifest, as serde would.
+    const hints = layers.map((l: J) => {
+      if (l.hints_file != null) return b32(l.hints_file, "hints_file");
+      if (l.hints == null) return undefined;
+      try {
+        return parseHints(l.hints);
+      } catch {
+        return refuse("manifest: layer hints");
+      }
+    });
+    return { runs: tables, hints };
   });
+}
+
+// ---------------------------------------------------------------- hints
+//
+// crates/store/src/hints.rs and the Rust client's `plan`: which runs of a
+// table a position is asked of. Scheduling, never evidence: a layer a hint
+// rules out is not asked, and a walk that then misses a node, or meets one
+// that does not hash, asks every run before it gives up (`walkTable`). A
+// skipped layer that did hold the node leaves the walk an older node, whose
+// keccak is not its parent's reference, so a wrong hint costs a round,
+// never an answer.
+
+const [NO, MAYBE, YES] = [0, 1, 2] as const;
+type Holds = 0 | 1 | 2;
+/** Account-style positions, cut to `depth` nibbles; `short`: "depth:nibbles" of shallower ones with nothing under them. */
+type PathHint = { depth: number; cut: number[]; short: Set<string> };
+export type Hints = { account?: PathHint; storage?: string[]; code?: string[]; paths?: Map<string, PathHint>; owners?: { path: string; count: number; first: string[] } };
+
+const top8 = (k: Uint8Array) => ((k[0]! << 24) | (k[1]! << 16) | (k[2]! << 8) | k[3]!) >>> 0;
+/** A key's first eight bytes, as 16 lowercase hex digits: sorted strings sort as the u64s. */
+const prefix8 = (k: Uint8Array) => hex(k.subarray(0, 8)).slice(2);
+const cutTo = (t: number, n: number) => (n === 0 ? 0 : t >>> (32 - 4 * n));
+function lowerBound<T>(a: T[], x: T): number {
+  let [lo, hi] = [0, a.length];
+  while (lo < hi) {
+    const m = (lo + hi) >> 1;
+    if (a[m]! < x) lo = m + 1;
+    else hi = m;
+  }
+  return lo;
+}
+const has = <T>(a: T[], x: T) => a[lowerBound(a, x)] === x;
+const split = (b: Uint8Array, w: number) => Array.from({ length: b.length / w }, (_, i) => b.subarray(i * w, i * w + w));
+const ascending = <T>(a: T[]) => a.every((x, i) => i === 0 || a[i - 1]! < x);
+const bad = (what: string): never => {
+  throw new Error(what);
+};
+
+function pathHint(j: J): PathHint {
+  const d = j?.depth;
+  if (!Number.isInteger(d) || d < 1 || d > 8) bad("hint depth");
+  const w = Math.ceil(d / 2);
+  const [c, sh] = [unhex(j.cut), unhex(j.short ?? "")];
+  if (c.length % w || sh.length % (w + 1)) bad("ragged hint");
+  const get = (b: Uint8Array) => b.reduce((n, x) => n * 256 + x, 0);
+  const cut = split(c, w).map(get);
+  const short = split(sh, w + 1).map((e) => [e[0]!, get(e.subarray(1))] as const);
+  const sorted = short.every(([a, b], i) => i === 0 || short[i - 1]![0] < a || (short[i - 1]![0] === a && short[i - 1]![1] < b));
+  if (!ascending(cut) || cut.some((v) => v >= 16 ** d) || !sorted || short.some(([e, v]) => e >= d || v >= 16 ** e)) bad("hint out of order");
+  return { depth: d, cut, short: new Set(short.map(([e, v]) => `${e}:${v}`)) };
+}
+
+/** A key set: 8-byte keys in hex, strictly ascending. */
+function keySet(v: J): string[] {
+  if (typeof v !== "string") bad("key set");
+  const k = split(unhex(v.length % 16 ? bad("key set") : v), 8).map((x) => hex(x).slice(2));
+  return ascending(k) ? k : bad("key set out of order");
+}
+
+function parseHints(j: J): Hints {
+  if (typeof j !== "object" || !j || Array.isArray(j)) bad("hints");
+  const o: Hints = {};
+  if (j.account != null) o.account = pathHint(j.account);
+  if (j.storage != null) o.storage = keySet(j.storage);
+  if (j.code != null) o.code = keySet(j.code);
+  if (j.storage_paths != null) {
+    o.paths = new Map();
+    for (const [k, v] of Object.entries(j.storage_paths)) o.paths.set(/^[0-9a-f]{16}$/i.test(k) ? k.toLowerCase() : bad("owner"), pathHint(v));
+  }
+  if (j.owners != null) {
+    const c = j.owners.count;
+    o.owners = { path: `runs/${hex(b32(j.owners.file, "owners file")).slice(2)}.owners`, count: Number.isSafeInteger(c) && c >= 0 ? c : bad("count"), first: keySet(j.owners.first) };
+  }
+  return o;
+}
+
+/** Each layer's hints. A hint file must hash to its name; one that is missing, does not hash or does not parse leaves its layer unhinted. */
+function layerHints(h: Held, t: Tables): (Hints | undefined)[] {
+  return h.once("hints", () =>
+    each(t.hints, (src) => {
+      if (!(src instanceof Uint8Array)) return src;
+      const w = { path: `runs/${hex(src).slice(2)}.hints` };
+      if (h.s.parsed.has(w.path)) return h.s.parsed.get(w.path);
+      let out: Hints | undefined;
+      try {
+        const b = h.need(w);
+        out = eq(blake3(b), src) ? parseHints(JSON.parse(new TextDecoder().decode(b))) : undefined;
+      } catch (e) {
+        if (e instanceof Pending) throw e;
+      }
+      h.s.parsed.set(w.path, out);
+      return out;
+    }),
+  );
+}
+
+/** PathHint::holds: exact above the cut depth (a held position or a "nothing under it" one), a prefix test at and below it. */
+function holds(p: PathHint, t: number, depth: number): Holds {
+  if (depth >= p.depth) return has(p.cut, cutTo(t, p.depth)) ? MAYBE : NO;
+  const [q, span] = [cutTo(t, depth), 16 ** (p.depth - depth)];
+  const i = lowerBound(p.cut, q * span);
+  return (i < p.cut.length && p.cut[i]! < (q + 1) * span) || p.short.has(`${depth}:${q}`) ? YES : NO;
+}
+
+/** Hints::storage_holds. */
+function storageHolds(x: Hints, owner: Uint8Array, t: number, depth: number): Holds {
+  if (!x.storage) return MAYBE;
+  const k = prefix8(owner);
+  if (!has(x.storage, k)) return NO;
+  const p = x.paths?.get(k);
+  return p ? holds(p, t, depth) : depth === 0 ? YES : MAYBE; // its storage changed in the layer: its root is there
+}
+
+/**
+ * The Rust client's owner_holds: the owner's page of the index must list
+ * it. Until that page is here the layer is not asked (it is wanted in the
+ * same round); a page that failed or does not fit the index costs the skip.
+ */
+function ownerHolds(h: Held, o: NonNullable<Hints["owners"]>, owner: Uint8Array): Holds {
+  if (!(o.count > 0 && o.first.length === Math.ceil(o.count / 512))) return MAYBE;
+  const k = prefix8(owner);
+  const at = lowerBound(o.first, k);
+  const i = o.first[at] === k ? at : at - 1;
+  if (i < 0) return NO;
+  const w = { path: o.path, off: i * 4096, len: 8 * Math.min(512, o.count - i * 512) };
+  let page: Uint8Array | undefined;
+  try {
+    page = h.get(w);
+  } catch (e) {
+    if (e instanceof Refused) return MAYBE;
+    throw e;
+  }
+  if (!page) return NO;
+  const v = split(page, 8).map((x) => hex(x).slice(2));
+  if (page.length !== w.len || !ascending(v) || v[0] !== o.first[i] || !(i + 1 >= o.first.length || v[v.length - 1]! < o.first[i + 1]!)) return MAYBE;
+  h.keep(w, page);
+  return has(v, k) ? MAYBE : NO;
+}
+
+/** Whose trie a walk reads: the account trie, or `owner`'s storage; `top8`, the path's first eight nibbles. */
+type Scope = { owner?: Uint8Array; top8: number };
+
+/**
+ * Snapshot::plan: the runs of `table` a position at `depth` is asked of,
+ * newest first. A layer that may hold it is asked; one that holds it for
+ * sure ends the search; the base is asked unless that happened. A layer
+ * without a hint for the table is always asked.
+ */
+function plan(h: Held, t: Tables, table: number, scope: Scope, depth: number): boolean[] {
+  const [rs, hints] = [t.runs[table]!, layerHints(h, t)];
+  const ask = rs.map(() => false);
+  for (let i = rs.length - 1; i >= 0; i--) {
+    const li = rs[i]!.layer;
+    if (li === undefined) return (ask[i] = true), ask;
+    const x = hints[li];
+    let v: Holds = MAYBE;
+    if (x && !scope.owner) v = x.account ? holds(x.account, scope.top8, depth) : MAYBE;
+    else if (x) v = x.owners && !x.storage ? ownerHolds(h, x.owners, scope.owner!) : storageHolds(x, scope.owner!, scope.top8, depth);
+    if (v === NO) continue;
+    ask[i] = true;
+    if (v === YES) break;
+  }
+  return ask;
+}
+
+/** code_plan: the newest layer whose hint names the code hash (any copy that hashes is the code), every unhinted layer, and the base. */
+function codePlan(h: Held, t: Tables, codeHash: Uint8Array): boolean[] {
+  const [rs, hints] = [t.runs[CODE]!, layerHints(h, t)];
+  const ask = rs.map(() => false);
+  for (let i = rs.length - 1; i >= 0; i--) {
+    const li = rs[i]!.layer;
+    const c = li === undefined ? undefined : hints[li]?.code;
+    if (li === undefined || !c || has(c, prefix8(codeHash))) {
+      ask[i] = true;
+      if (li === undefined || c) break;
+    }
+  }
+  return ask;
 }
 
 // ---------------------------------------------------------------- runs
@@ -495,8 +709,10 @@ type Top = { modelPages: number; root: Uint8Array; model: Model };
 /** Page 0: blake3 must be the manifest's `model_root`. */
 function top(h: Held, r: Run): Top {
   return h.once(`top ${r.path}`, () => {
-    const b = h.need({ path: r.path, off: 0, len: PAGE });
+    const w = { path: r.path, off: 0, len: PAGE };
+    const b = h.need(w);
     if (b.length !== PAGE || !eq(blake3(b), r.ref.modelRoot)) refuse(`${r.path}: page 0 does not hash to the manifest's model root`);
+    h.keep(w, b);
     const modelPages = u32(b, 56);
     const n = u32(b, 94);
     if (modelPages === 0 || n === 0 || n > 166) refuse(`${r.path}: bad top model`);
@@ -515,9 +731,11 @@ function modelPage(h: Held, r: Run, m: number): ModelPage {
   return h.once(`model ${r.path} ${m}`, () => {
     if (m < 1 || m > t.modelPages) refuse(`${r.path}: model page ${m} out of range`);
     const record = PAGE + 32 * treeDepth(t.modelPages);
-    const rec = h.need({ path: r.path, off: (r.ref.pages + 1) * PAGE + (m - 1) * record, len: record });
+    const w = { path: r.path, off: (r.ref.pages + 1) * PAGE + (m - 1) * record, len: record };
+    const rec = h.need(w);
     const b = rec.subarray(0, PAGE);
     if (rec.length !== record || !inlineOk(t.modelPages, m - 1, b, rec.subarray(PAGE), t.root)) refuse(`${r.path}: model page ${m} is not in the model tree`);
+    h.keep(w, rec);
     const [n, lo, hi, nextI, last] = [u16(b, 0), u64(b, 2), u64(b, 10), i64(b, 18), m === t.modelPages];
     const pages = BigInt(r.ref.pages);
     if (n === 0 || n > 169 || (m === 1 && lo !== 0n) || (last ? hi !== 2n ** 64n - 1n : hi <= lo) || nextI < 1n || nextI > pages) refuse(`${r.path}: model page ${m} header`);
@@ -537,8 +755,6 @@ function search(p: number, count: number, eps: number, below: (q: number) => boo
   if (covers(p)) return p;
   const down = below(p);
   const near = (step: number) => (down ? p - step : p + step);
-  // Ask for the whole window at once (one round), then search it in order.
-  for (let step = 1; step <= Math.min(eps + 1, count); step++) soft(() => near(step) >= 1 && near(step) <= count && covers(near(step)));
   for (let step = 1; step <= eps + 1; step++) {
     const q = down ? p - step : p + step;
     if (q < 1 || q > count) break;
@@ -621,10 +837,11 @@ function lookup(h: Held, r: Run, key: Uint8Array): Entry | null {
   return page(p).entries.find((e) => eq(e.key, key)) ?? null;
 }
 
-/** Every run's entry for `key`; a run that errs is skipped while another answers. */
-function entries(h: Held, rs: Run[], key: Uint8Array): Entry[] {
+/** Every asked run's entry for `key` (all runs without `ask`); a run that errs is skipped while another answers. */
+function entries(h: Held, rs: Run[], key: Uint8Array, ask?: boolean[]): Entry[] {
   let err: string | undefined;
-  const found = each(rs, (r) => {
+  const found = each(rs, (r, i) => {
+    if (ask && !ask[i]) return null;
     try {
       return lookup(h, r, key);
     } catch (e) {
@@ -785,14 +1002,45 @@ export function walk(root: Uint8Array, path: number[], node: (depth: number, has
   }
 }
 
-/** Walk a table: each position's candidates come from every run, the one hashing to the reference is taken. */
-function walkTable(h: Held, rs: Run[], root: Uint8Array, path: number[], keyOf: (d: number) => Uint8Array, prefetch: number): Outcome {
+const TOP_LEVELS = 4; // account-trie depths kept across reads, as the full page's default
+const STOP = new Error("stop");
+
+/**
+ * The Rust client's walk_table. One speculative round: every depth up to
+ * `max` the kept nodes do not answer, in the runs its plan names. Then the
+ * walk; at each position the candidate hashing to the parent's reference
+ * is taken, and a position the plan asked of only some runs is asked of
+ * every run before the walk fails on it. `nodes`: the session's kept
+ * account-trie nodes, by keccak (a node is its hash's only preimage, so a
+ * kept one is right under any root).
+ */
+function walkTable(h: Held, rs: Run[], root: Uint8Array, path: number[], keyOf: (d: number) => Uint8Array, max: number, askOf: (d: number) => boolean[], nodes?: Map<string, Uint8Array>): Outcome {
   if (eq(root, EMPTY_ROOT)) return { absent: "the trie is empty" };
-  // Ask for the first depths at once, so they share rounds.
-  for (let d = 0; d <= prefetch; d++) soft(() => entries(h, rs, keyOf(d)));
+  const kept = (d: number, hash: Uint8Array) => (nodes && d < TOP_LEVELS ? nodes.get(hex(hash)) : undefined);
+  let from = max + 1; // the first depth the kept nodes do not reach
+  try {
+    walk(root, path, (d, hash) => kept(d, hash) ?? ((from = d), bad(STOP.message)));
+  } catch (e) {
+    if (!(e instanceof Error && e.message === STOP.message)) throw e;
+  }
+  for (let d = from; d <= max; d++) soft(() => entries(h, rs, keyOf(d), askOf(d)));
   return walk(root, path, (d, hash) => {
-    const c = entries(h, rs, keyOf(d)).filter((e) => e.tag === 0).map((e) => e.value);
-    return c.find((v) => eq(keccak(v), hash)) ?? c[0] ?? null;
+    const k = kept(d, hash);
+    if (k) return k;
+    const ok = (v: Uint8Array) => eq(keccak(v), hash);
+    const cands = (ask?: boolean[]) => entries(h, rs, keyOf(d), ask).filter((e) => e.tag === 0).map((e) => e.value);
+    const ask = askOf(d);
+    let c: Uint8Array[] = [];
+    if (ask.some((x) => !x))
+      try {
+        c = cands(ask);
+      } catch (e) {
+        if (!(e instanceof Refused)) throw e;
+      }
+    if (!c.some(ok)) c = cands(); // every run: the planned ones gave no node that hashes
+    const v = c.find(ok);
+    if (v && nodes && d < TOP_LEVELS) nodes.set(hex(hash), v);
+    return v ?? c[0] ?? null;
   });
 }
 
@@ -834,29 +1082,44 @@ export function read(h: Held, q: Query): Answer {
   if (q.address.length !== 20) refuse("an address is 20 bytes");
   if (q.slot !== undefined && (q.slot < 0n || q.slot >= 2n ** 256n)) refuse("a slot is a 256-bit unsigned number");
   const head = verifyHead(h, q.now);
-  const tables = runs(h, head);
+  const t = runs(h, head);
+  const tables = t.runs;
+  // As the Rust client opens a snapshot: every page 0 and hint file in one round.
+  for (const r of tables.flat()) soft(() => top(h, r));
+  soft(() => layerHints(h, t));
   const hashed = keccak(q.address);
   const apath = nibbles(hashed);
-  const slotPath = q.slot === undefined ? null : nibbles(keccak(le(q.slot).reverse()));
+  const slotHash = q.slot === undefined ? null : keccak(le(q.slot).reverse());
+  const slotPath = slotHash && nibbles(slotHash);
+  const sScope = { owner: hashed, top8: slotHash ? top8(slotHash) : 0 };
   // The storage trie's first pages depend only on the owner: ask in the account's rounds.
-  if (slotPath) for (let d = 0; d <= D_STORAGE; d++) soft(() => entries(h, tables[STORAGE]!, storageKey(hashed, slotPath, d)));
-  if (q.code) for (const r of tables[CODE]!) soft(() => top(h, r)); // page 0s need no key
-  const a = walkTable(h, tables[ACCOUNTS]!, head.stateRoot, apath, (d) => tableKey(apath, d), D_ACCOUNT);
+  if (slotPath) for (let d = 0; d <= D_STORAGE; d++) soft(() => entries(h, tables[STORAGE]!, storageKey(hashed, slotPath, d), plan(h, t, STORAGE, sScope, d)));
+  const aAsk = (d: number) => plan(h, t, ACCOUNTS, { top8: top8(hashed) }, d);
+  const a = walkTable(h, tables[ACCOUNTS]!, head.stateRoot, apath, (d) => tableKey(apath, d), D_ACCOUNT, aAsk, h.s.nodes);
   if ("absent" in a) return { head, account: null, absent: a.absent, ...(slotPath ? { storage: { value: 0n, absent: "no account" } } : {}) };
   const account = decodeAccount(a.value);
   const out: Answer = { head, account };
   if (slotPath) {
-    const s = walkTable(h, tables[STORAGE]!, account.storageRoot, slotPath, (d) => storageKey(hashed, slotPath, d), D_STORAGE);
+    const s = walkTable(h, tables[STORAGE]!, account.storageRoot, slotPath, (d) => storageKey(hashed, slotPath, d), D_STORAGE, (d) => plan(h, t, STORAGE, sScope, d));
     out.storage = "absent" in s ? { value: 0n, absent: s.absent } : { value: decodeWord(s.value) };
   }
-  if (q.code) out.code = code(h, tables[CODE]!, account.codeHash);
+  if (q.code) {
+    // The runs the hints name first; if none of them gives the code, every run.
+    const ask = eq(account.codeHash, KECCAK_EMPTY) ? undefined : codePlan(h, t, account.codeHash);
+    try {
+      out.code = code(h, tables[CODE]!, account.codeHash, ask?.includes(false) ? ask : undefined);
+    } catch (e) {
+      if (!(e instanceof Refused) || !ask?.includes(false)) throw e;
+      out.code = code(h, tables[CODE]!, account.codeHash);
+    }
+  }
   return out;
 }
 
 /** Bytecode under a verified code hash: any run's copy that hashes to it; large code is a blob named by its blake3. */
-function code(h: Held, rs: Run[], codeHash: Uint8Array): Uint8Array {
+function code(h: Held, rs: Run[], codeHash: Uint8Array, ask?: boolean[]): Uint8Array {
   if (eq(codeHash, KECCAK_EMPTY)) return new Uint8Array();
-  const found = entries(h, rs, codeHash);
+  const found = entries(h, rs, codeHash, ask);
   if (!found.length) refuse("code is not in the bucket");
   let why = "";
   for (const e of found) {

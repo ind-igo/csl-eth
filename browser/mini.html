@@ -126,8 +126,8 @@
       </div>
 
       <section class="about">
-        <p><b id="lines">The whole verifier is one file.</b> Every read starts from nothing: it fetches the head files, the snapshot's manifest and a few hundred 4 KB pages, and refuses the answer if any signature or hash fails. A page byte that is flipped in transit is caught by the trie's keccak hashes; a flipped head byte, by the committee's signature or a Merkle branch.</p>
-        <p>Left out, compared with the full version: layer hints (so it asks every layer), the owner index, checkpoint rotation, the finalized tier and the visualization. None of them is needed for correctness.</p>
+        <p><b id="lines">The whole verifier is one file.</b> It fetches the head files, the snapshot's manifest and a few dozen 4 KB pages, and refuses the answer if any signature or hash fails. A page byte that is flipped in transit is caught by the trie's keccak hashes; a flipped head byte, by the committee's signature or a Merkle branch. The first read also fetches each layer's hints, about 1.4 MB, so that later reads skip the layers that cannot hold their keys; a hint that lies costs a round, never an answer. Later reads reuse the index pages, the account trie's top levels and the sync committees the earlier ones checked.</p>
+        <p>Left out, compared with the full version: checkpoint rotation, the by-hash table, the finalized tier and the visualization. None of them is needed for correctness.</p>
       </section>
     </div>
     <script type="module" src="dist/mini.js"></script>
