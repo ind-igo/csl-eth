@@ -2,26 +2,26 @@
 import { describe, expect, test } from "bun:test";
 import {
   beaconRoot, CHECKPOINT, decodeAccount, Held, read, decodeNode, decodePage, decodeWord, EMPTY_ROOT, executionRoot, hex, keccak,
-  KECCAK_EMPTY, merkleize, nibbles, Refused, rlpItem, storageKey, tableKey, unhex, walk,
+  KECCAK_EMPTY, merkleize, nibbles, Refused, storageKey, tableKey, unhex, walk,
 } from "./verify.ts";
 
 const b = (...x: number[]) => Uint8Array.from(x);
 
 describe("rlp", () => {
-  test("headers", () => {
-    expect(rlpItem(b(0x05), 0)).toEqual({ list: false, start: 0, end: 1 });
-    expect(rlpItem(b(0x82, 1, 2), 0)).toEqual({ list: false, start: 1, end: 3 });
-    expect(rlpItem(b(0xc1, 0x80), 0)).toEqual({ list: true, start: 1, end: 2 });
-    const long = new Uint8Array(58).fill(1);
-    long[0] = 0xb8, long[1] = 56;
-    expect(rlpItem(long, 0)).toEqual({ list: false, start: 2, end: 58 });
-  });
-  test("non-canonical and short headers are refused", () => {
-    expect(() => rlpItem(b(0x81, 0x05), 0)).toThrow(Refused); // single byte < 0x80 wrapped
-    expect(() => rlpItem(b(0xb8, 0x05, 1, 2, 3, 4, 5), 0)).toThrow(Refused); // long form under 56
-    expect(() => rlpItem(b(0xb9, 0x00, 0x40), 0)).toThrow(Refused); // leading zero length
-    expect(() => rlpItem(b(0x83, 1, 2), 0)).toThrow(Refused); // short
-    expect(() => rlpItem(b(), 0)).toThrow(Refused);
+  test("non-canonical and short encodings are refused", () => {
+    for (const bad of [
+      b(0x81, 0x05), // single byte < 0x80 wrapped
+      b(0xb8, 0x05, 1, 2, 3, 4, 5), // long form under 56
+      b(0xb9, 0x00, 0x40, ...new Array(64).fill(1)), // leading zero in the length
+      b(0x83, 1, 2), // short
+      b(), // nothing
+      b(0x82, 1, 2, 3), // trailing byte
+      b(0xc1, 0x80), // a list where a word goes
+    ])
+      expect(() => decodeWord(bad)).toThrow(Refused);
+    expect(() => decodeNode(b(0xc2, 0x83, 1, 2, 3))).toThrow(Refused); // item overruns its list
+    const long = Uint8Array.from([0xb8, 56, ...new Array(56).fill(1)]);
+    expect(() => decodeWord(long)).toThrow(/overflow/); // canonical, but 56 bytes is no word
   });
   test("storage words, as the Rust tests", () => {
     expect(decodeWord(b(0x82, 0x12, 0x34))).toBe(0x1234n);

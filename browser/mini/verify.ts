@@ -20,14 +20,22 @@
 // and absence is decided by the trie's shape, never by a missing file.
 //
 // Mirrors the Rust client (crates/head, crates/csl-run, crates/trie,
-// crates/client) for the current mainnet fork only. Left out: hints, the
-// owner index, the by-hash baseline, the finalized tier, checkpoint rotation,
-// history, tracing and every fork but fulu.
+// crates/client) for the current mainnet fork only, its read-cost tricks
+// included: layer hints, the owner index, one speculative round, and what a
+// session keeps between reads. Left out: the by-hash baseline, the finalized
+// tier, checkpoint rotation, history, tracing and every fork but fulu.
+//
+// ox (wevm) for RLP, hex, bytes and BLS; @noble/hashes for keccak, sha256
+// and blake3, which ox's own hashes are.
 
-import { bls12_381 } from "@noble/curves/bls12-381.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
+import * as Bls from "ox/Bls";
+import type * as BlsPoint from "ox/BlsPoint";
+import * as Bytes from "ox/Bytes";
+import * as Hex from "ox/Hex";
+import * as Rlp from "ox/Rlp";
 
 // ---------------------------------------------------------------- trust
 
@@ -54,25 +62,22 @@ const refuse = (why: string): never => {
   throw new Refused(why);
 };
 
-export const hex = (b: Uint8Array) => "0x" + Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+export const hex = (b: Uint8Array): string => Hex.fromBytes(b);
 
+/** Hex with or without 0x (the manifest's has none), exactly `len` bytes when given: ox's `size` pads, so the length is checked here. */
 export function unhex(s: string, len?: number): Uint8Array {
-  const h = s.startsWith("0x") ? s.slice(2) : s;
-  if (h.length % 2 || !/^[0-9a-fA-F]*$/.test(h)) refuse(`not hex: ${s.slice(0, 20)}`);
-  const out = new Uint8Array(h.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(h.slice(2 * i, 2 * i + 2), 16);
+  let out: Uint8Array;
+  try {
+    out = Bytes.fromHex((typeof s === "string" && s.startsWith("0x") ? s : `0x${s}`) as Hex.Hex);
+  } catch {
+    return refuse(`not hex: ${String(s).slice(0, 20)}`);
+  }
   if (len !== undefined && out.length !== len) refuse(`expected ${len} bytes, got ${out.length}`);
   return out;
 }
 
-function concat(...parts: Uint8Array[]): Uint8Array {
-  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
-  let o = 0;
-  for (const p of parts) out.set(p, (o += p.length) - p.length);
-  return out;
-}
-
-export const eq = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
+const concat = (...parts: Uint8Array[]) => Bytes.concat(...parts);
+export const eq = (a: Uint8Array, b: Uint8Array) => Bytes.isEqual(a, b);
 
 /** Lexicographic order, as Rust orders `[u8; 32]`. */
 function cmp(a: Uint8Array, b: Uint8Array): number {
@@ -321,11 +326,12 @@ function signed(u: J, keys: Uint8Array[] | undefined, what: string, nowSlot: num
   if (sigSlot <= num(attested?.slot, `${what} attested slot`)) refuse(`${what}: signed before the slot it attests`);
   const forkData = H(concat(FULU_VERSION, new Uint8Array(28)), unhex(GENESIS_VALIDATORS_ROOT, 32));
   const domain = concat(Uint8Array.of(7, 0, 0, 0), forkData.subarray(0, 28)); // DOMAIN_SYNC_COMMITTEE
-  const bls = bls12_381.longSignatures;
+  const signature = fixed(u?.sync_aggregate?.sync_committee_signature, 96, `${what} signature`);
   let ok = false;
   try {
-    const msg = bls.hash(H(beaconRoot(attested), domain), BLS_DST);
-    ok = bls.verify(fixed(u?.sync_aggregate?.sync_committee_signature, 96, `${what} signature`), msg, bls.aggregatePublicKeys(signers));
+    // 48-byte keys (G1), a 96-byte signature (G2): ox reads the group from the signature's size.
+    const publicKey = Bls.aggregate(signers, { group: "G1" }) as BlsPoint.G1;
+    ok = Bls.verify({ payload: H(beaconRoot(attested), domain), publicKey, signature, suite: BLS_DST });
   } catch (e) {
     if (e instanceof Refused) throw e;
   }
@@ -884,45 +890,25 @@ export const storageKey = (owner: Uint8Array, path: number[], depth: number) => 
 
 // ---------------------------------------------------------------- RLP
 
-type Item = { list: boolean; start: number; end: number };
+type Item = Uint8Array | Item[];
 
-/** One RLP header at `o`, canonical as alloy-rlp requires; the item spans [o, end). */
-export function rlpItem(b: Uint8Array, o: number): Item {
-  const x = b[o] ?? refuse("rlp: short");
-  let [list, start, len] = [false, o + 1, 0];
-  if (x < 0x80) [start, len] = [o, 1];
-  else if (x <= 0xb7) {
-    len = x - 0x80;
-    if (len === 1 && (b[o + 1] ?? refuse("rlp: short")) < 0x80) refuse("rlp: non-canonical single byte");
-  } else if (x < 0xc0 || x >= 0xf8) {
-    list = x >= 0xf8;
-    const n = x - (list ? 0xf7 : 0xb7);
-    if (o + 1 + n > b.length) refuse("rlp: short");
-    if (b[o + 1] === 0) refuse("rlp: leading zero in length");
-    for (let i = 0; i < n; i++) len = len * 256 + b[o + 1 + i]!;
-    if (len < 56) refuse("rlp: non-canonical length");
-    start = o + 1 + n;
-  } else [list, len] = [true, x - 0xc0];
-  if (start + len > b.length) refuse("rlp: short");
-  return { list, start, end: start + len };
+/** One RLP item, nothing after it, canonical: ox refuses non-minimal lengths, wrapped single bytes and overruns. */
+function rlp(b: Uint8Array): Item {
+  if (!b.length) refuse("rlp: empty");
+  try {
+    return Rlp.toBytes(b) as Item;
+  } catch (e) {
+    return refuse(`rlp: ${(e as { shortMessage?: string }).shortMessage ?? (e as Error).message}`);
+  }
 }
-
-/** The items of a list item. */
-function rlpList(b: Uint8Array, it: Item): Item[] {
-  if (!it.list) refuse("rlp: expected a list");
-  const out: Item[] = [];
-  const inner = b.subarray(0, it.end); // no item may run past the list
-  for (let at = it.start; at < it.end; at = out[out.length - 1]!.end) out.push(rlpItem(inner, at));
-  return out;
-}
-const strOf = (b: Uint8Array, it: Item) => (it.list ? refuse("rlp: expected a string") : b.subarray(it.start, it.end));
+const bytesOf = (x: Item | undefined) => (x instanceof Uint8Array ? x : refuse("rlp: expected a string"));
 
 /** A minimal big-endian unsigned integer of at most `max` bytes. */
-function rlpUint(b: Uint8Array, it: Item, max: number): bigint {
-  const s = strOf(b, it);
+function uintOf(x: Item | undefined, max: number): bigint {
+  const s = bytesOf(x);
   if (s.length > max) refuse("rlp: integer overflow");
   if (s[0] === 0) refuse("rlp: integer with a leading zero");
-  return s.reduce((n, x) => (n << 8n) | BigInt(x), 0n);
+  return s.length ? Hex.toBigInt(Hex.fromBytes(s)) : 0n;
 }
 
 type Node =
@@ -933,30 +919,25 @@ type Node =
 
 /** alloy-trie's TrieNode::decode, plus: nothing may follow the node. */
 export function decodeNode(b: Uint8Array): Node {
-  const top = rlpItem(b, 0);
-  if (top.end !== b.length) refuse("rlp: bytes after the node");
-  if (!top.list) return top.end === top.start ? { kind: "empty" } : refuse("rlp: node is a string");
-  const items: Item[] = [];
-  for (let at = top.start; at < top.end; at = items[items.length - 1]!.end) {
-    if (items.length === 17) refuse("rlp: too many items");
-    items.push(rlpItem(b, at));
-  }
-  // An item's raw bytes, from its header on.
-  const rawOf = (i: number) => b.subarray(i === 0 ? top.start : items[i - 1]!.end, items[i]!.end);
+  const items = rlp(b);
+  if (!Array.isArray(items)) return items.length === 0 ? { kind: "empty" } : refuse("rlp: node is a string");
+  // A child's raw bytes, as alloy keeps them: re-encoding a canonical item gives back its bytes.
+  const raw = (x: Item) => Rlp.fromBytes(x as Uint8Array) as Uint8Array;
   const ref = (r: Uint8Array) => (r.length > 33 ? refuse("rlp: child reference too long") : r);
+  const isEmpty = (x: Item) => x instanceof Uint8Array && x.length === 0;
   if (items.length === 17) {
-    if (!eq(rawOf(16), Uint8Array.of(0x80))) refuse("branch node with a value");
-    return { kind: "branch", children: items.slice(0, 16).map((_, i) => (eq(rawOf(i), Uint8Array.of(0x80)) ? null : ref(rawOf(i)))) };
+    if (!isEmpty(items[16]!)) refuse("branch node with a value");
+    return { kind: "branch", children: items.slice(0, 16).map((x) => (isEmpty(x) ? null : ref(raw(x)))) };
   }
   if (items.length !== 2) refuse("rlp: node has neither 2 nor 17 items");
-  const enc = strOf(b, items[0]!);
+  const enc = bytesOf(items[0]);
   if (!enc.length) refuse("trie node key empty");
   const flag = enc[0]! & 0xf0;
   if (flag > 0x30) refuse("node is not extension or leaf");
   const odd = (flag & 0x10) !== 0;
   if (enc.length - 1 > 32 - (odd ? 1 : 0)) refuse("trie node key too long");
   const key = [...(odd ? [enc[0]! & 15] : []), ...nibbles(enc.subarray(1))];
-  return flag >= 0x20 ? { kind: "leaf", key, value: strOf(b, items[1]!) } : { kind: "extension", key, child: ref(rawOf(1)) };
+  return flag >= 0x20 ? { kind: "leaf", key, value: bytesOf(items[1]) } : { kind: "extension", key, child: ref(raw(items[1]!)) };
 }
 
 // ---------------------------------------------------------------- trie walk
@@ -1050,19 +1031,15 @@ export type Account = { nonce: bigint; balance: bigint; storageRoot: Uint8Array;
 
 /** rlp([nonce, balance, storageRoot, codeHash]), minimal, nothing after it. */
 export function decodeAccount(b: Uint8Array): Account {
-  const it = rlpItem(b, 0);
-  if (it.end !== b.length) refuse("account: bytes after the list");
-  const f = rlpList(b, it);
-  if (f.length !== 4) refuse("account: not four fields");
-  const h32 = (x: Item) => (x.list || x.end - x.start !== 32 || b[x.start - 1] !== 0xa0 ? refuse("account: not a 32-byte hash") : b.slice(x.start, x.end));
-  return { nonce: rlpUint(b, f[0]!, 8), balance: rlpUint(b, f[1]!, 32), storageRoot: h32(f[2]!), codeHash: h32(f[3]!) };
+  const f = rlp(b);
+  if (!Array.isArray(f) || f.length !== 4) return refuse("account: not a list of four fields");
+  const h32 = (x: Item | undefined) => (x instanceof Uint8Array && x.length === 32 ? x : refuse("account: not a 32-byte hash"));
+  return { nonce: uintOf(f[0], 8), balance: uintOf(f[1], 32), storageRoot: h32(f[2]), codeHash: h32(f[3]) };
 }
 
 /** A storage leaf: rlp of a minimal, non-zero word. */
 export function decodeWord(b: Uint8Array): bigint {
-  const it = rlpItem(b, 0);
-  if (it.end !== b.length) refuse("storage: bytes after the word");
-  const w = rlpUint(b, it, 32);
+  const w = uintOf(rlp(b), 32);
   return w === 0n ? refuse("storage: zero word stored as a leaf") : w;
 }
 
