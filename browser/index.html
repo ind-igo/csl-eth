@@ -131,6 +131,13 @@
       #tip b { color: var(--ink); }
       footer { color: var(--faint); font-size: 11px; }
 
+      .faq { max-width: 760px; margin: 28px auto 56px; padding: 0 16px; color: var(--ink2); font-size: 13.5px; line-height: 1.55; }
+      .faq > h2 { font-size: 15px; font-weight: 650; color: var(--ink); margin: 0 0 6px; }
+      .faq details { border-top: 1px solid var(--line); padding: 10px 0; }
+      .faq details:last-of-type { border-bottom: 1px solid var(--line); }
+      .faq summary { cursor: pointer; color: var(--ink); font-weight: 600; }
+      .faq p { margin: 8px 0 0; }
+
       @media (max-width: 1180px) {
         main { grid-template-columns: minmax(170px, 200px) minmax(0, 1fr) clamp(260px, 28vw, 320px); }
         #key { width: min(330px, 40vw); }
@@ -219,6 +226,39 @@
         </section>
       </div>
     </div>
+
+    <section class="faq" aria-labelledby="faq-title">
+      <h2 id="faq-title">FAQ</h2>
+      <details>
+        <summary>What is this?</summary>
+        <p>A demo. All of Ethereum mainnet's current state (every balance, every contract's storage, all contract code) is published as plain files in a cloud storage bucket. This tab reads those files directly and proves each answer is correct. There is no RPC provider, API or Ethereum node behind it.</p>
+      </details>
+      <details>
+        <summary>Why does it matter?</summary>
+        <p>Wallets and apps usually read Ethereum through an RPC provider and trust its answers. Here nothing that serves the data is trusted: the bucket is only a file host, and anyone could mirror it. Reading the chain needs no generous node operator, only somewhere that serves bytes.</p>
+      </details>
+      <details>
+        <summary>How does the tab know the answer is right?</summary>
+        <p>It starts from one trusted checkpoint and follows the beacon chain's light-client data to the latest head, which must be signed by at least 342 of the 512 validators in the sync committee. Every value it reads is hashed up to the state root in that signed head. A wrong or missing byte makes the read fail rather than return a wrong answer. Tick "tamper next read" to watch it refuse a flipped byte.</p>
+      </details>
+      <details>
+        <summary>How up to date is it?</summary>
+        <p>By default, about 35 seconds behind the latest block. That block is signed but not yet final, so in rare cases it could still be replaced. Add <span class="mono">?tier=finalized</span> to the address to read only finalized blocks, about 13 minutes behind.</p>
+      </details>
+      <details>
+        <summary>Who keeps the files current?</summary>
+        <p>A small server with no Ethereum node. For each new block, it asks mainnet peers for the parts of the state that changed and uploads them as a small update file. Running it and storing everything costs under $40 a month. In a real deployment, an Ethereum node would publish these updates as a side effect.</p>
+      </details>
+      <details>
+        <summary>What am I looking at?</summary>
+        <p>Left: the chain of trust, from the checkpoint to the state root. Middle: the path through Ethereum's state trie that proves this answer. Right: every 4 KB page in the bucket, with the ones this read fetched lit up. Bottom: each network request, on the real clock.</p>
+      </details>
+      <details>
+        <summary>What can't it do yet?</summary>
+        <p>Run contract calls (<span class="mono">eth_call</span>), read transaction history or logs, read past states, or send transactions. This demo shows the hard part: current state, read and verified by a small light client from plain files.</p>
+      </details>
+      <p>Code and measurements: <a href="https://github.com/ind-igo/csl-eth">github.com/ind-igo/csl-eth</a></p>
+    </section>
     <div id="tip" hidden></div>
     <script type="module" src="./dist/viz.js"></script>
   </body>
