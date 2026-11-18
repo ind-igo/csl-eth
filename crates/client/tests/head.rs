@@ -14,7 +14,7 @@ use csl_eth_client::{
     open_at_head, open_at_head_with, Driver, Got, HeadOpenError, HeadOpener, Pending, TierChoice,
     Want,
 };
-use csl_eth_head::{paths, verify, Chain, FcrClass, FcrReport, HeadSource};
+use csl_eth_head::{paths, verify, Chain, HeadSource};
 use csl_eth_store::manifest_path;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -127,8 +127,7 @@ fn head_round(fx: &Fixture) -> BTreeSet<String> {
 }
 
 /// What the default opener reads first: both tiers' head updates beside
-/// the bootstrap, and nothing else (no `head/fcr`: the client does not
-/// read the producer's unverified note).
+/// the bootstrap, and nothing else.
 fn best_round(fx: &Fixture) -> BTreeSet<String> {
     let mut r = head_round(fx);
     r.insert(paths::OPTIMISTIC.to_string());
@@ -634,10 +633,7 @@ fn forced_finalized_never_reads_the_attested_files() {
     assert_eq!(head, Some((Tier::Finalized, FINALIZED_BLOCK)));
     let rounds = fx.files.rounds();
     assert_eq!(rounds[0], head_round(&fx));
-    assert!(rounds
-        .iter()
-        .flatten()
-        .all(|f| f != paths::OPTIMISTIC && f != paths::FCR));
+    assert!(rounds.iter().flatten().all(|f| f != paths::OPTIMISTIC));
     assert_eq!(rounds[2], set(&[manifest_path(&f)]));
 }
 
@@ -662,30 +658,4 @@ fn before_any_finality_update_the_attested_head_opens_alone() {
             current: 1903
         }))
     );
-}
-
-fn fcr_note(fx: &Fixture, hash: B256, number: u64) -> Vec<u8> {
-    let _ = fx;
-    FcrReport {
-        block_hash: hash,
-        block_number: number,
-        confirmed_after_secs: 13,
-        trail_blocks: 2,
-        classification: FcrClass::of_trail(2),
-        source: "rpc.example".into(),
-        checked_at: 1_793_712_520,
-    }
-    .to_json()
-}
-
-#[test]
-fn fcr_classification_is_by_trail() {
-    assert_eq!(FcrClass::of_trail(0), FcrClass::FcrLike);
-    assert_eq!(FcrClass::of_trail(4), FcrClass::FcrLike);
-    assert_eq!(FcrClass::of_trail(5), FcrClass::JustifiedLike);
-    assert_eq!(FcrClass::of_trail(40), FcrClass::JustifiedLike);
-    let r = FcrReport::from_json(&fcr_note(&fixture(), B256::repeat_byte(9), 7)).unwrap();
-    assert_eq!(r.block_hash, B256::repeat_byte(9));
-    let v: serde_json::Value = serde_json::from_slice(&r.to_json()).unwrap();
-    assert_eq!(v["classification"], "fcr_like");
 }

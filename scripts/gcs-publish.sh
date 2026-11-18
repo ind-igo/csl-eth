@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# The producer's publisher for a Cloud Storage bucket, run on a GCP VM
-# (`csl-eth produce --publish scripts/gcs-publish.sh`). Same interface as
-# r2-publish.sh and r2-s3-publish.sh:
+# The tracker's publisher for a Cloud Storage bucket, run on a GCP VM
+# (`csl-eth track --publish scripts/gcs-publish.sh`):
 #
 #   gcs-publish.sh put <key> <file>    upload <file> as <key>
 #   gcs-publish.sh delete <key>        delete <key>
@@ -38,7 +37,7 @@ token() {
 # Seconds each try may take: 240, plus one per 10 MB of the upload, so a
 # large file gets time at about a fifth of the VM's usual 40-80 MB/s. The
 # tracker's own deadline for the call grows the same way (PUT_FLOOR_RATE in
-# crates/snap/src/produce.rs).
+# crates/snap/src/publish.rs).
 max_time=240
 
 gcs() {
@@ -75,7 +74,7 @@ case "${1:-}" in
       # the block its span ends at; none is ever rewritten.
       history/runs/* | history/packs/* | history/[0-9a-f]*/manifest.json)
         cc='public, max-age=31536000, immutable' ;;
-      *) cc='no-cache' ;; # head/optimistic, finality, fcr, updates/<period>, snapshots/latest, history/latest
+      *) cc='no-cache' ;; # head/optimistic, finality, updates/<period>, snapshots/latest, history/latest
     esac
     code=$(gcs -X PUT -H "Content-Type: $ct" -H "Cache-Control: $cc" --upload-file "$file" "$base/$key")
     ;;

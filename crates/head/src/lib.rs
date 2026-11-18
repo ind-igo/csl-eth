@@ -61,8 +61,6 @@ pub mod paths {
 
     pub const FINALITY: &str = "head/finality";
     pub const OPTIMISTIC: &str = "head/optimistic";
-    /// The producer's unverified fast-confirmation report; see [`crate::FcrReport`].
-    pub const FCR: &str = "head/fcr";
     /// A newer checkpoint the producer suggests ([`crate::Pointer`]):
     /// unverified, adopted only through [`crate::adopt`].
     pub const CHECKPOINT: &str = "head/checkpoint";
@@ -724,108 +722,4 @@ pub fn current_slot(chain: &Chain, now: SystemTime) -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     secs.saturating_sub(chain.genesis_time) / 12
-}
-
-/// `head/fcr`: what one named RPC's `safe` tag said about a block the
-/// producer published, as the producer saw it. Nothing here is verified,
-/// and nothing a light client holds could verify it: fast confirmation is
-/// a full node's judgement over all the attestations it has seen. A client
-/// shows it as the producer's report from a named source, and only next
-/// to a head it verified at the same block hash.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FcrReport {
-    pub block_hash: B256,
-    pub block_number: u64,
-    /// Seconds from the block's timestamp to the first poll that saw the
-    /// source's `safe` at or past its height; the source also returned
-    /// this hash for this height, in a request of its own, which is not a
-    /// proof that this block is an ancestor of that `safe` block.
-    pub confirmed_after_secs: u64,
-    /// How many blocks the source's `safe` trailed its `latest` then.
-    pub trail_blocks: u64,
-    pub classification: FcrClass,
-    /// The host of the RPC, never its full URL (which may carry a key).
-    pub source: String,
-    /// Unix seconds of that poll.
-    pub checked_at: u64,
-}
-
-/// What a source's `safe` tag behaves like, from how far it trails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FcrClass {
-    /// Within [`FCR_LIKE_TRAIL`] blocks of `latest`: a fast-confirmation rule.
-    FcrLike,
-    /// Further behind: the justified checkpoint, which is what most public
-    /// endpoints serve as `safe`.
-    JustifiedLike,
-}
-
-/// The most blocks `safe` may trail `latest` and still look like a
-/// fast-confirmation rule rather than justification (which trails by
-/// roughly one to two epochs, 30 to 60 blocks).
-pub const FCR_LIKE_TRAIL: u64 = 4;
-
-impl FcrClass {
-    pub fn of_trail(trail_blocks: u64) -> FcrClass {
-        if trail_blocks <= FCR_LIKE_TRAIL {
-            FcrClass::FcrLike
-        } else {
-            FcrClass::JustifiedLike
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            FcrClass::FcrLike => "fcr_like",
-            FcrClass::JustifiedLike => "justified_like",
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct FcrWire {
-    block_hash: String,
-    block_number: u64,
-    confirmed_after_secs: u64,
-    trail_blocks: u64,
-    classification: FcrClass,
-    source: String,
-    checked_at: u64,
-}
-
-impl FcrReport {
-    pub fn to_json(&self) -> Vec<u8> {
-        serde_json::to_vec_pretty(&FcrWire {
-            block_hash: self.block_hash.to_string(),
-            block_number: self.block_number,
-            confirmed_after_secs: self.confirmed_after_secs,
-            trail_blocks: self.trail_blocks,
-            classification: self.classification,
-            source: self.source.clone(),
-            checked_at: self.checked_at,
-        })
-        .expect("serializes")
-    }
-
-    /// The report, or `None` for bytes that are not one.
-    pub fn from_json(bytes: &[u8]) -> Option<FcrReport> {
-        let w: FcrWire = serde_json::from_slice(bytes).ok()?;
-        Some(FcrReport {
-            block_hash: w.block_hash.parse().ok()?,
-            block_number: w.block_number,
-            confirmed_after_secs: w.confirmed_after_secs,
-            trail_blocks: w.trail_blocks,
-            classification: w.classification,
-            source: w.source,
-            checked_at: w.checked_at,
-        })
-    }
-
-    /// The report if it is about `head`'s block, else `None`: a report for
-    /// another block (an older snapshot, or another chain) says nothing.
-    pub fn about(self, head: &ExecutionHead) -> Option<FcrReport> {
-        (self.block_hash == head.block_hash && self.block_number == head.block_number)
-            .then_some(self)
-    }
 }

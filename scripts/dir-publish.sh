@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# A publisher into a local directory, for running `csl-eth produce`
-# without touching R2: the same interface as r2-publish.sh.
+# A publisher into a local directory, for running `csl-eth track
+# --publish` without touching a bucket: the same interface as
+# gcs-publish.sh.
 #
 #   CSL_ETH_PUBLISH_DIR=<dir> dir-publish.sh put <key> <file>
 #   CSL_ETH_PUBLISH_DIR=<dir> dir-publish.sh delete <key>

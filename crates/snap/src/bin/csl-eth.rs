@@ -4,7 +4,7 @@
 use alloy_primitives::{B256, U256};
 use clap::{Parser, Subcommand};
 use csl_eth_client::{open_at_head, DirDriver, Hint, Read, Reason, Snapshot, VerifiedHead};
-use csl_eth_snap::{bal, fetch, peer::Net, probe, FetchConfig, Slice};
+use csl_eth_snap::{bal, fetch, peer::Net, probe, slice::parse_prefix, FetchConfig, Slice};
 use csl_eth_store::{produce_with, ProduceOptions};
 use csl_eth_trie::KECCAK_EMPTY;
 use csl_eth_trie::{Account, Nibbles};
@@ -66,11 +66,6 @@ enum Cmd {
     /// bucket's responses by a lying host, read through, tabulated; passes
     /// when safe (no false answer) and exercised (every fault fired).
     Faults(csl_eth_snap::faults::Args),
-    /// The producer loop: at each chosen epoch boundary fetch the slice,
-    /// build it, wait for finality to name the block, lay out the head
-    /// files, verify, publish in order, collect old snapshots. One JSON
-    /// line per cycle on stdout and in `<work>/produce.log`.
-    Produce(csl_eth_snap::produce::Args),
     /// The tracker: keep a published state current by fetching the trie
     /// nodes that changed up to each verified attested head over snap/1
     /// `GetTrieNodes`, one layer per step, merged in
@@ -288,26 +283,11 @@ fn open_for_check<D: csl_eth_client::Driver>(
     }
 }
 
-fn parse_prefix(s: &str) -> Result<Nibbles, String> {
-    let s = s.trim_start_matches("0x");
-    if s.is_empty() || s.len() > 62 {
-        return Err("prefix must be 1 to 62 hex nibbles".into());
-    }
-    let mut out = Vec::with_capacity(s.len());
-    for c in s.chars() {
-        out.push(
-            c.to_digit(16)
-                .ok_or_else(|| format!("not a hex nibble: {c}"))? as u8,
-        );
-    }
-    Ok(Nibbles::from_nibbles(out))
-}
-
 /// Log targets that never get through, whatever `RUST_LOG` says: the HTTP
 /// client ureq prints each request's URI, path and query included, at
 /// trace level (and its protocol crate the request line), and the URL of
-/// the producer's FCR RPC, or of the workload's oracle, may carry a key in
-/// either. Their other logs are not worth that risk.
+/// the workload's oracle may carry a key in either. Their other logs are
+/// not worth that risk.
 const SILENCED: &[&str] = &["ureq", "ureq_proto"];
 
 fn silenced(target: &str) -> bool {
@@ -344,19 +324,13 @@ fn log_filter() -> tracing_subscriber::EnvFilter {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use tracing_subscriber::util::SubscriberInitExt;
     let cli = Cli::parse();
-    if matches!(
-        cli.cmd,
-        Cmd::Produce(_) | Cmd::History { .. } | Cmd::Beacon { .. }
-    ) {
-        // stdout carries the cycle lines (the JSON document) only.
+    if matches!(cli.cmd, Cmd::History { .. } | Cmd::Beacon { .. }) {
+        // stdout carries the JSON document only.
         subscriber(log_filter(), std::io::stderr).init();
     } else {
         subscriber(log_filter(), std::io::stdout).init();
     }
     match cli.cmd {
-        Cmd::Produce(args) => {
-            tokio::task::spawn_blocking(move || csl_eth_snap::produce::run(args)).await??;
-        }
         Cmd::Track(args) => {
             csl_eth_snap::track::run(args).await?;
         }
@@ -857,7 +831,7 @@ mod tests {
     #[test]
     fn the_http_clients_logs_never_get_through() {
         assert!(silenced("ureq") && silenced("ureq::run") && silenced("ureq_proto::client"));
-        assert!(!silenced("ureqx") && !silenced("csl_eth_snap::produce"));
+        assert!(!silenced("ureqx") && !silenced("csl_eth_snap::track"));
         // Even with everything at trace, and ureq's own targets asked for
         // by name: what ureq logs (through the `log` bridge, as these
         // targets) is dropped, the rest is not.

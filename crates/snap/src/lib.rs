@@ -6,13 +6,14 @@
 //! - [`discovery`]: candidates from the EIP-1459 DNS tree and discv4.
 //! - [`fetch`]: the slice fetcher, which verifies every range proof and
 //!   every bytecode as it arrives and re-pivots when peers forget the root.
-//! - [`slice`]: the fetched slice on disk, the producer's input.
+//! - [`slice`]: the fetched slice on disk, the build's input.
 //!
 //! The `csl-eth` binary drives it: `fetch` a prefix, `build` a bucket
 //! from a slice, `check` a bucket, `peers` to probe connectivity,
 //! `bal-probe` to ask testnet peers for block access lists ([`bal`]), and the
-//! milestone 1 exit tests: [`workload`] and [`faults`]; `produce` is the
-//! loop that keeps a bucket at the finalized head ([`produce`]).
+//! milestone 1 exit tests: [`workload`] and [`faults`]; `track` keeps a
+//! published state at the verified head ([`track`]), uploading through
+//! [`publish`].
 //! `history` acquires blocks, receipts and headers below the verified head
 //! and writes and reads the §3c history tables ([`history`]).
 
@@ -20,13 +21,12 @@ pub mod bal;
 pub mod beacon;
 pub mod discovery;
 pub mod faults;
-pub mod fcr;
 pub mod fetch;
 pub mod heal;
 pub mod track;
 pub mod history;
 pub mod peer;
-pub mod produce;
+pub mod publish;
 pub mod remote;
 pub mod slice;
 pub mod workload;

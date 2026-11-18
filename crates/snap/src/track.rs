@@ -29,7 +29,7 @@
 
 use crate::{
     heal::{self, shape, Fetch, Group, Need, Pool, Ref, Shape},
-    produce::{Program, Publish},
+    publish::{Program, Publish},
 };
 use alloy_primitives::{keccak256, Bytes, B256, U256};
 use clap::Args as ClapArgs;
@@ -3027,7 +3027,7 @@ pub async fn run(args: Args) -> Result<(), String> {
     let prefix = if base.prefix.is_empty() {
         None
     } else {
-        Some(crate::produce::parse_prefix(&base.prefix)?)
+        Some(crate::slice::parse_prefix(&base.prefix)?)
     };
     let publish: Arc<dyn Publish + Send> = match (&args.publish, &args.to_dir) {
         (Some(p), _) => Arc::new(Program {

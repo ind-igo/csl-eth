@@ -46,6 +46,23 @@ pub struct SliceHead {
     pub pivot_set_ms: u64,
 }
 
+/// A prefix as [`SliceHead::prefix`] writes it (hex nibbles, `0x`
+/// optional) back into nibbles.
+pub fn parse_prefix(s: &str) -> Result<Nibbles, String> {
+    let s = s.trim_start_matches("0x");
+    if s.is_empty() || s.len() > 62 {
+        return Err("prefix must be 1 to 62 hex nibbles".into());
+    }
+    let mut out = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        out.push(
+            c.to_digit(16)
+                .ok_or_else(|| format!("not a hex nibble: {c}"))? as u8,
+        );
+    }
+    Ok(Nibbles::from_nibbles(out))
+}
+
 #[derive(RlpEncodable, RlpDecodable)]
 struct AccountRec {
     hash: B256,
