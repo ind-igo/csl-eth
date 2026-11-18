@@ -21,7 +21,10 @@
 set -euo pipefail
 
 PROJECT="${CSL_ETH_PROJECT:-csl-eth}"
-ZONE="${CSL_ETH_ZONE:-asia-east1-b}"
+env_file="$(cd "$(dirname "$0")/../.." && pwd)/infra/.env"
+[ -f "$env_file" ] && . "$env_file"   # CSL_ETH_REGION (gitignored)
+ZONE="${CSL_ETH_ZONE:-${CSL_ETH_REGION:+$CSL_ETH_REGION-b}}"
+: "${ZONE:?set CSL_ETH_REGION in infra/.env, or CSL_ETH_ZONE}"
 VM="${CSL_ETH_NODE_VM:-csl-eth-node}"
 BUCKET="${CSL_ETH_GCS_BUCKET:-csl-eth-demo}"
 CHECKPOINT="${CSL_ETH_CHECKPOINT:-0x431b33af8452e2d644377405e69d4f382182ab906f31461190ca24cb3401d70b}"

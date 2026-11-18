@@ -1,0 +1,4 @@
+/pkg/*
+  Cache-Control: public, max-age=300
+/dist/*
+  Cache-Control: public, max-age=300

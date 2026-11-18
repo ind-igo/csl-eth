@@ -29,18 +29,23 @@
 // SSH comes only through Identity-Aware Proxy, which checks the caller's
 // Google account:
 //
-//	gcloud compute ssh csl-eth-producer --zone asia-east1-b --tunnel-through-iap
+//	gcloud compute ssh csl-eth-producer --zone <zone> --tunnel-through-iap
 //
 // The VM writes to the bucket as its own service account, whose only grant
-// is object read/write on that bucket; no key exists anywhere. The optional
-// FCR RPC URL (it may carry an API key) is written on the VM by hand into
-// /etc/csl-eth/fcr.env and never passes through this file or Alchemy's state.
+// is object read/write on that bucket; no key exists anywhere.
 import * as GCP from "@alchemy.run/gcp";
 import * as Alchemy from "alchemy";
 import * as Output from "alchemy/Output";
 import * as Effect from "effect/Effect";
 
-const region = "asia-east1"; // Taiwan
+// Region and project number come from infra/.env (gitignored):
+// CSL_ETH_REGION, CSL_ETH_PROJECT_NUMBER.
+const need = (k: string) => {
+  const v = process.env[k];
+  if (!v) throw new Error(`set ${k} in infra/.env`);
+  return v;
+};
+const region = need("CSL_ETH_REGION");
 const zone = `${region}-b`;
 const cidr = "10.30.0.0/24";
 const iap = "35.235.240.0/20"; // the range IAP's TCP forwarding connects from
@@ -188,7 +193,7 @@ export default Alchemy.Stack(
     // to. The stack cannot attach the schedule to the instance, so that was
     // done by hand (2026-11-17):
     //   gcloud compute instances add-resource-policies csl-eth-producer \
-    //     --zone asia-east1-b --resource-policies csl-eth-restart
+    //     --zone <zone> --resource-policies csl-eth-restart
     // and again after anything replaces the VM.
     yield* GCP.Compute.ResourcePolicy("restart", {
       resourcePolicyName: "csl-eth-restart",
@@ -200,7 +205,7 @@ export default Alchemy.Stack(
       kind: "project",
       name: "csl-eth",
       role: "roles/compute.instanceAdmin.v1",
-      member: "serviceAccount:service-929770876169@compute-system.iam.gserviceaccount.com",
+      member: `serviceAccount:service-${need("CSL_ETH_PROJECT_NUMBER")}@compute-system.iam.gserviceaccount.com`,
     });
 
     // The full-state node is not in this stack: it is a burst VM with

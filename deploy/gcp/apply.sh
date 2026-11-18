@@ -12,7 +12,10 @@
 set -euo pipefail
 
 VM="${CSL_ETH_VM:-csl-eth-producer}"
-ZONE="${CSL_ETH_ZONE:-asia-east1-b}"
+env_file="$(cd "$(dirname "$0")/../.." && pwd)/infra/.env"
+[ -f "$env_file" ] && . "$env_file"   # CSL_ETH_REGION (gitignored)
+ZONE="${CSL_ETH_ZONE:-${CSL_ETH_REGION:+$CSL_ETH_REGION-b}}"
+: "${ZONE:?set CSL_ETH_REGION in infra/.env, or CSL_ETH_ZONE}"
 PROJECT="${CSL_ETH_PROJECT:-csl-eth}"
 cd "$(dirname "$0")/../.."
 
@@ -33,7 +36,7 @@ remote sudo chown "$user" /opt/csl-eth
 
 rsync -az --stats -e "$ssh_cmd" \
   --exclude target --exclude data --exclude node_modules --exclude infra/node_modules \
-  --exclude browser/pkg --exclude browser/site --exclude browser/dist --exclude browser/deploy/.cloudflare \
+  --exclude browser/pkg --exclude browser/site --exclude browser/dist \
   ./ "$user@$VM:/opt/csl-eth/" | grep -E 'Number of regular files transferred' || true
 
 # Rust as the deploying user, the toolchain the repo pins if it pins one.

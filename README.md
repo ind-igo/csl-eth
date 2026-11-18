@@ -19,7 +19,7 @@ Inspired by Open Table Formats (OTF) like Iceberg which create highly scalable d
 
 The **Learned Index**, in contrast to a classical tree-based index, is a small model of how the keys are spread across the pages, which makes it extremely lightweight compared to a tree-based index. Our learned index is about **2.7 MB** to index the entire Ethereum current state. An equivalent B-Tree index would be **2.8 GB** with full 32-byte keys, or around **700 MB** with 8 byte keys, a **250-1000x** difference. This is what allows the light client to be so small. The tradeoff is that it takes more requests to get the result, an acceptable tradeoff for the massive portability increase.
 
-The resulting light client is a ~1000 line file that can be written in any language. See skills/csl-eth-light-client/SKILL.md for an AI skill to make them, and browser/light/verify.ts for a simple typescript implementation.
+The resulting light client is a ~1200 line file that can be written in any language. See skills/csl-eth-light-client/SKILL.md for an AI skill to make them, and browser/light/verify.ts for a simple typescript implementation.
 
 ## How a read is verified
 
@@ -52,7 +52,7 @@ layers of changed trie nodes, merged over time so a read asks only a few.
 behind without running a node. For each new head it asks mainnet peers for
 the trie nodes that changed, checks each by hash, and publishes them as a
 layer. It costs about $30 a month. A full node could publish the same
-layers as a side effect, which is the natural next step.
+layers as a side effect (ie using Reth Exex, Nethermind plugin, etc), which is the natural next step.
 
 **Copies are cheap.** One copy of the bucket costs about $3–15 a month to
 store and keep current, and any static host can serve one; see
@@ -74,44 +74,41 @@ store and keep current, and any static host can serve one; see
 
 ## Build
 
-| crate | what |
+| path | what |
 |---|---|
-| `crates/pgm` | the learned index (piecewise-linear, Q0.64), from cinder |
-| `crates/csl-run` | run files: sorted pages under a blake3 tree, the paged model, writer and verifying reader, from cinder at `ba2b9d8` |
+| `browser/light` | the TypeScript light client (`verify.ts`, the whole trust path) and its page |
+| `skills/csl-eth-light-client` | everything needed to write a verifying client in another language |
+| `crates/pgm` | the learned index (piecewise-linear, Q0.64) |
+| `crates/csl-run` | run files: sorted pages under a blake3 tree, the paged model, writer and verifying reader |
 | `crates/trie` | node positions, a streaming trie builder, the verifier walk |
 | `crates/store` | the bucket layout, manifest, and building a bucket from verified state |
-| `crates/client` | the client as a sans-I/O state machine: each read returns the ranges it needs next |
+| `crates/client` | the Rust client as a sans-I/O state machine: each read returns the ranges it needs next |
 | `crates/head` | the beacon light-client protocol from files, verified with helios |
-| `crates/wasm` | the client and head verifier for the browser |
-| `crates/snap` | bin `csl-eth`: mainnet state over devp2p `snap` with no node; `fetch`, `build`, `check`, `produce`, `track` |
+| `crates/wasm` | the Rust client and head verifier for the browser |
+| `crates/history` | history reads (transactions, receipts, logs, headers) verified to the beacon head; not used by the browser |
+| `crates/snap` | bin `csl-eth`: mainnet state over devp2p `snap` with no node, and the tracker |
 
 ```
 cargo test --workspace
 cargo build --release -p csl-eth-snap
-./target/release/csl-eth fetch --prefix 1a7 --out data/slice-1a7      # 1/4096 of mainnet state
-./target/release/csl-eth build --slice data/slice-1a7 --out data/bucket-1a7
-./target/release/csl-eth check --slice data/slice-1a7 --url https://host/bucket --prefetch 1 --top-levels 4
 
-# the producer: a snapshot every epoch, published under the attested head, upgraded when finalized
-./target/release/csl-eth produce --prefix 1a7 --work data/produce --checkpoint 0x<root> \
-    --publish scripts/r2-publish.sh --every-mins 6 --keep 10   # CSL_ETH_FCR_RPC adds the FCR note
-
-# the tracker: keep a full-state base current from mainnet peers, the base left in the bucket
+# the tracker: keep a full-state base current from mainnet peers
 ./target/release/csl-eth track --root data/track/root --work data/track/work --base 0x<base block hash> \
     --base-url https://storage.googleapis.com/csl-eth-demo/full/ --checkpoint 0x<root> \
     --publish scripts/gcs-publish.sh
 
-# the browser page
+# the browser pages
 mise install && ./scripts/build-wasm.sh
 cd browser && bun install && bun run serve                     # http://127.0.0.1:8791/
+bun test light                                                 # the TypeScript client's tests
 
-# the demo on Google Cloud (project csl-eth): bucket, VM, network, in one Alchemy stack
+# the demo on Google Cloud: put CSL_ETH_REGION and CSL_ETH_PROJECT_NUMBER in infra/.env
 cd infra && bun install && bun run plan && bun run deploy --yes
 deploy/gcp/apply.sh        # build the tracker on the VM, run it under systemd
-deploy/gcp/site.sh         # build the page (gzipped), upload it into the bucket
+deploy/gcp/site.sh         # build the pages (gzipped), upload them into the bucket
 ```
 
-The producer publishes with `scripts/gcs-publish.sh`, as the VM's service
+The tracker publishes with `scripts/gcs-publish.sh`, as the VM's service
 account; pointers are served `no-cache` and hash-named files `immutable`.
 The reasoning behind each choice is in `docs/decisions.md`, in the order it
 was made.

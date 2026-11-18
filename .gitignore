@@ -5,3 +5,4 @@
 !/results/*.md
 /data
 !/results/m1-*.json
+/.cloudflare

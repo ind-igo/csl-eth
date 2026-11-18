@@ -1,6 +1,5 @@
 # The producer loop on the GCP VM (infra/alchemy.run.ts), installed by
-# deploy/gcp/apply.sh. The same command as deploy/k8s/deployment.yaml on
-# fafo-0, writing to the Cloud Storage bucket instead of R2.
+# deploy/gcp/apply.sh, writing to the Cloud Storage bucket.
 #
 # Checkpoint: the page's default root (browser/src/main.ts, viz.ts), here so
 # the producer publishes head/bootstrap/<root>. state.json is tied to it, so

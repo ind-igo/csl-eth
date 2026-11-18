@@ -15,7 +15,10 @@
 set -euo pipefail
 
 PROJECT="${CSL_ETH_PROJECT:-csl-eth}"
-ZONE="${CSL_ETH_ZONE:-asia-east1-b}"
+env_file="$(cd "$(dirname "$0")/../.." && pwd)/infra/.env"
+[ -f "$env_file" ] && . "$env_file"   # CSL_ETH_REGION (gitignored)
+ZONE="${CSL_ETH_ZONE:-${CSL_ETH_REGION:+$CSL_ETH_REGION-b}}"
+: "${ZONE:?set CSL_ETH_REGION in infra/.env, or CSL_ETH_ZONE}"
 VM=csl-eth-heal-probe
 RULE=csl-eth-heal-probe-discv4
 HOURS="${HEAL_PROBE_HOURS:-24}"

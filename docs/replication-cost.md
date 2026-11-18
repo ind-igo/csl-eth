@@ -48,7 +48,7 @@ The six largest providers had 238 public regions in January 2026. About 240 copi
 ## Against the full nodes that serve state now
 
 - Ethereum has roughly 8,000 to 14,000 execution nodes, depending on the counter (ethernodes about 8,000–9,000; Etherscan about 11,800; other trackers higher).
-- A full node costs about $60–100 a month on a dedicated server and $250–300 in the cloud. Our own estimate for one in asia-east1 was $250–283 (n2-standard-4 and 700 GiB pd-ssd; `docs/delta-producer.md`).
+- A full node costs about $60–100 a month on a dedicated server and $250–300 in the cloud. Our own estimate for one in the bucket's region was $250–283 (n2-standard-4 and 700 GiB pd-ssd; `docs/delta-producer.md`).
 - The fleet is therefore roughly $1–3M a month.
 
 | | Monthly | Equivalent |

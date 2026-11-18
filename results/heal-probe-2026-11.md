@@ -1,6 +1,6 @@
 # The healing probe: keeping the full state current from peers' trie nodes
 
-Run 2026-11-16, 09:04 to 14:02 UTC, on a temporary spot VM in `asia-east1-b`
+Run 2026-11-16, 09:04 to 14:02 UTC, on a temporary spot VM in the bucket's region
 (e2-standard-2, Debian 13, public IP, UDP 30303 open). The design it tests is
 `docs/delta-producer.md`, "The healer". The question: can a process with no
 node and no execution keep a path-keyed copy of mainnet's state current by
@@ -205,7 +205,7 @@ minutes when Geth is full.
 - **Machine.** The probe recorded no CPU or memory figures. Its work is
   network waits and hashing a few MiB per block, so a smaller VM is likely
   enough. The download is about 2.4 MiB per block new (half
-  of the probe's 4.7). A spot e2-small or fafo-0 is the next thing to try. Disk is
+  of the probe's 4.7). A spot e2-small or a separate server is the next thing to try. Disk is
   dominated by the stored deltas: about 17 GB a day per-block, or 5.5 GB a
   day batched every ~80 blocks, before compaction.
 - **Cadence is a choice.** Per-block costs 3× the writes of batching across
