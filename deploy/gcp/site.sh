@@ -28,7 +28,8 @@ up --content-type=text/javascript "$site"/dist/*.js "gs://$bucket/dist/"
 up --content-type=text/javascript "$site"/pkg/*.js "gs://$bucket/pkg/"
 up --content-type=application/json "$site"/dist/*.map "gs://$bucket/dist/"
 up --content-type=application/wasm "$site"/pkg/*.wasm "gs://$bucket/pkg/"
-# The old two-page site's script.
-gcloud storage rm -q "gs://$bucket/dist/main.js" "gs://$bucket/dist/main.js.map" 2>/dev/null || true
+# Scripts of earlier pages (the two-page site's, the first TypeScript client's).
+gcloud storage rm -q "gs://$bucket/dist/main.js" "gs://$bucket/dist/main.js.map" \
+  "gs://$bucket/dist/mini.js" "gs://$bucket/dist/mini.js.map" 2>/dev/null || true
 
 echo "https://storage.googleapis.com/$bucket/index.html"

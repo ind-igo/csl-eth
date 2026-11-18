@@ -48,7 +48,11 @@ if [[ -z "${AR_wasm32_unknown_unknown:-}" ]]; then
   fi
 fi
 
-cargo build --profile wasm --target wasm32-unknown-unknown -p csl-eth-wasm "$@"
+# Panic messages carry source paths; rewrite the build machine's so the
+# published wasm names no local directory (arrays from --config add to
+# .cargo/config.toml's rustflags; the last matching prefix wins).
+remap="target.wasm32-unknown-unknown.rustflags=['--remap-path-prefix=$HOME=/home','--remap-path-prefix=$repo=/csl-eth']"
+cargo build --config "$remap" --profile wasm --target wasm32-unknown-unknown -p csl-eth-wasm "$@"
 
 wasm="target/wasm32-unknown-unknown/wasm/csl_eth_wasm.wasm"
 mkdir -p "$out"
