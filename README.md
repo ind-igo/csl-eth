@@ -1,159 +1,76 @@
-# csl-eth
+# Cold state light client: Ethereum light clients in about 1,000 lines of code
 
-Ethereum state as static files, verified to the block header. A client in
-the browser reads mainnet accounts, storage and code from a plain bucket by
-byte range, and proves every value and every absence from the state root the
-beacon chain signed. No RPC and no node at read time. This is PoC 2 of the
-cold state layer; PoC 1 (cinder) built the same layer on a chain of its own.
+**WASM Demo (410 kb):** https://storage.googleapis.com/csl-eth-demo/index.html to read up to date mainnet state in your browser.
+**Minimal Demo (61 kb):** https://storage.googleapis.com/csl-eth-demo/light.html
 
-**Demo:** https://storage.googleapis.com/csl-eth-demo/index.html opens all of
-mainnet's state, verifies the head and reads vitalik.eth on its own, then
-shows each read's requests and its proof node by node. A checkbox flips one
-byte of a fetched page to show the client refusing it. Nothing on it is
-simulated.
+## What is it?
 
-**Scope:** all of mainnet's state, current to the head, under `full/` in the
-bucket. A base at block 26,422,083 (432 M accounts, 1.69 G storage slots,
-344 GiB) carries layers of changed trie nodes that `csl-eth track` publishes
-block by block from a small spot VM with no node and no copy of the base: it
-fetches the changed nodes from mainnet peers over devp2p `snap/1`, reads
-them back, and publishes each block about 35 s after its slot starts (the
-attested tier) and each finalized checkpoint about 13 minutes later. The
-last 22,084 blocks before the base of transactions, receipts and logs sit
-beside it. The page is served from the same Cloud Storage bucket it reads.
+An experimental light client for Ethereum mainnet, running completely in the browser and utilizing object storage, removing the RPC dependency for access to the chain. Instead, we rely on static self-verifying files, a lightweight index algorithm, and any old file serving protocol (in this case object storage but could be anything, including a p2p network). The full demo light client is a 410kb wasm implementation that runs in the browser, and alongside there is a minimal 61kb version written in typescript.
 
-Before the full state, the PoC kept 1/4096 of the state (account-trie prefix
-`1a7`) fresh every epoch, fetched over devp2p `snap` with no node. That
-producer is stopped (2026-11-16) and its R2 bucket and Worker deleted
-(2026-11-17); its numbers below are kept for the record.
+## Why?
+
+I've been frustrated with the progress on light clients. Light clients are the end goal way for access to Ethereum. However, access is currently gated by an (paid) RPC dependency. All previous major light client proposals (LES, Portal) failed due to incentivization issues around who serves state.
+
+This project is aimed to give a alternative design that is cheaper and practical, utilizing modern database techniques and can be implemented today with no protocol changes. I am starting with the current state, but the techniques used can be applied to history as well to create archival nodes.
+
+## How? 
+
+Inspired by Open Table Formats (OTF) like Iceberg which create highly scalable databases on top of object stores, CSL utilizes a type of database index called a **Learned Index**, along with **self-validating files**, and a normal object store to create an OTF specifically for validating and serving Ethereum state.
+
+The **Learned Index**, in contrast to a classical tree-based index, is a small model of how the keys are spread across the pages, which makes it extremely lightweight compared to a tree-based index. Our learned index is about **2.7 MB** to index the entire Ethereum current state. An equivalent B-Tree index would be **2.8 GB** with full 32-byte keys, or around **700 MB** with 8 byte keys, a **250-1000x** difference. This is what allows the light client to be so small. The tradeoff is that it takes more requests to get the result, an acceptable tradeoff for the massive portability increase.
+
+The resulting light client is a ~1000 line file that can be written in any language. See skills/csl-eth-light-client/SKILL.md for an AI skill to make them, and browser/light/verify.ts for a simple typescript implementation.
 
 ## How a read is verified
 
-1. **Head.** `head/` holds the beacon light-client objects as files: a
-   bootstrap, one update per sync-committee period, and the latest finality
-   and optimistic updates. The client verifies them with
-   `helios-consensus-core` from one checkpoint root, requires 342 of 512
-   signatures, and ends with an execution block hash and state root.
+1. **Head.** `head/` holds the beacon light-client objects as files: a bootstrap, one update per sync-committee period, and the latest finality and optimistic updates. The client verifies them from one checkpoint root, requires 342 of 512 signatures, and ends with an execution block hash and state root.
 2. **Snapshot.** The snapshot's manifest must name that block and state root.
-3. **State.** The trie's own nodes are stored by position in sorted 4 KB
-   pages, with a small learned index that predicts a key's page. The client
-   fetches the path from the root in one speculative round and hashes it up to
-   the state root. Absence is proven by the trie's shape.
+3. **State.** The trie's own nodes are stored by position in sorted 4 KB pages, with a small learned index that predicts a key's page. The client fetches the path from the root in one speculative round and hashes it up to the state root. Absence is proven by the trie's shape.
 
-The bucket is never trusted. A wrong byte, a missing page or a snapshot for
-another block ends in a refusal or `Insufficient`, not a wrong answer. The
-trust inputs are the checkpoint root and an honest two thirds of the sync
-committee.
+## Trust Assumptions, Tradeoffs and Implications
 
-There are two tiers. **Attested** is the default: the committee signed the
-block as head, and it can still be reorged out (the page says so).
-**Finalized** (`?tier=finalized`) means Casper finalized it, about 13 minutes
-later. When the producer has one, the page also shows Ankr's fast-confirmation
-report as a named source's claim, which the client does not verify.
+The biggest trust assumption is that there needs to be a full node or some service that is propagating the latest block to the bucket. My prototype has a custom tracker service doing this rather than running a full node, however a full node would be the appropriate source.
+The learned index is orders of magnitude smaller in size than a tree-based index, but it instead has a bounded error (ε). The error is configurable, however what it means is a query for a specific piece of state requires multiple requests. This means more total data is requested, which means higher egress and stress on the network. However there are multiple optimizations like batching and caching that reduce the impact of this significantly. You can see this in the demo page, where each read query breaks down how many requests are made, how many total round trips, and how much data gets transferred.
 
-## Numbers
+----
 
-**Keeping it current** (`csl-eth track` on an e2-medium spot VM in the
-bucket's region, 2026-11-17; `docs/decisions.md` has the detail):
+## More detail
 
-- **Per block,** over 31 minutes at the head: all 162 blocks published, in
-  92 steps (59 of one block). Lag from the slot's start to the published
-  pointer: median 35 s, p90 46 s. Of that, the light client knows the
-  attested head 20 s after the slot starts; fetching and diffing the changed
-  nodes takes 9 to 15 s, reading them back 1.1 s (a sample, since; it was
-  3.6 s), uploading 1.1 s. No block was published within its own slot.
-- **Finalized:** each finalized checkpoint's block gets its own step, so
-  `head/finality` moved every epoch (five in a row in the window).
-- **Catch-up:** the first, 8,903 blocks (about 30 hours) from the base,
-  wrote 1.21 M changed accounts as 10.2 M trie nodes (2.45 GB of runs) and
-  uploaded 3.05 GB in 1,402 files. Its last attempt took 27 minutes (fetch 7,
-  materialize 7, build and read-back 9, upload 4); the bucket served the old
-  side by range, about $7 of reads.
-- **Reads over layers,** cold, against the base alone, eight layers: an
-  account 0.85× the requests, an absent account 1.9×, a slot of a contract
-  that changed recently 1.6× to 1.7×, a slot of USDT 1.5× (3.5× before
-  storage hints by contract and path), WETH 2.2× (path hints for owners
-  with 16 or more changed nodes, kept through merges for owners hot
-  lately; WETH's re-measure waits for the older merged layers to go). Most of what remains is
-  the since-base layer, which carries no hints (`docs/decisions.md`).
-- **Cost:** about $30 a month (the VM and its disks about $22, about
-  50,000 writes a day about $8), plus about $3.60 of bucket reads per day of
-  gap when it has to catch up.
+**What is trusted.** One beacon checkpoint and an honest two thirds of the
+sync committee. Everything else is checked: the head by signatures and
+Merkle branches, every trie node by its hash, and absence by the trie's
+shape. The bucket is never trusted; a wrong or missing byte ends in a
+refusal, never a wrong answer. Reads default to the latest signed head,
+which can be reorged out; `?tier=finalized` reads the last finalized block,
+about 13 minutes behind.
 
-The full state on Cloud Storage, cold, in headless Chromium from Taipei
-(2026-11-16, no VPN): the page loads, verifies the head and reads an account
-in 0.7 s. An account takes 3 to 5 rounds and about 80 KB (about 220 to
-260 ms), a storage slot 7 rounds (540 ms), an absent account 3 rounds
-(230 ms).
+**What is in the bucket.** All of mainnet's current state: a snapshot
+(432 M accounts, 1.69 B storage slots, about 350 GB) plus small update
+layers of changed trie nodes, merged over time so a read asks only a few.
 
-Earlier, the slice against Cloudflare R2, from Taipei through a VPN
-(2026-10-31 to 11-01, `results/m1.md`):
+**How it stays current.** A tracker follows the chain about 35 seconds
+behind without running a node. For each new head it asks mainnet peers for
+the trie nodes that changed, checks each by hash, and publishes them as a
+layer. It costs about $30 a month. A full node could publish the same
+layers as a side effect, which is the natural next step.
 
-- **Account:** 2.7 requests, 37 KB, one round (two when its index pages are
-  cold), 135 ms p50.
-- **Storage slot:** 10 requests, one round, 250 to 310 ms in the browser.
-- **By-hash baseline**, one round per trie node: 8.9 rounds and 1,162 ms p50
-  per account, against one round and 118 ms by path, uncached.
-- **Opening the head**, once per session: 13 requests in 4 rounds, 248 KB
-  (on loopback, 2026-11-03).
-- **Correctness:** zero false answers in 86,368 workload reads and 23 aimed
-  faults.
-
-The slice's freshness in production (fafo-0 publishing to R2, 258 cycles,
-2026-11-06 11:34 to 11-08 12:51 UTC):
-
-- **Snapshot age a reader sees**, averaged over time: median about 14
-  minutes, p90 39, p99 73, max 91.
-- **Cycles:** 200 of 258 published. 53 failed because no snap peer could be
-  found within 21 minutes, and 5 missed the attested update.
-- **Publish lag** of a successful cycle: 1.7 minutes after its block (median;
-  p90 7.5). Almost all of it is the fetch; building takes about 1 s and
-  publishing about 6 s.
-
-The lag comes from how this PoC gets state. It has no node, so every cycle
-fetches the slice again over devp2p `snap` from mainnet peers, which accept
-about one dial in a hundred. The verifiable floor is much lower: the
-optimistic update for a block arrived 15.5 s after it (median). An earlier
-five-cycle run on a laptop measured 1 to 11 minutes; production is the number
-above. Details in `docs/decisions.md`.
+**Copies are cheap.** One copy of the bucket costs about $3–15 a month to
+store and keep current, and any static host can serve one; see
+`docs/replication-cost.md`.
 
 ## Limits
 
-- **The base is one block, and the layers grow.** One burst
-  (`deploy/gcp/full-export.sh`: reth's snapshot, a sync, a 2.4 h export, a
-  2.4 h upload, about $7) published the base. The layer since the base grows
-  about 2.3 GB a day and carries no skip hints (it is too large), so every
-  read asks it, and it is now most of a read's extra cost (10 to 28 requests
-  for a slot). Folding it into a new base (a rebase, a burst) is not built.
-- **It depends on peers serving `snap/1`.** The tracker has no node: it
-  needs mainnet peers that answer `GetTrieNodes` at the head, which snap/2
-  removes. A restart used to take 2 to 26 minutes to find three such peers;
-  the peers that served are now kept on disk and dialed first, and a restart
-  has five within a minute. A step that
-  no peer can serve re-pivots to a newer head.
-- **History is recent.** `full/history/` covers the 22,084 blocks the node
-  kept (three days). Old headers cost a walk (6.4 MB for a transaction a day
-  back) until the beacon accumulator's files are published. History from
-  genesis is sized (about 4.9 TB, about $100 a month) but not run.
-- **HTTP/3 through a VPN.** Through Mullvad (Manila relay, 2026-11-16) the
-  page hung loading: Chrome's HTTP/3 to storage.googleapis.com stalled, first
-  because the tunnel's MTU (1,320) was below Google's QUIC packets, then, at
-  MTU 1,420, because bulk UDP through the relay crawled (600 KB from
-  Cloudflare in 13 to 18 s over HTTP/3, 0.08 s over TCP). Without the VPN the
-  page opens, verifies the head and reads an account in 0.7 s, all over
-  HTTP/3. Behind such a VPN, turning QUIC off in Chrome fixes it.
-- **The checkpoint.** The page's built-in root (slot 15,661,216, 2026-11-15)
-  ages out of the weak-subjectivity period around the end of November, but
-  a visitor moves past it. Once a period, the tracker publishes a newer
-  finalized root's bootstrap and a pointer, `head/checkpoint`. After each
-  open, the page adopts that root only if the open proved it finalized from
-  the root it held, then remembers it in localStorage (`docs/decisions.md`).
-  The tracker moves its own root the same way. A first visit still starts
-  from the built-in root. `?checkpoint=` pins a root and is never rotated.
-  The page accepts it and `?bucket=` from the URL without a warning.
-- **Gloas.** EIP-7732 removes the state root from the light-client header, so
-  after that fork the head verifier needs the execution header from another
-  source.
+- **The snapshot ages.** The layer since the snapshot grows about 2 GB a
+  day until it is folded into a new snapshot, which is not automated yet.
+- **The tracker depends on peers** that still serve `snap/1`
+  `GetTrieNodes`. A full node publishing layers would remove that.
+- **State only.** No contract calls (`eth_call`), only recent history, no
+  archive state, and no sending transactions.
+- **Checkpoints age out** after the weak-subjectivity period. The page and
+  the tracker each rotate theirs, adopting a newer one only after proving
+  it from the one they hold.
+- **Gloas** (EIP-7732) removes the state root from the light-client header,
+  so the head check will need another source for it after that fork.
 
 ## Build
 

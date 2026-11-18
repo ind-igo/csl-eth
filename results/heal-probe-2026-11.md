@@ -116,7 +116,7 @@ servable to 127.
 The heal time hardly depends on how much changed: the correlation of heal
 time with node count is 0.26. It is 18 dependent waves of about 0.36 s
 each, so it is bound by round trips. Requests take 254 ms (Geth) and
-260 ms (Nethermind) at p50 from Taiwan. Each wave also waits for its
+260 ms (Nethermind) at p50. Each wave also waits for its
 slowest request. Three changes would cut it, none of them tried here:
 
 - **No old side.** A real healer has the old trie, so it sends half the

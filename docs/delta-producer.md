@@ -145,7 +145,7 @@ On mainnet the hint sizes decide which tiers are hinted. A block changes about a
 
 **On mainnet, from the Mac (2026-11-16).**
 
-- **Base.** A fresh 1/4096 slice (prefix `1a7`, block 26,428,265: 105,262 accounts, 134,125 slots, 2,218 codes), fetched over 27 minutes from the one Nethermind peer the Mac reached through Mullvad.
+- **Base.** A fresh 1/4096 slice (prefix `1a7`, block 26,428,265: 105,262 accounts, 134,125 slots, 2,218 codes), fetched over 27 minutes from the one Nethermind peer reachable through a VPN.
 - **Run.** `csl-eth track --to-dir pub --steps 5` (then named `heal`) against live peers and the Lodestar light-client endpoints, verifying from the 2026-11-15 checkpoint.
 - **Steps.** The first closed the 122 blocks since the base in 0.9 s (47 nodes, 15 KiB, 9 waves). The next four followed the head block by block, 0.2 to 0.7 s each, publishing about 16 s after each block's timestamp, which is the attested update's own delay. One peer was enough at this size.
 - **Checks.** Each step read its changed accounts back through the client before publishing, and the fourth merged a tier.
