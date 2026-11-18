@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # Deploy the tracker to the GCP VM made by infra/alchemy.run.ts: rsync the
 # code to /opt/csl-eth, build the release binary there, install the systemd
-# unit and restart it onto the new binary. CSL_ETH_UNIT=csl-eth-producer
-# installs the old slice producer instead.
+# unit and restart it onto the new binary.
 #
 #   deploy/gcp/apply.sh
 #
 # SSH goes through Identity-Aware Proxy as your Google account (OS Login);
-# the first `gcloud compute ssh` registers your key. Never touches /data:
-# /data/produce is the producer's state.
+# the first `gcloud compute ssh` registers your key. Never touches /data,
+# the tracker's state.
 set -euo pipefail
 
 VM="${CSL_ETH_VM:-csl-eth-producer}"
