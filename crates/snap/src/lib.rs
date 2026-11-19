@@ -10,7 +10,9 @@
 //!
 //! The `csl-eth` binary drives it: `fetch` a prefix, `build` a bucket
 //! from a slice, `check` a bucket, `peers` to probe connectivity,
-//! `bal-probe` to ask testnet peers for block access lists ([`bal`]), and the
+//! `bal-probe` to ask testnet peers for block access lists ([`bal`]),
+//! `bal-replay` to reproduce a testnet's recent state roots from them
+//! ([`replay`]), and the
 //! milestone 1 exit tests: [`workload`] and [`faults`]; `track` keeps a
 //! published state at the verified head ([`track`]), uploading through
 //! [`publish`].
@@ -28,6 +30,7 @@ pub mod history;
 pub mod peer;
 pub mod publish;
 pub mod remote;
+pub mod replay;
 pub mod slice;
 pub mod workload;
 

@@ -176,6 +176,32 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         timeout_secs: u64,
     },
+    /// Reproduce recent testnet blocks' state roots from their block
+    /// access lists, with witness nodes from peers (snap/1
+    /// `GetTrieNodes`). One JSON line per block, then a summary.
+    BalReplay {
+        /// sepolia or hoodi.
+        #[arg(long, default_value = "sepolia")]
+        chain: String,
+        /// Blocks to replay.
+        #[arg(long, default_value_t = 64)]
+        blocks: u64,
+        /// Start this many blocks behind the head.
+        #[arg(long, default_value_t = 16)]
+        back: u64,
+        #[arg(long, default_value_t = 12)]
+        peers: usize,
+        #[arg(long, default_value_t = 30412)]
+        udp_port: u16,
+        #[arg(long)]
+        out: PathBuf,
+        /// Give up after this many seconds.
+        #[arg(long, default_value_t = 3600)]
+        max_secs: u64,
+        /// Remember peers that served here, and start from them next time.
+        #[arg(long)]
+        known: Option<PathBuf>,
+    },
     /// Measure state healing over snap/1 `GetTrieNodes`: each cycle diff
     /// the trie between two recent roots from peers, and ask each peer how
     /// old a root it still serves. JSON lines to `--out`.
@@ -572,6 +598,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             summary["chain"] = serde_json::json!(net.name());
             summary["dial_errors"] = serde_json::json!(probed.dial_errors);
             println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        Cmd::BalReplay {
+            chain,
+            blocks,
+            back,
+            peers,
+            udp_port,
+            out,
+            max_secs,
+            known,
+        } => {
+            let net = Net::parse(&chain)?;
+            if net == Net::Mainnet {
+                return Err("bal-replay: mainnet has no block access lists yet".into());
+            }
+            csl_eth_snap::replay::run(csl_eth_snap::replay::Config {
+                net,
+                blocks,
+                back,
+                peers,
+                udp_port,
+                out,
+                max_wall: Duration::from_secs(max_secs),
+                known,
+            })
+            .await?;
         }
         Cmd::HealProbe {
             out,

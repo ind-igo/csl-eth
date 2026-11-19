@@ -24,7 +24,7 @@
 
 use crate::{
     discovery,
-    peer::{self, Peer, PeerError},
+    peer::{self, Net, Peer, PeerError},
 };
 use alloy_consensus::Header;
 use alloy_primitives::{keccak256, Bytes, B256};
@@ -82,6 +82,11 @@ pub struct Config {
     /// Peers that served snap/1 nodes, kept across restarts and dialed
     /// before discovery's candidates (see [`Known`]). None: not kept.
     pub known: Option<PathBuf>,
+    /// The chain the pool's peers are on.
+    pub net: Net,
+    /// Offer `eth/71` (block access lists) where the chain does not by
+    /// default (mainnet), so [`Pool::access_lists`] can be served.
+    pub eth71: bool,
 }
 
 impl Default for Config {
@@ -104,6 +109,8 @@ impl Default for Config {
             known: None,
             per_block: false,
             out: PathBuf::from("heal-probe.jsonl"),
+            net: Net::Mainnet,
+            eth71: false,
         }
     }
 }
@@ -188,6 +195,10 @@ enum Job {
     Ages { roots: Vec<(u64, B256)>, reply: oneshot::Sender<()> },
     /// Bytecodes by hash: those the peer returned that hash to one asked.
     Codes { hashes: Vec<B256>, reply: oneshot::Sender<HashMap<B256, Bytes>> },
+    /// Headers from `hash` back, hash-linked.
+    HeadersBack { hash: B256, limit: u64, reply: oneshot::Sender<Option<Vec<Header>>> },
+    /// `eth/71` block access lists, raw and unchecked.
+    Lists { hashes: Vec<B256>, reply: oneshot::Sender<Option<Vec<Option<Bytes>>>> },
 }
 
 struct NodesDone {
@@ -199,6 +210,8 @@ struct NodesDone {
 #[derive(Clone)]
 struct Worker {
     id: PeerId,
+    /// The negotiated `eth` version.
+    eth: u8,
     tx: mpsc::Sender<Job>,
 }
 
@@ -309,7 +322,7 @@ async fn worker_task(mut peer: Peer, shared: Arc<Shared>, idle_tx: mpsc::Sender<
         return 0;
     }
     let (tx, mut rx) = mpsc::channel::<Job>(1);
-    let me = Worker { id, tx };
+    let me = Worker { id, eth: peer.eth_version(), tx };
     let mut served = 0u64;
     let mut empty_streak = 0u32;
     let reason: String = 'life: loop {
@@ -381,6 +394,22 @@ async fn worker_task(mut peer: Peer, shared: Arc<Shared>, idle_tx: mpsc::Sender<
                     break 'life "header failed".into();
                 }
             }
+            Job::HeadersBack { hash, limit, reply } => {
+                let r = peer.headers_back(hash, limit).await;
+                let failed = matches!(r, Err(ref e) if !matches!(e, PeerError::Timeout));
+                let _ = reply.send(r.ok());
+                if failed {
+                    break 'life "headers failed".into();
+                }
+            }
+            Job::Lists { hashes, reply } => {
+                let r = peer.block_access_lists(hashes).await;
+                let failed = matches!(r, Err(ref e) if !matches!(e, PeerError::Timeout | PeerError::Protocol(_)));
+                let _ = reply.send(r.ok());
+                if failed {
+                    break 'life "lists failed".into();
+                }
+            }
             Job::Codes { hashes, reply } => {
                 let want: HashSet<B256> = hashes.iter().copied().collect();
                 let r = peer.byte_codes(hashes, shared.cfg.bytes).await;
@@ -438,8 +467,9 @@ const KNOWN_RETRIES: u32 = 3;
 fn spawn_connector(shared: Arc<Shared>, idle_tx: mpsc::Sender<Worker>) {
     tokio::spawn(async move {
         let key = peer::random_key();
-        let (status, fork_filter) = peer::mainnet_status(None);
-        let mut candidates = discovery::start(key, shared.cfg.udp_port, fork_filter.clone(), true, true).await;
+        let net = shared.cfg.net;
+        let (status, fork_filter) = peer::status_on(net, None);
+        let mut candidates = discovery::start_on(net, key, shared.cfg.udp_port, fork_filter.clone(), true, true).await;
         let dials = Arc::new(tokio::sync::Semaphore::new(shared.cfg.dial_parallel));
         // Discovery hands out each node once, but full nodes evict peers
         // at random to free slots: one that served is dialed again later,
@@ -474,7 +504,7 @@ fn spawn_connector(shared: Arc<Shared>, idle_tx: mpsc::Sender<Worker>) {
             tokio::spawn(async move {
                 let _permit = permit;
                 shared.dialed.fetch_add(1, Ordering::Relaxed);
-                match Peer::connect_snap1(record, &key, status, fork_filter, shared.cfg.dial_timeout).await {
+                match Peer::connect_snap1_on(net, shared.cfg.eth71, record, &key, status, fork_filter, shared.cfg.dial_timeout).await {
                     Ok(mut peer) => {
                         shared.accepted.fetch_add(1, Ordering::Relaxed);
                         if shared.connected.fetch_add(1, Ordering::Relaxed) >= shared.cfg.peers {
@@ -666,6 +696,80 @@ impl Pool {
     /// Some peer's header at `number` (unchecked: the caller links it).
     pub async fn header(&mut self, number: u64) -> Option<Header> {
         self.header_at(number).await
+    }
+
+    /// An idle worker speaking at least `eth/<eth>`, waiting up to `wait`;
+    /// the others it passes stay idle.
+    async fn worker_with(&mut self, wait: Duration, eth: u8) -> Option<Worker> {
+        let until = Instant::now() + wait;
+        let mut other = Vec::new();
+        let found = loop {
+            let left = until.saturating_duration_since(Instant::now());
+            match self.worker(left).await {
+                Some(w) if w.eth >= eth => break Some(w),
+                Some(w) => other.push(w),
+                None => break None,
+            }
+        };
+        self.idle.extend(other);
+        found
+    }
+
+    /// `limit` headers from `hash` back, each the parent of the one
+    /// before (the first hashing to `hash`), from the first of three peers
+    /// that has them all.
+    pub async fn headers_back(&mut self, hash: B256, limit: u64) -> Option<Vec<Header>> {
+        for _ in 0..3 {
+            let w = self.worker(Duration::from_secs(30)).await?;
+            let (tx, rx) = oneshot::channel();
+            if w.tx.send(Job::HeadersBack { hash, limit, reply: tx }).await.is_err() {
+                continue;
+            }
+            if let Ok(Some(v)) = rx.await {
+                // The block asked for, then each one's parent.
+                let linked = v.first().is_some_and(|h| h.hash_slow() == hash)
+                    && v.windows(2).all(|w| w[0].parent_hash == w[1].hash_slow());
+                if v.len() as u64 == limit && linked {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
+    /// Block access lists from `eth/71` peers for `want` (block hash, the
+    /// header's `block_access_list_hash`): per block, the first list some
+    /// peer of up to four served that hashes to what its header commits
+    /// to. None when no `eth/71` peer is idle within `wait`.
+    pub async fn access_lists(&mut self, want: &[(B256, B256)], wait: Duration) -> Option<Vec<Option<Bytes>>> {
+        let mut out: Vec<Option<Bytes>> = vec![None; want.len()];
+        let mut asked = false;
+        for _ in 0..4 {
+            let left: Vec<usize> = (0..want.len()).filter(|&i| out[i].is_none()).collect();
+            if left.is_empty() {
+                break;
+            }
+            let Some(w) = self.worker_with(wait, 71).await else { break };
+            asked = true;
+            let (tx, rx) = oneshot::channel();
+            let hashes: Vec<B256> = left.iter().map(|&i| want[i].0).collect();
+            if w.tx.send(Job::Lists { hashes, reply: tx }).await.is_err() {
+                continue;
+            }
+            if let Ok(Some(v)) = rx.await {
+                for (j, b) in v.into_iter().enumerate().take(left.len()) {
+                    if let Some(b) = b.filter(|b| keccak256(b) == want[left[j]].1) {
+                        out[left[j]] = Some(b);
+                    }
+                }
+            }
+        }
+        asked.then_some(out)
+    }
+
+    /// The newest header some peer has (see [`Pool::head`]).
+    pub async fn head_header(&mut self) -> Option<Header> {
+        self.head().await
     }
 
     async fn header_at(&mut self, number: u64) -> Option<Header> {

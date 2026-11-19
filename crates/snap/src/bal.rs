@@ -7,19 +7,26 @@
 //! headers at fixed depths back toward the fork, asks for their access
 //! lists, and checks each list against its header's
 //! `block_access_list_hash` (keccak of the list's RLP) before decoding it.
+//!
+//! It also turns a checked list into post-state changes
+//! ([`block_changes`]) and applies one block of them to a state read on
+//! demand ([`try_block`], over `csl_eth_trie::update`), which the tracker
+//! (`track.rs`) and the Sepolia replay (`replay.rs`) share.
 
 use crate::{
     discovery,
+    heal::Need,
     peer::{self, Net, Peer},
 };
 use alloy_consensus::Header;
-use alloy_eip7928::bal::Bal;
+use alloy_eip7928::{bal::Bal, AccountChanges};
 use alloy_primitives::{keccak256, Bytes, B256};
 use alloy_rlp::Decodable;
+use csl_eth_trie::update::{Change, Load, World};
 use reth_ethereum_forks::{EthereumHardfork, EthereumHardforks};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -367,6 +374,112 @@ pub fn summarize(reports: &[Value]) -> Value {
         "storage_reads": dist(|s| s.3),
         "deepest_verified_depth": deepest_served,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Applying lists
+
+/// One block's post-state changes from its access list: each changed
+/// account's post-values by hashed address, and the new code by hash.
+/// Storage reads are left out (they change nothing); an account the list
+/// only read is too.
+#[derive(Clone, Debug, Default)]
+pub struct BlockChanges {
+    pub accounts: Vec<(B256, Change)>,
+    pub codes: HashMap<B256, Bytes>,
+}
+
+impl BlockChanges {
+    /// Slots written, over every account.
+    pub fn slots(&self) -> usize {
+        self.accounts.iter().map(|(_, c)| c.storage.len()).sum()
+    }
+}
+
+/// The post-block value of each field a list changed: the change with the
+/// highest block access index (lists are sorted, but this does not rely
+/// on it).
+pub fn block_changes(bal: &[AccountChanges]) -> BlockChanges {
+    let mut out = BlockChanges::default();
+    for a in bal {
+        let mut ch = Change {
+            nonce: a.nonce_changes.iter().max_by_key(|c| c.block_access_index).map(|c| c.new_nonce),
+            balance: a.balance_changes.iter().max_by_key(|c| c.block_access_index).map(|c| c.post_balance),
+            ..Default::default()
+        };
+        if let Some(c) = a.code_changes.iter().max_by_key(|c| c.block_access_index) {
+            let h = keccak256(&c.new_code);
+            ch.code_hash = Some(h);
+            if !c.new_code.is_empty() {
+                out.codes.insert(h, c.new_code.clone());
+            }
+        }
+        for sc in &a.storage_changes {
+            if let Some(c) = sc.changes.iter().max_by_key(|c| c.block_access_index) {
+                ch.storage.push((keccak256(sc.slot.to_be_bytes::<32>()), c.new_value));
+            }
+        }
+        if !ch.is_empty() {
+            out.accounts.push((keccak256(a.address), ch));
+        }
+    }
+    out
+}
+
+/// A list checked against its header: `block_access_list_hash` must be the
+/// keccak of the raw bytes, and they must decode.
+pub fn checked_list(h: &Header, raw: &[u8]) -> Result<Bal, String> {
+    match h.block_access_list_hash {
+        None => return Err(format!("block {} has no block_access_list_hash", h.number)),
+        Some(want) if keccak256(raw) != want => return Err(format!("block {}: list does not match its header", h.number)),
+        Some(_) => {}
+    }
+    Bal::decode(&mut &raw[..]).map_err(|e| format!("block {}: list: {e}", h.number))
+}
+
+/// A [`Load`] that keeps what it lacked, for the caller to fetch.
+pub trait Witness: Load {
+    /// The nodes asked for and not had since the last call.
+    fn take_missing(&mut self) -> Vec<Need>;
+}
+
+/// Apply block `b` to `world` if every node of the held state it needs can
+/// be loaded. Otherwise `world` keeps the state it had (with more of it
+/// read), and the nodes missing come back for the caller to fetch before
+/// trying again.
+pub fn try_block<W: Witness>(world: &mut World, b: &BlockChanges, ld: &mut W) -> Result<(), Vec<Need>> {
+    for (h, ch) in &b.accounts {
+        world.read(*h, ch, ld);
+    }
+    let missing = dedup(ld.take_missing());
+    if !missing.is_empty() {
+        return Err(missing);
+    }
+    // A deletion may collapse a branch into a sibling not yet read.
+    let before = world.clone();
+    for (h, ch) in &b.accounts {
+        world.apply(*h, ch, ld);
+    }
+    let missing = dedup(ld.take_missing());
+    if !missing.is_empty() {
+        *world = before;
+        return Err(missing);
+    }
+    Ok(())
+}
+
+/// Apply block `b` whatever is missing: what could not be read is lost
+/// (its new nodes and every ancestor's are not computed).
+pub fn force_block<W: Witness>(world: &mut World, b: &BlockChanges, ld: &mut W) {
+    for (h, ch) in &b.accounts {
+        world.apply(*h, ch, ld);
+    }
+    ld.take_missing();
+}
+
+fn dedup(v: Vec<Need>) -> Vec<Need> {
+    let mut seen = HashSet::new();
+    v.into_iter().filter(|n| seen.insert(n.hash)).collect()
 }
 
 #[cfg(test)]

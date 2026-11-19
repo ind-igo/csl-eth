@@ -28,6 +28,7 @@
 //! a reader asks a bounded number of runs.
 
 use crate::{
+    bal::{block_changes, checked_list, force_block, try_block, BlockChanges, Witness},
     heal::{self, shape, Fetch, Group, Need, Pool, Ref, Shape},
     publish::{Program, Publish},
 };
@@ -48,7 +49,11 @@ use csl_eth_store::{
     CODE_BLOB_THRESHOLD, EPSILON, LATEST_FILE, RUN_FORMAT, SORT_ACCOUNT, SORT_STORAGE,
     TABLE_ACCOUNT_NODES, TABLE_CODE, TABLE_STORAGE_NODES,
 };
-use csl_eth_trie::{decode_word, Account, Nibbles, NodeKey, EMPTY_ROOT, KECCAK_EMPTY};
+use csl_eth_trie::{
+    decode_word,
+    update::{Load, World},
+    Account, Nibbles, NodeKey, EMPTY_ROOT, KECCAK_EMPTY,
+};
 use csl_run::Reader;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -359,6 +364,306 @@ impl Source for Pool {
     async fn codes(&mut self, hashes: &[B256], deadline: Instant) -> HashMap<B256, Bytes> {
         Pool::codes(self, hashes, 4, deadline).await
     }
+}
+
+// ---------------------------------------------------------------------------
+// New nodes from block access lists (EIP-7928)
+
+/// A step's new nodes computed locally from block access lists: each
+/// block's post-state changes applied in order over the held state. Nodes
+/// are by hash, so a need is answered whatever its position; the walk
+/// still checks each one against its parent's reference, so a wrong or
+/// partial computation costs a fetch from peers, never a wrong layer.
+#[derive(Default)]
+pub struct Local {
+    /// The root the lists lead to (the step's target).
+    pub root: B256,
+    pub nodes: HashMap<B256, Bytes>,
+    pub codes: HashMap<B256, Bytes>,
+}
+
+/// A [`Source`] that answers from `local` what it holds for the step's
+/// target root and asks `inner` (peers) for the rest. With no local nodes
+/// it is `inner`.
+pub struct WithLocal<'a, S> {
+    pub local: Option<&'a Local>,
+    pub inner: &'a mut S,
+    /// Nodes and codes answered locally, and needs passed on.
+    pub nodes: u64,
+    pub codes: u64,
+    pub passed: u64,
+}
+
+impl<'a, S> WithLocal<'a, S> {
+    pub fn new(local: Option<&'a Local>, inner: &'a mut S) -> Self {
+        WithLocal {
+            local,
+            inner,
+            nodes: 0,
+            codes: 0,
+            passed: 0,
+        }
+    }
+}
+
+impl<S: Source> Source for WithLocal<'_, S> {
+    async fn nodes(
+        &mut self,
+        root: B256,
+        needs: &[Need],
+        deadline: Instant,
+    ) -> HashMap<usize, Bytes> {
+        let local = self.local.filter(|l| l.root == root);
+        let mut out = HashMap::new();
+        let mut rest = Vec::new();
+        let mut at = Vec::new();
+        for (i, n) in needs.iter().enumerate() {
+            match local.and_then(|l| l.nodes.get(&n.hash)) {
+                Some(b) if keccak256(b) == n.hash => {
+                    out.insert(i, b.clone());
+                }
+                _ => {
+                    at.push(i);
+                    rest.push(n.clone());
+                }
+            }
+        }
+        self.nodes += out.len() as u64;
+        if !rest.is_empty() {
+            self.passed += rest.len() as u64;
+            for (j, b) in self.inner.nodes(root, &rest, deadline).await {
+                out.insert(at[j], b);
+            }
+        }
+        out
+    }
+
+    async fn codes(&mut self, hashes: &[B256], deadline: Instant) -> HashMap<B256, Bytes> {
+        let mut out = HashMap::new();
+        let mut rest = Vec::new();
+        for h in hashes {
+            match self.local.and_then(|l| l.codes.get(h)) {
+                Some(c) if keccak256(c) == *h => {
+                    out.insert(*h, c.clone());
+                }
+                _ => rest.push(*h),
+            }
+        }
+        self.codes += out.len() as u64;
+        if !rest.is_empty() {
+            self.passed += rest.len() as u64;
+            out.extend(self.inner.codes(&rest, deadline).await);
+        }
+        out
+    }
+}
+
+/// The held state as an update reads it: nodes fetched for this step,
+/// then the local runs by position. Outside a slice's prefix nothing is
+/// held or asked for (those accounts' changes are lost, and so is every
+/// node above them).
+struct HeldLoad<'a> {
+    store: &'a mut Store,
+    db: &'a NodeDb,
+    prefix: Option<&'a Nibbles>,
+    missing: Vec<Need>,
+}
+
+impl Load for HeldLoad<'_> {
+    fn load(&mut self, owner: Option<B256>, path: &Nibbles, hash: &B256) -> Option<Vec<u8>> {
+        if !compatible(self.prefix, &owner, path) {
+            return None;
+        }
+        if let Ok(Some(b)) = self.db.get(hash) {
+            return Some(b.to_vec());
+        }
+        match self.store.node(owner, path, hash) {
+            Ok(Some(b)) => Some(b.to_vec()),
+            _ => {
+                self.missing.push(Need {
+                    owner,
+                    path: *path,
+                    hash: *hash,
+                });
+                None
+            }
+        }
+    }
+}
+
+impl Witness for HeldLoad<'_> {
+    fn take_missing(&mut self) -> Vec<Need> {
+        std::mem::take(&mut self.missing)
+    }
+}
+
+/// Rounds of old-node fetches per block before what is still missing is
+/// left lost.
+const LOCAL_ROUNDS: usize = 32;
+
+/// Apply `blocks` (each block's changes, and the state root its header
+/// names) in order over the held state at `old_root`, and keep every node
+/// they write. Old nodes the local runs lack come from `old` (peers at the
+/// old root through `src`, then the bucket) when the tracker has no local
+/// base; without one, or when they are not served, that part of the
+/// update is lost and the walk fetches it from peers instead. A block
+/// whose computed root differs from its header's discards the lot.
+#[allow(clippy::too_many_arguments)]
+pub async fn local_step<S: Source>(
+    src: &mut S,
+    store: &mut Store,
+    db: &mut NodeDb,
+    prefix: Option<&Nibbles>,
+    old: &mut OldSide<'_>,
+    old_root: B256,
+    blocks: &[(B256, BlockChanges)],
+    deadline: Instant,
+) -> Result<(Local, Value), String> {
+    let t = Instant::now();
+    let mut world = World::new(old_root);
+    let mut codes = HashMap::new();
+    let (mut fetched, mut lost_blocks, mut rounds) = (0u64, 0u64, 0usize);
+    for (want, b) in blocks {
+        codes.extend(b.codes.iter().map(|(h, c)| (*h, c.clone())));
+        let mut round = 0;
+        loop {
+            let r = {
+                let mut ld = HeldLoad {
+                    store,
+                    db,
+                    prefix,
+                    missing: Vec::new(),
+                };
+                try_block(&mut world, b, &mut ld)
+            };
+            let Err(needs) = r else { break };
+            round += 1;
+            let mut got: HashMap<usize, Bytes> = HashMap::new();
+            if old.any() && round <= LOCAL_ROUNDS && Instant::now() < deadline {
+                if old.peers {
+                    got = src.nodes(old_root, &needs, deadline).await;
+                }
+                if let Some(rb) = old.remote.as_mut() {
+                    let rest: Vec<usize> =
+                        (0..needs.len()).filter(|i| !got.contains_key(i)).collect();
+                    if !rest.is_empty() {
+                        let sub: Vec<Need> = rest.iter().map(|&i| needs[i].clone()).collect();
+                        for (j, b) in rb.nodes(&sub).await? {
+                            got.insert(rest[j], b);
+                        }
+                    }
+                }
+            }
+            let mut put = 0;
+            for (i, b) in got {
+                if db.put(needs[i].hash, &b)? {
+                    put += 1;
+                }
+            }
+            fetched += put;
+            if put == 0 {
+                let mut ld = HeldLoad {
+                    store,
+                    db,
+                    prefix,
+                    missing: Vec::new(),
+                };
+                force_block(&mut world, b, &mut ld);
+                break;
+            }
+        }
+        rounds = rounds.max(round);
+        match world.root() {
+            Some(r) if r != *want => {
+                return Err(format!("computed root {r} is not the header's {want}"))
+            }
+            Some(_) => {}
+            None => lost_blocks += 1,
+        }
+    }
+    db.flush()?;
+    let root = blocks.last().map_or(old_root, |b| b.0);
+    let nodes = world.written();
+    let v = json!({
+        "used": true, "blocks": blocks.len(), "nodes": nodes.len(), "codes": codes.len(),
+        "accounts": blocks.iter().map(|b| b.1.accounts.len()).sum::<usize>(),
+        "slots": blocks.iter().map(|b| b.1.slots()).sum::<usize>(),
+        "old_fetched": fetched, "rounds": rounds, "lost_blocks": lost_blocks,
+        "secs": t.elapsed().as_secs_f64(),
+    });
+    Ok((Local { root, nodes, codes }, v))
+}
+
+/// The changes of every block from the held head (exclusive) to `target`,
+/// in order, each list checked against its header and the headers
+/// hash-linked from the target back to the held head. An error says why
+/// the step goes to peers instead: before the fork (asked of no peer), a
+/// gap past `max`, a target not descended from the held head (a reorg:
+/// lists hold post-values only, so nothing is undone), or a list nobody
+/// served.
+async fn bal_blocks(
+    pool: &mut Pool,
+    cache: &mut HashMap<B256, BlockChanges>,
+    held: &HeadRec,
+    target: &ExecutionHead,
+    max: u64,
+) -> Result<Vec<(B256, BlockChanges)>, String> {
+    use reth_ethereum_forks::EthereumHardforks;
+    if !crate::peer::Net::Mainnet
+        .spec()
+        .is_amsterdam_active_at_timestamp(target.timestamp)
+    {
+        return Err("before the access-list fork".into());
+    }
+    let n = target.block_number.saturating_sub(held.block_number);
+    if n == 0 || n > max {
+        return Err(format!("{n} blocks (at most {max})"));
+    }
+    let mut headers = pool
+        .headers_back(target.block_hash, n)
+        .await
+        .ok_or("no peer gave the headers")?;
+    if headers[0].state_root != target.state_root
+        || headers[headers.len() - 1].parent_hash != held.block_hash
+    {
+        return Err("the target does not descend from the held head".into());
+    }
+    headers.reverse();
+    let mut want = Vec::new();
+    let mut hashes = Vec::new();
+    for h in &headers {
+        let bh = h
+            .block_access_list_hash
+            .ok_or_else(|| format!("block {} has no block_access_list_hash", h.number))?;
+        let hash = h.hash_slow();
+        hashes.push(hash);
+        if !cache.contains_key(&hash) {
+            want.push((hash, bh));
+        }
+    }
+    if !want.is_empty() {
+        let got = pool
+            .access_lists(&want, Duration::from_secs(10))
+            .await
+            .ok_or("no eth/71 peer")?;
+        for ((hash, _), raw) in want.iter().zip(got) {
+            let raw = raw.ok_or_else(|| format!("no peer served the list of {hash}"))?;
+            let h = headers
+                .iter()
+                .find(|h| h.hash_slow() == *hash)
+                .expect("asked for");
+            let list = checked_list(h, &raw)?;
+            if cache.len() > 4096 {
+                cache.clear();
+            }
+            cache.insert(*hash, block_changes(&list));
+        }
+    }
+    Ok(headers
+        .iter()
+        .zip(&hashes)
+        .map(|(h, hash)| (h.state_root, cache[hash].clone()))
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -2276,6 +2581,17 @@ pub struct Args {
     /// 5 s of a 16 s step at the head, a third of the time to publish).
     #[arg(long, default_value_t = 256)]
     pub verify_accounts: usize,
+    /// Compute each step's new nodes locally from block access lists
+    /// (EIP-7928, over `eth/71`, which peers are then offered) and ask
+    /// peers only for what that leaves out. Inert before the fork that
+    /// brings the lists (no request is made), and a step whose headers or
+    /// lists are not served, or that does not descend from the held head,
+    /// goes to peers as without it.
+    #[arg(long)]
+    pub bal: bool,
+    /// Steps over more blocks than this go to peers.
+    #[arg(long, default_value_t = 64)]
+    pub bal_max_blocks: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3110,9 +3426,12 @@ pub async fn run(args: Args) -> Result<(), String> {
         udp_port: args.udp_port,
         out: args.work.join("peers.jsonl"),
         known: Some(args.work.join("known-peers.json")),
+        eth71: args.bal,
         ..heal::Config::default()
     };
     let mut pool = Pool::start(&peer_cfg).map_err(|e| e.to_string())?;
+    // Verified access lists by block hash, kept across re-pivots.
+    let mut lists: HashMap<B256, BlockChanges> = HashMap::new();
     // Fetched nodes, against the held state: kept across re-pivots and
     // restarts, emptied when a step commits.
     let mut db = NodeDb::open(&args.work.join("nodes"), h.st.head.state_root)?;
@@ -3257,8 +3576,46 @@ pub async fn run(args: Args) -> Result<(), String> {
         let t0 = Instant::now();
         let from = h.st.head.block_number;
         let held_before = db.len();
+        // The held head is in the peers' window (with a minute to spare):
+        // ask them for the old side first.
+        let old_peers = remote.is_some() && window_secs(h.st.head.timestamp) >= 60;
+        let mut bal = Value::Null;
+        let local = if args.bal {
+            let r = match bal_blocks(&mut pool, &mut lists, &h.st.head, &target, args.bal_max_blocks).await {
+                Ok(blocks) => {
+                    local_step(
+                        &mut pool,
+                        &mut h.store,
+                        &mut db,
+                        h.prefix.as_ref(),
+                        &mut OldSide {
+                            peers: old_peers,
+                            remote: remote.as_mut(),
+                        },
+                        h.st.head.state_root,
+                        &blocks,
+                        deadline,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            };
+            match r {
+                Ok((l, v)) => {
+                    bal = v;
+                    Some(l)
+                }
+                Err(e) => {
+                    bal = json!({"used": false, "why": e});
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut src = WithLocal::new(local.as_ref(), &mut pool);
         let r = track_step(
-            &mut pool,
+            &mut src,
             &mut h.store,
             &mut db,
             h.st.head.state_root,
@@ -3270,13 +3627,14 @@ pub async fn run(args: Args) -> Result<(), String> {
             args.sort_mib << 20,
             roots.as_mut(),
             OldSide {
-                // The held head is in the peers' window (with a minute to
-                // spare): ask them for the old side first.
-                peers: remote.is_some() && window_secs(h.st.head.timestamp) >= 60,
+                peers: old_peers,
                 remote: remote.as_mut(),
             },
         )
         .await;
+        if args.bal {
+            bal["served"] = json!({"nodes": src.nodes, "codes": src.codes, "passed": src.passed});
+        }
         let step_s = t0.elapsed().as_secs_f64();
         let lag = |t: u64| {
             SystemTime::now()
@@ -3291,7 +3649,7 @@ pub async fn run(args: Args) -> Result<(), String> {
                 h.log.emit(json!({
                     "ev": "repivot", "attempt": attempt, "from": from, "to": target.block_number, "error": e.to_string(),
                     "step_s": step_s, "held": db.len(), "held_before": held_before, "complete": db.done_len(),
-                    "log_bytes": db.log_bytes(), "peers": pool.connected(),
+                    "log_bytes": db.log_bytes(), "peers": pool.connected(), "bal": bal,
                 }));
                 if let StepError::Store(_) | StepError::TooDeep = e {
                     return Err(e.to_string());
@@ -3326,6 +3684,7 @@ pub async fn run(args: Args) -> Result<(), String> {
                             "blocks": target.block_number - from, "block_hash": target.block_hash, "state_root": target.state_root,
                             "step_s": step_s, "lag_s": lag(target.timestamp), "peers": pool.connected(),
                             "head_lag_s": vh.lag_secs, "participants": vh.participants, "stats": tracked.stats, "commit": v,
+                            "bal": bal,
                         }));
                     }
                     Err(e) => {
@@ -4426,6 +4785,306 @@ mod tests {
         byte_identical(&gap, &m, &s[2], &heads[2]);
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&gap).ok();
+    }
+
+    /// A block's access list as the state diff `a` → `b` gives it: every
+    /// account whose leaf changed with the fields that did, a deleted one
+    /// emptied (nonce, balance and code cleared, every slot zeroed), a new
+    /// one's code. Plus what a real list also carries: an account touched
+    /// with nothing changed, one written with its current values, and one
+    /// created and destroyed in the block (EIP-6780).
+    fn changes(a: &State, b: &State, rng: &mut ChaCha8Rng) -> BlockChanges {
+        use csl_eth_trie::update::Change;
+        let mut out = BlockChanges {
+            accounts: Vec::new(),
+            codes: HashMap::new(),
+        };
+        for k in a.keys().chain(b.keys()).collect::<BTreeSet<_>>() {
+            let (old, new) = (a.get(k), b.get(k));
+            if old == new {
+                continue;
+            }
+            let mut ch = Change::default();
+            match new {
+                None => {
+                    let old = old.unwrap();
+                    ch.nonce = Some(0);
+                    ch.balance = Some(U256::ZERO);
+                    ch.code_hash = Some(KECCAK_EMPTY);
+                    ch.storage = old.storage.keys().map(|s| (*s, U256::ZERO)).collect();
+                }
+                Some(n) => {
+                    let o = old.map(account_of);
+                    let na = account_of(n);
+                    if o.is_none() {
+                        ch.nonce = Some(1);
+                    }
+                    if o.as_ref().map(|o| o.balance) != Some(na.balance) {
+                        ch.balance = Some(na.balance);
+                    }
+                    if o.as_ref().map(|o| o.code_hash) != Some(na.code_hash) {
+                        ch.code_hash = Some(na.code_hash);
+                        if let Some(c) = &n.code {
+                            out.codes.insert(na.code_hash, Bytes::from(c.clone()));
+                        }
+                    }
+                    let empty = BTreeMap::new();
+                    let os = old.map_or(&empty, |o| &o.storage);
+                    for s in os.keys().chain(n.storage.keys()).collect::<BTreeSet<_>>() {
+                        let v = n.storage.get(s).copied().unwrap_or(U256::ZERO);
+                        if os.get(s).copied().unwrap_or(U256::ZERO) != v {
+                            ch.storage.push((*s, v));
+                        }
+                    }
+                }
+            }
+            out.accounts.push((*k, ch));
+        }
+        let (k, x) = b.iter().next().unwrap();
+        out.accounts.push((*k, Change::default()));
+        out.accounts.push((
+            *k,
+            Change {
+                balance: Some(x.balance),
+                ..Change::default()
+            },
+        ));
+        out.accounts.push((
+            key(rng),
+            Change {
+                nonce: Some(0),
+                balance: Some(U256::ZERO),
+                code_hash: Some(KECCAK_EMPTY),
+                storage: vec![(key(rng), U256::ZERO)],
+            },
+        ));
+        out
+    }
+
+    /// No peers: every ask comes back empty.
+    #[derive(Default)]
+    struct NoPeers {
+        asked: usize,
+    }
+
+    impl Source for NoPeers {
+        async fn nodes(&mut self, _: B256, needs: &[Need], _: Instant) -> HashMap<usize, Bytes> {
+            self.asked += needs.len();
+            HashMap::new()
+        }
+        async fn codes(&mut self, hashes: &[B256], _: Instant) -> HashMap<B256, Bytes> {
+            self.asked += hashes.len();
+            HashMap::new()
+        }
+    }
+
+    /// Every file under `dir` but the node log and the sorter's scratch,
+    /// by path.
+    fn published(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for e in fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                let rel = p.strip_prefix(dir).unwrap().to_path_buf();
+                if rel.starts_with("nodes") || rel.starts_with("sort") {
+                    continue;
+                }
+                if p.is_dir() {
+                    todo.push(p);
+                } else {
+                    out.insert(rel, fs::read(&p).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    /// The access-list step with peers gone publishes exactly what the
+    /// peer-driven step publishes: step by step (S0 → S1 → S2, with the
+    /// deletion and recreation, branch collapse, extension split,
+    /// hashed/embedded transitions and shared storage roots of
+    /// [`states`]), and across a gap of two blocks applied in order.
+    #[tokio::test]
+    async fn an_access_list_step_publishes_what_peers_give() {
+        let s = states();
+        let heads: Vec<Head> = s
+            .iter()
+            .enumerate()
+            .map(|(i, x)| head_of(x, i as u64))
+            .collect();
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
+        let lists: Vec<BlockChanges> = (1..s.len())
+            .map(|i| changes(&s[i - 1], &s[i], &mut rng))
+            .collect();
+        let open = |name: &str| {
+            let dir = scratch(name);
+            let base = produce(&dir, &heads[0], "", leaves(&s[0]), &code_of(&s[0]))
+                .unwrap()
+                .manifest;
+            let store = Store::open(&dir, &base).unwrap();
+            let db = NodeDb::open(&dir.join("nodes"), heads[0].state_root).unwrap();
+            (dir, base, store, db)
+        };
+        // Step by step, then the gap S0 → S2.
+        for gap in [false, true] {
+            let tag = if gap { "gap" } else { "steps" };
+            let (pd, pbase, mut pstore, mut pdb) = open(&format!("bal-peers-{tag}"));
+            let (bd, bbase, mut bstore, mut bdb) = open(&format!("bal-local-{tag}"));
+            let (mut pl, mut bl) = (Vec::new(), Vec::new());
+            let walk: Vec<(usize, usize)> = if gap { vec![(0, 2)] } else { vec![(0, 1), (1, 2)] };
+            for (from, to) in walk {
+                let mut mem = Mem::of(&s[to], &heads[to]);
+                let mut ph = step(
+                    &mut mem,
+                    &mut pstore,
+                    &mut pdb,
+                    &heads[from],
+                    &heads[to],
+                    &pd,
+                    64 << 20,
+                )
+                .await
+                .unwrap();
+                let blocks: Vec<(B256, BlockChanges)> = (from + 1..=to)
+                    .map(|i| (heads[i].state_root, lists[i - 1].clone()))
+                    .collect();
+                let mut none = NoPeers::default();
+                let (local, v) = local_step(
+                    &mut none,
+                    &mut bstore,
+                    &mut bdb,
+                    None,
+                    &mut OldSide::default(),
+                    heads[from].state_root,
+                    &blocks,
+                    far(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(local.root, heads[to].state_root);
+                assert_eq!(v["lost_blocks"], json!(0), "{v}");
+                let mut src = WithLocal::new(Some(&local), &mut none);
+                let mut bh = track_step(
+                    &mut src,
+                    &mut bstore,
+                    &mut bdb,
+                    heads[from].state_root,
+                    heads[to].state_root,
+                    None,
+                    10_000,
+                    far(),
+                    &bd.join("sort"),
+                    64 << 20,
+                    None,
+                    OldSide::default(),
+                )
+                .await
+                .unwrap();
+                let (served, passed) = (src.nodes, src.passed);
+                assert!(served > 0);
+                assert_eq!(passed, 0, "every need answered from the lists");
+                assert_eq!(none.asked, 0);
+                eprintln!("{tag} {from}->{to}: {v} served {served}");
+                assert_eq!(bh.rows.collect(), ph.rows.collect(), "{tag} {from}->{to}");
+                assert_eq!(bh.accounts, ph.accounts);
+                assert_eq!(bh.new_tries, ph.new_tries);
+                let m;
+                (pstore, _) = commit(&pd, &pbase, &mut pl, &heads[from], &heads[to], &mut ph, 4, 3);
+                (bstore, m) = commit(&bd, &bbase, &mut bl, &heads[from], &heads[to], &mut bh, 4, 3);
+                pdb.reset(heads[to].state_root).unwrap();
+                bdb.reset(heads[to].state_root).unwrap();
+                let (pf, bf) = (published(&pd), published(&bd));
+                assert_eq!(
+                    pf.keys().collect::<Vec<_>>(),
+                    bf.keys().collect::<Vec<_>>()
+                );
+                for (k, v) in &pf {
+                    assert!(bf[k] == *v, "{tag}: {} differs", k.display());
+                }
+                byte_identical(&bd, &m, &s[to], &heads[to]);
+            }
+            fs::remove_dir_all(&pd).ok();
+            fs::remove_dir_all(&bd).ok();
+        }
+    }
+
+    /// A list whose result is not the header's root is refused whole, and
+    /// held nodes the update needs but cannot read lose only what is above
+    /// them: the step then falls to peers for those, and still publishes
+    /// the same.
+    #[tokio::test]
+    async fn a_wrong_or_partial_access_list_falls_back_to_peers() {
+        let s = states();
+        let heads: Vec<Head> = s
+            .iter()
+            .enumerate()
+            .map(|(i, x)| head_of(x, i as u64))
+            .collect();
+        let mut rng = ChaCha8Rng::seed_from_u64(12);
+        let dir = scratch("bal-partial");
+        let base = produce(&dir, &heads[0], "", leaves(&s[0]), &code_of(&s[0]))
+            .unwrap()
+            .manifest;
+        let mut store = Store::open(&dir, &base).unwrap();
+        let mut db = NodeDb::open(&dir.join("nodes"), heads[0].state_root).unwrap();
+        let list = changes(&s[0], &s[1], &mut rng);
+        // Wrong: one balance off.
+        let mut wrong = list.clone();
+        let c = wrong.accounts.iter_mut().find(|a| a.1.balance.is_some()).unwrap();
+        c.1.balance = Some(c.1.balance.unwrap() + U256::from(1u64));
+        let mut none = NoPeers::default();
+        let r = local_step(
+            &mut none,
+            &mut store,
+            &mut db,
+            None,
+            &mut OldSide::default(),
+            heads[0].state_root,
+            &[(heads[1].state_root, wrong)],
+            far(),
+        )
+        .await;
+        assert!(r.is_err());
+        // Partial: an account outside a slice's prefix cannot be read, so
+        // its path up to the root is lost and those nodes come from peers.
+        let prefix = Nibbles::from_nibbles([path_of(&list.accounts[0].0).get(0).unwrap()]);
+        let (local, v) = local_step(
+            &mut none,
+            &mut store,
+            &mut db,
+            Some(&prefix),
+            &mut OldSide::default(),
+            heads[0].state_root,
+            &[(heads[1].state_root, list.clone())],
+            far(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v["lost_blocks"], json!(1), "{v}");
+        let mut mem = Mem::of(&s[1], &heads[1]);
+        let mut src = WithLocal::new(Some(&local), &mut mem);
+        let mut h = track_step(
+            &mut src,
+            &mut store,
+            &mut db,
+            heads[0].state_root,
+            heads[1].state_root,
+            None,
+            10_000,
+            far(),
+            &dir.join("sort"),
+            64 << 20,
+            None,
+            OldSide::default(),
+        )
+        .await
+        .unwrap();
+        assert!(src.nodes > 0 && src.passed > 0, "{} {}", src.nodes, src.passed);
+        let mut layers = Vec::new();
+        let (_, m) = commit(&dir, &base, &mut layers, &heads[0], &heads[1], &mut h, 4, 3);
+        byte_identical(&dir, &m, &s[1], &heads[1]);
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
