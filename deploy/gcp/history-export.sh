@@ -25,6 +25,11 @@
 # period) and 0.3 TB of scratch for tx_lookup; about 8 to 12 hours, the
 # export and the upload of the bytes about equal; hence 9 TB of disk, and 48
 # hours as a ceiling.
+#
+# The VM is infra/burst.run.ts's stage "history": this script makes it with
+# `bun run burst:up --stage history` and deletes it with `burst:down`, so
+# nothing here creates or deletes infrastructure itself (gcloud is used for
+# SSH through IAP and the bucket's objects only).
 set -euo pipefail
 
 PROJECT="${CSL_ETH_PROJECT:-csl-eth}"
@@ -32,11 +37,10 @@ env_file="$(cd "$(dirname "$0")/../.." && pwd)/infra/.env"
 [ -f "$env_file" ] && . "$env_file"   # CSL_ETH_REGION (gitignored)
 ZONE="${CSL_ETH_ZONE:-${CSL_ETH_REGION:+$CSL_ETH_REGION-b}}"
 : "${ZONE:?set CSL_ETH_REGION in infra/.env, or CSL_ETH_ZONE}"
-VM="${CSL_ETH_HISTORY_VM:-csl-eth-history}"
+VM=csl-eth-history # the name infra/burst.run.ts gives the "history" stage's VM
 BUCKET="${CSL_ETH_GCS_BUCKET:-csl-eth-demo}"
 CHECKPOINT="${CSL_ETH_CHECKPOINT:-0x431b33af8452e2d644377405e69d4f382182ab906f31461190ca24cb3401d70b}"
-SSDS="${CSL_ETH_HISTORY_SSDS:-24}" # 375 GB each; n2-highmem-8 takes 1, 2, 4, 8, 16 or 24
-SA="csl-eth-producer@${PROJECT}.iam.gserviceaccount.com"
+export CSL_ETH_HISTORY_SSDS="${CSL_ETH_HISTORY_SSDS:-24}" # 375 GB each; read by infra/burst.run.ts
 cd "$(dirname "$0")/../.."
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -51,42 +55,18 @@ gcloud storage cp -r "gs://$BUCKET/head/updates" "$work/head/head/" >/dev/null 2
 read -r hash number < <(python3 -c "import json,sys;d=json.load(open('$work/head.json'));print(d['block_hash'],d['block_number'])")
 log "target: blocks 0 to $number ($hash)"
 
-# 2. The VM: n2-highmem-8 with $SSDS local NVMe SSDs in RAID 0 at /data. GCE
-# deletes it after 48 hours whatever happens here.
-startup=$(cat <<'EOS'
-#!/bin/bash
-set -euo pipefail
-if ! mountpoint -q /data; then
-  apt-get update -q
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -q mdadm build-essential clang libclang-dev pkg-config curl rsync git zstd
-  devs=$(ls /dev/disk/by-id/google-local-nvme-ssd-* | sort)
-  [ -e /dev/md0 ] || mdadm --create /dev/md0 --level=0 --raid-devices=$(echo "$devs" | wc -l) $devs --force --run
-  mkfs.ext4 -q -F -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/md0
-  mkdir -p /data && mount -o discard,noatime /dev/md0 /data && chmod 1777 /data
-fi
-EOS
-)
-ssd_flags=()
-for _ in $(seq "$SSDS"); do ssd_flags+=(--local-ssd interface=NVME); done
-if ! gcloud compute instances describe "$VM" --zone "$ZONE" --project "$PROJECT" >/dev/null 2>&1; then
-  log "creating $VM with $SSDS local SSDs"
-  gcloud compute instances create "$VM" --project "$PROJECT" --zone "$ZONE" \
-    --machine-type n2-highmem-8 "${ssd_flags[@]}" \
-    --boot-disk-size 50GB --boot-disk-type pd-balanced \
-    --image-family debian-13 --image-project debian-cloud \
-    --network-interface "subnet=csl-eth" \
-    --service-account "$SA" --scopes https://www.googleapis.com/auth/devstorage.read_write \
-    --tags producer,node \
-    --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
-    --max-run-duration 48h --instance-termination-action DELETE \
-    --metadata enable-oslogin=TRUE --metadata-from-file startup-script=<(echo "$startup") >/dev/null
-fi
+# 2. The VM: n2-highmem-8 with $CSL_ETH_HISTORY_SSDS local NVMe SSDs in RAID 0
+# at /data, as infra/burst.run.ts describes it. GCE deletes it after 48 hours
+# whatever happens here. An existing one (KEEP_VM=1 last time) is kept; one
+# with another SSD count is replaced.
+log "making $VM with $CSL_ETH_HISTORY_SSDS local SSDs (alchemy, stage history)"
 cleanup_vm() {
-  if [ "${KEEP_VM:-0}" = 1 ]; then log "KEEP_VM=1: $VM left running"; return; fi
-  log "deleting $VM"
-  gcloud compute instances delete "$VM" --zone "$ZONE" --project "$PROJECT" --quiet >/dev/null || true
+  if [ "${KEEP_VM:-0}" = 1 ]; then log "KEEP_VM=1: $VM left running (delete: cd infra && bun run burst:down --stage history)"; return; fi
+  log "deleting $VM (alchemy, stage history)"
+  (cd infra && bun run burst:down --stage history) || log "delete failed: cd infra && bun run burst:down --stage history"
 }
 trap 'cleanup_vm; rm -rf "$work"' EXIT
+(cd infra && bun run burst:up --stage history)
 
 # SSH through IAP, as in apply.sh.
 for i in $(seq 30); do

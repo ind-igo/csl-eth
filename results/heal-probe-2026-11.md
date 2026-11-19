@@ -14,8 +14,9 @@ Peers to ask for trie nodes are the hard part: about 1 dial in 140 gets a
 snap/1 peer, and only about 2 in 5 of those are at the head.
 
 Code: `csl-eth heal-probe` (`crates/snap/src/heal.rs`), snap/1 trie-node
-messages in `crates/snap/src/peer.rs`, the VM in `deploy/gcp/heal-probe.sh`,
-the reduction in `scripts/heal-probe-summary.py`. Branch `heal-probe`.
+messages in `crates/snap/src/peer.rs`, the VM in `deploy/gcp/heal-probe.sh`
+(removed 2026-11-19 with the experiment finished; it is in git history), the
+reduction in `scripts/heal-probe-summary.py`. Branch `heal-probe`.
 
 ## What the probe does
 

@@ -25,18 +25,28 @@
 // for a few days and destroy.
 //
 // Nothing on the VM listens to the internet except devp2p on TCP and UDP
-// 30303.
-// SSH comes only through Identity-Aware Proxy, which checks the caller's
+// 30303. SSH comes only through Identity-Aware Proxy, which checks the caller's
 // Google account:
 //
 //	gcloud compute ssh csl-eth-producer --zone <zone> --tunnel-through-iap
 //
 // The VM writes to the bucket as its own service account, whose only grant
 // is object read/write on that bucket; no key exists anywhere.
+//
+// Everything here is made and changed only by this stack. What
+// @alchemy.run/gcp has no prop for (the restart schedule's attachment to
+// the VM, the bucket's soft delete) is done by the stack's own resources in
+// ./resources.ts. The burst VMs of deploy/gcp/full-export.sh and
+// history-export.sh are a second entrypoint, ./burst.run.ts.
+//
+// The VM's names (csl-eth-producer, its data disk, its service account,
+// the "producer" tag) are from the retired slice producer; renaming them
+// would replace them, so they stay.
 import * as GCP from "@alchemy.run/gcp";
 import * as Alchemy from "alchemy";
 import * as Output from "alchemy/Output";
 import * as Effect from "effect/Effect";
+import * as Custom from "./resources.ts";
 
 // Region and project number come from infra/.env (gitignored):
 // CSL_ETH_REGION, CSL_ETH_PROJECT_NUMBER.
@@ -52,8 +62,8 @@ const iap = "35.235.240.0/20"; // the range IAP's TCP forwarding connects from
 const bucketName = "csl-eth-demo"; // also in deploy/gcp/*: the publisher and the page upload
 
 // Runs as root on every boot. It only prepares the machine: the data disk
-// at /data (the producer's work directory, so it outlives the VM), swap for
-// the release build, the build tools, and the user the producer runs as.
+// at /data (the tracker's work directory, so it outlives the VM), swap for
+// the release build, the build tools, and the user the tracker runs as.
 // The code, the binary and the service are put there by deploy/gcp/apply.sh.
 const startup = `#!/bin/bash
 set -euo pipefail
@@ -74,8 +84,7 @@ swapon --show | grep -q /data/swap || swapon /data/swap
 # and a catch-up's materializing walk slowed to swap speed.
 echo "vm.swappiness = 1" > /etc/sysctl.d/90-csl-eth.conf && sysctl -q vm.swappiness=1
 id csl >/dev/null 2>&1 || useradd --system --home-dir /data/home --create-home --shell /usr/sbin/nologin csl
-mkdir -p /data/produce /opt/csl-eth /etc/csl-eth
-chown csl:csl /data/produce
+mkdir -p /opt/csl-eth /etc/csl-eth
 if ! command -v cc >/dev/null || ! command -v rsync >/dev/null; then
   apt-get update -q
   DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential clang libclang-dev pkg-config curl rsync git zstd
@@ -84,21 +93,23 @@ fi
 
 export default Alchemy.Stack(
   "csl-eth",
-  { providers: GCP.providers(), state: GCP.state() },
+  { providers: Custom.providers(), state: GCP.state() }, // GCP.providers() and ours
   Effect.gen(function* () {
     // The bucket: page and data side by side (index.html, viz.html, dist/,
     // pkg/ beside head/, snapshots/, blobs/; no key collides). Readable by
     // anyone; uniform access, so no object carries its own ACL.
-    // Soft delete is off (retention 0), set by hand since this resource has
-    // no prop for it: `gcloud storage buckets update gs://csl-eth-demo
-    // --clear-soft-delete` (2026-11-16). Merged-away delta layers would
-    // otherwise stay billable for Google's default seven days. Everything in
-    // the bucket can be rebuilt; a deleted object is gone at once.
     const bucket = yield* GCP.Storage.Bucket("bucket", {
       bucketName,
       location: region.toUpperCase(),
       storageClass: "STANDARD",
       uniformBucketLevelAccess: true,
+    });
+    // Soft delete off (retention 0): merged-away delta layers would
+    // otherwise stay billable for Google's default seven days. Everything in
+    // the bucket can be rebuilt; a deleted object is gone at once.
+    yield* Custom.BucketSoftDelete("bucket-no-soft-delete", {
+      bucketName: bucket.bucketName,
+      retentionDurationSeconds: 0,
     });
     yield* GCP.IAM.Member("public-read", {
       kind: "storage.bucket",
@@ -138,20 +149,10 @@ export default Alchemy.Stack(
       sourceRanges: [iap],
       targetTags: ["producer"],
     });
-    // discv4 for the old slice producer (UDP 30399); the tracker uses
-    // 30303, opened below with the node's rule.
-    yield* GCP.Compute.Firewall("discv4", {
-      firewallName: "csl-eth-discv4",
-      network: netUrl,
-      allowed: [{ protocol: "udp", ports: ["30399"] }],
-      sourceRanges: ["0.0.0.0/0"],
-      targetTags: ["producer"],
-    });
 
-    // The work directory: slices, the local mirror of the bucket, state.json
-    // (what is published, which pointer write is pending). On its own disk so
-    // replacing the VM keeps it: a lost state.json leaves old snapshots in the
-    // bucket that nothing will ever collect.
+    // The tracker's work directory: the layers as published and track.json
+    // (what is published, the layers held). On its own disk so replacing the
+    // VM keeps it: losing them leaves orphaned layer runs in the bucket.
     // 200 GB (100 until 2026-11-17): the tracker's layers, the since-base layer twice while it
     // merges, the node log and sort spill of a catch-up (see
     // docs/delta-producer.md § Disk without the base). Grows in place
@@ -167,8 +168,7 @@ export default Alchemy.Stack(
       zone,
       // 4 vCPUs, 16 GB (e2-medium until 2026-11-17: the background
       // since-base merge and the steps shared two vCPUs and slowed each
-      // other). Resized in place by stop, set-machine-type, start; this
-      // file only records it. Changing it here replaces the VM and keeps /data.
+      // other). Changing it replaces the VM and keeps /data.
       machineType: "e2-standard-4",
       // Spot: a preemption stops the VM, and the schedule below starts it
       // again; the tracker then catches up from where track.json left it.
@@ -190,16 +190,19 @@ export default Alchemy.Stack(
     // Start the VM every hour (a no-op while it runs; Compute Engine allows
     // nothing more frequent): a spot preemption leaves it stopped.
     // Compute Engine's service agent does the start, so it needs the right
-    // to. The stack cannot attach the schedule to the instance, so that was
-    // done by hand (2026-11-17):
-    //   gcloud compute instances add-resource-policies csl-eth-producer \
-    //     --zone <zone> --resource-policies csl-eth-restart
-    // and again after anything replaces the VM.
-    yield* GCP.Compute.ResourcePolicy("restart", {
+    // to. The attachment carries the VM's id, so a replaced VM gets the
+    // schedule again; attaching never stops the VM.
+    const restart = yield* GCP.Compute.ResourcePolicy("restart", {
       resourcePolicyName: "csl-eth-restart",
       region,
       description: "start the spot VM again after a preemption",
       instanceSchedulePolicy: { vmStartSchedule: { schedule: "0 * * * *" }, timeZone: "UTC" },
+    });
+    yield* Custom.InstanceResourcePolicies("producer-restart", {
+      instanceName: vm.instanceName,
+      zone,
+      resourcePolicies: [restart.resourcePolicyName],
+      instanceId: vm.instanceId,
     });
     yield* GCP.IAM.Member("compute-agent-starts", {
       kind: "project",
@@ -209,8 +212,8 @@ export default Alchemy.Stack(
     });
 
     // The full-state node is not in this stack: it is a burst VM with
-    // local NVMe SSDs (which Alchemy cannot attach, and which no quota here
-    // limits), created and deleted by deploy/gcp/full-export.sh on this
+    // local NVMe SSDs, made and deleted by ./burst.run.ts (its own stages,
+    // driven by deploy/gcp/full-export.sh and history-export.sh) on this
     // network, with the producer's service account and the "node" tag. The
     // tracker on the producer VM carries the tag too: devp2p on 30303.
     yield* GCP.Compute.Firewall("devp2p", {

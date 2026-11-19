@@ -4,10 +4,14 @@
   "type": "module",
   "scripts": {
     "plan": "CLOUDSDK_CORE_PROJECT=csl-eth GOOGLE_PROJECT_ID=csl-eth alchemy plan --stage demo",
-    "deploy": "CLOUDSDK_CORE_PROJECT=csl-eth GOOGLE_PROJECT_ID=csl-eth alchemy deploy --stage demo"
+    "deploy": "CLOUDSDK_CORE_PROJECT=csl-eth GOOGLE_PROJECT_ID=csl-eth alchemy deploy --stage demo",
+    "burst:plan": "CLOUDSDK_CORE_PROJECT=csl-eth GOOGLE_PROJECT_ID=csl-eth alchemy plan -c burst.run.ts",
+    "burst:up": "CLOUDSDK_CORE_PROJECT=csl-eth GOOGLE_PROJECT_ID=csl-eth alchemy deploy -c burst.run.ts --force --yes --no-input",
+    "burst:down": "CLOUDSDK_CORE_PROJECT=csl-eth GOOGLE_PROJECT_ID=csl-eth alchemy destroy -c burst.run.ts --yes --no-input"
   },
   "dependencies": {
     "@alchemy.run/gcp": "2.0.0-beta.85",
+    "@distilled.cloud/gcp": "1.0.0-rc.18",
     "@effect/platform-bun": "^4.1.3",
     "@effect/platform-node": "^4.1.3",
     "alchemy": "2.0.0-beta.85",

@@ -15,9 +15,12 @@
 # head files frozen at that block: it verifies until the next sync-committee
 # period begins (up to about 27 hours), so the export runs daily.
 #
-# The VM is not in infra/alchemy.run.ts: Alchemy cannot attach local SSDs, and
-# it lives only for the burst. It uses the stack's network, the producer's
-# service account (bucket writes only) and the "node" tag (devp2p firewall).
+# The VM is infra/burst.run.ts's stage "export": this script makes it with
+# `bun run burst:up --stage export` and deletes it with `burst:down`, so
+# nothing here creates or deletes infrastructure itself (gcloud is used for
+# SSH through IAP and the bucket's objects only). It uses the demo stack's
+# network, the producer's service account (bucket writes only) and the
+# "node" tag (devp2p firewall).
 set -euo pipefail
 
 PROJECT="${CSL_ETH_PROJECT:-csl-eth}"
@@ -25,10 +28,9 @@ env_file="$(cd "$(dirname "$0")/../.." && pwd)/infra/.env"
 [ -f "$env_file" ] && . "$env_file"   # CSL_ETH_REGION (gitignored)
 ZONE="${CSL_ETH_ZONE:-${CSL_ETH_REGION:+$CSL_ETH_REGION-b}}"
 : "${ZONE:?set CSL_ETH_REGION in infra/.env, or CSL_ETH_ZONE}"
-VM="${CSL_ETH_NODE_VM:-csl-eth-node}"
+VM=csl-eth-node # the name infra/burst.run.ts gives the "export" stage's VM
 BUCKET="${CSL_ETH_GCS_BUCKET:-csl-eth-demo}"
 CHECKPOINT="${CSL_ETH_CHECKPOINT:-0x431b33af8452e2d644377405e69d4f382182ab906f31461190ca24cb3401d70b}"
-SA="csl-eth-producer@${PROJECT}.iam.gserviceaccount.com"
 cd "$(dirname "$0")/../.."
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -43,42 +45,18 @@ gcloud storage cp -r "gs://$BUCKET/head/updates" "$work/head/head/" >/dev/null 2
 read -r hash number ts root < <(python3 -c "import json,sys;d=json.load(open('$work/head.json'));print(d['block_hash'],d['block_number'],d['timestamp'],d['state_root'])")
 log "target: block $number $hash state_root $root"
 
-# 2. The VM: n2-highmem-8 with four local NVMe SSDs (1.5 TB, RAID 0 at /data).
-# GCE deletes it after 16 hours whatever happens here, so a lost laptop or
-# a killed script cannot leave it running.
-startup=$(cat <<'EOS'
-#!/bin/bash
-set -euo pipefail
-if ! mountpoint -q /data; then
-  apt-get update -q
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -q mdadm build-essential clang libclang-dev pkg-config curl rsync git zstd
-  devs=$(ls /dev/disk/by-id/google-local-nvme-ssd-* | sort)
-  [ -e /dev/md0 ] || mdadm --create /dev/md0 --level=0 --raid-devices=$(echo "$devs" | wc -l) $devs --force --run
-  mkfs.ext4 -q -F -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/md0
-  mkdir -p /data && mount -o discard,noatime /dev/md0 /data && chmod 1777 /data
-fi
-EOS
-)
-if ! gcloud compute instances describe "$VM" --zone "$ZONE" --project "$PROJECT" >/dev/null 2>&1; then
-  log "creating $VM"
-  gcloud compute instances create "$VM" --project "$PROJECT" --zone "$ZONE" \
-    --machine-type n2-highmem-8 \
-    --local-ssd interface=NVME --local-ssd interface=NVME --local-ssd interface=NVME --local-ssd interface=NVME \
-    --boot-disk-size 50GB --boot-disk-type pd-balanced \
-    --image-family debian-13 --image-project debian-cloud \
-    --network-interface "subnet=csl-eth" \
-    --service-account "$SA" --scopes https://www.googleapis.com/auth/devstorage.read_write \
-    --tags producer,node \
-    --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
-    --max-run-duration 16h --instance-termination-action DELETE \
-    --metadata enable-oslogin=TRUE --metadata-from-file startup-script=<(echo "$startup") >/dev/null
-fi
+# 2. The VM: n2-highmem-8 with four local NVMe SSDs (1.5 TB, RAID 0 at /data),
+# as infra/burst.run.ts describes it. GCE deletes it after 16 hours whatever
+# happens here, so a lost laptop or a killed script cannot leave it running.
+# An existing one (KEEP_VM=1 last time) is kept.
+log "making $VM (alchemy, stage export)"
 cleanup_vm() {
-  if [ "${KEEP_VM:-0}" = 1 ]; then log "KEEP_VM=1: $VM left running"; return; fi
-  log "deleting $VM"
-  gcloud compute instances delete "$VM" --zone "$ZONE" --project "$PROJECT" --quiet >/dev/null || true
+  if [ "${KEEP_VM:-0}" = 1 ]; then log "KEEP_VM=1: $VM left running (delete: cd infra && bun run burst:down --stage export)"; return; fi
+  log "deleting $VM (alchemy, stage export)"
+  (cd infra && bun run burst:down --stage export) || log "delete failed: cd infra && bun run burst:down --stage export"
 }
 trap 'cleanup_vm; rm -rf "$work"' EXIT
+(cd infra && bun run burst:up --stage export)
 
 # SSH through IAP, as in apply.sh.
 for i in $(seq 30); do
