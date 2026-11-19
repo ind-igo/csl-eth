@@ -14,6 +14,8 @@
 //!   than 32 bytes) live inside their parent and are not emitted.
 //! - [`range`]: snap range proofs checked by rebuilding, and the sealed
 //!   subtrees they yield so a slice builds up to `state_root`.
+//! - [`update`]: post-state changes applied to a trie read on demand,
+//!   the new root and every node they write (block access lists).
 //! - [`walk`]: the one verifier (§2). Hash nodes from `state_root` down to
 //!   a leaf or an empty branch slot; anything the files fail to provide is
 //!   `Missing`, never absence.
@@ -25,6 +27,7 @@
 pub mod build;
 pub mod key;
 pub mod range;
+pub mod update;
 pub mod value;
 pub mod walk;
 
