@@ -245,7 +245,7 @@ impl Peer {
         timeout_each: Duration,
         require_snap: bool,
     ) -> Result<Peer, PeerError> {
-        Peer::connect_with(net.offers_eth71(), record, key, status, fork_filter, timeout_each, require_snap, false, false).await
+        Peer::connect_with(net, record, key, status, fork_filter, timeout_each, require_snap, false, false).await
     }
 
     /// A mainnet connection offering `snap/1` only, for its trie-node
@@ -258,22 +258,7 @@ impl Peer {
         fork_filter: ForkFilter,
         timeout_each: Duration,
     ) -> Result<Peer, PeerError> {
-        Peer::connect_snap1_on(Net::Mainnet, false, record, key, status, fork_filter, timeout_each).await
-    }
-
-    /// [`Peer::connect_snap1`] on `net`, offering `eth/71` too when `eth71`
-    /// (block access lists, EIP-8159) on top of the versions `net` offers.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn connect_snap1_on(
-        net: Net,
-        eth71: bool,
-        record: NodeRecord,
-        key: &SecretKey,
-        status: UnifiedStatus,
-        fork_filter: ForkFilter,
-        timeout_each: Duration,
-    ) -> Result<Peer, PeerError> {
-        Peer::connect_with(eth71 || net.offers_eth71(), record, key, status, fork_filter, timeout_each, true, false, true).await
+        Peer::connect_with(Net::Mainnet, record, key, status, fork_filter, timeout_each, true, false, true).await
     }
 
     /// A mainnet connection for history: `eth/68`, `eth/69` and `eth/70`
@@ -287,12 +272,12 @@ impl Peer {
         fork_filter: ForkFilter,
         timeout_each: Duration,
     ) -> Result<Peer, PeerError> {
-        Peer::connect_with(false, record, key, status, fork_filter, timeout_each, false, true, false).await
+        Peer::connect_with(Net::Mainnet, record, key, status, fork_filter, timeout_each, false, true, false).await
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn connect_with(
-        eth71: bool,
+        net: Net,
         record: NodeRecord,
         key: &SecretKey,
         status: UnifiedStatus,
@@ -311,7 +296,7 @@ impl Peer {
         if eth70 {
             hello = hello.protocol(Protocol::eth(EthVersion::Eth70));
         }
-        if eth71 {
+        if net.offers_eth71() {
             hello = hello.protocol(Protocol::eth(EthVersion::Eth71));
         }
         let hello = hello.protocol(Protocol::new(Capability::new_static("snap", 1), 8));

@@ -729,34 +729,3 @@ Every piece of the GCP infrastructure is now made, changed and deleted by Alchem
 `infra/resources.ts` adds three small resources of the stack's own, in the provider's pattern and calling the same Compute and Storage clients: `InstanceResourcePolicies` attaches named policies to an instance, `BucketSoftDelete` sets a bucket's soft delete retention, and `BurstInstance` is a standard VM with local NVMe SSDs and a maximum run duration. The first two read the live resource first and change only what differs, so the schedule already on the VM and the retention already at 0 are left as they are, and attaching a schedule never stops the VM; the attachment carries the VM's id, so a replaced VM gets the schedule again without anyone remembering to. Removing the soft delete resource leaves the bucket's retention as it is. The burst VMs are a second entrypoint, `infra/burst.run.ts`, a stack of their own with one stage per burst (`export` for `full-export.sh`, `history` for `history-export.sh`); the scripts run `bun run burst:up --stage …` to make the VM and `burst:down` to delete it, with the same machine, disks, image, network, identity, tags and deadline as the gcloud flags had. `burst:up` runs with `--force`, so it makes the VM again when Compute Engine deleted it at its deadline and the stage's state still lists it.
 
 The retired producer's last pieces left the stack with this: the discv4 firewall rule (UDP 30399) and `/data/produce` in the startup script. The VM, its disk, its service account and the "producer" tag keep their names, since renaming them would replace them. `deploy/gcp/heal-probe.sh`, which made its own VM and firewall rule with gcloud, is deleted with the experiment finished (`results/heal-probe-2026-11.md` keeps the results).
-
-## 2026-11-19: new trie nodes from block access lists
-
-snap/2 (EIP-8189) drops `GetTrieNodes` because block access lists (EIP-7928) make it unnecessary, and the tracker fetches every step's new nodes with it. The tracker can now compute those nodes itself instead: `csl-eth track --bal`. For a step from the held head to the verified target, it takes the headers from eth peers, hash-linked from the target back to the held block; takes each block's list from `eth/71` peers, checked against the header's `block_access_list_hash`; applies each block's post-state changes in order over the held state; and requires each block's computed root to equal its header's `state_root`. The nodes this writes answer the walk's needs by hash, through a source in front of the peer pool. The walk is unchanged and still checks every node against its parent's reference. Anything the lists did not produce goes to peers, so a wrong or partial computation can only cost a fetch, never a wrong layer.
-
-The update is `csl-eth-trie::update`. It reads the held trie node by node, checking each by hash, and handles:
-- leaf and extension splits
-- branch collapse, which reads the remaining sibling
-- hashed↔embedded transitions
-- storage roots feeding the account leaf
-- EIP-161 deletion, which also covers an account created and destroyed in one block
-
-A node the loader cannot give loses its subtree and the path above it, and leaves the rest exact. This is what happens for accounts outside a slice's prefix. `--bal` is off by default, and it is inert on mainnet before Amsterdam: no list is asked for and peers are not offered `eth/71`. A step goes to peers as before when its gap is past `--bal-max-blocks` (64), the target does not descend from the held head (a reorg, since lists carry post-values only), a header or list is not served, or a computed root is wrong.
-
-Applying a list reads old nodes as well as the changed paths. A collapse reads the remaining sibling, and every storage write reads the account's storage trie down to the slot. A diskless tracker does not hold those nodes, so it fetches them at the old root from peers and then the bucket, the same way the walk fetches its old side. The lists therefore replace the fetch of new nodes, but a smaller fetch of old nodes stays.
-
-Tests. Synthetic: the tracker's S0→S1→S2 table covers deletion then recreation, a branch collapse, an extension split, embedded↔hashed transitions and a shared storage root. Lists derived from the state diffs drive the step, with no peers. The lists also include an account touched with nothing changed, one rewritten with its current values, and one created and destroyed. Both step by step and across a two-block gap, the step published the same rows and the same files byte for byte as the peer-driven step, with no need left for peers. A list with one wrong balance is refused, and a list with accounts outside the slice's prefix falls back to peers for what it lost and still publishes the same.
-
-Sepolia: `csl-eth bal-replay` replays recent blocks from their lists alone. It applies each list to witness nodes at the parent root, fetched from snap/1 peers as the update asks for them, and requires the header's state root. Geth 1.17 and Nethermind 2.2 negotiate snap/1 next to `eth/71` and served the witness nodes; the lists came from the same peers over `eth/71`. No RPC was used. Two runs, measured from a laptop, reproduced every block's state root:
-- 40 of 40 consecutive blocks, 12,168,981 to 12,169,020
-- 150 of 150 consecutive blocks, 12,169,010 to 12,169,159
-
-That is 179 distinct blocks with no failure.
-
-Per block, over the 150-block run (median, with the 90th percentile in brackets):
-- the list: 47 KB (70 KB) and 330 accounts (415), of which 185 changed (234)
-- storage: 349 slots written (521) and 674 slots only read (977)
-- witness: 482 nodes and 140 KB (943 nodes, 293 KB)
-- 12 dependent fetch rounds (14, at most 19), about 3.2 s a block
-
-Peers were the hard part. Most of the time one serving peer was connected, and two later attempts found none in ten minutes until the replay kept a known-peers file. For the tracker on mainnet after Amsterdam, this means a step costs its headers, about 50 KB of list per block, and an old-side fetch of roughly 150 KB per block, in place of the new-node fetch. Mainnet's blocks are larger, and these numbers are Sepolia's.
