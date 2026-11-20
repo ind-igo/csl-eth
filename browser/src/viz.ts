@@ -48,6 +48,11 @@ const DEFAULT_BASE =
 const DEFAULT_CHECKPOINT = "0x431b33af8452e2d644377405e69d4f382182ab906f31461190ca24cb3401d70b";
 /// Where the page remembers a checkpoint it adopted (see `rotate`). Only
 /// ever a root this page proved finalized from the one it held.
+// The demo is frozen (docs/decisions.md, 2026-11-20): the bucket stopped
+// updating at block 26,456,446. Its head is judged against the time it was
+// signed instead of the clock, so it stays readable; every signature and hash
+// is still checked.
+const FROZEN_AT_MS = 1795179515000;
 const CHECKPOINT_KEY = "csl-eth.checkpoint";
 const ROOT_RE = /^0x[0-9a-fA-F]{64}$/;
 
@@ -255,7 +260,7 @@ function setBusy(b: boolean) {
 /// A fresh client opened the way `cfg` says. Throws on a malformed
 /// checkpoint.
 function newClient(cfg: Config): ClientLike {
-  return new wasm!.Client(cfg.checkpoint, Date.now(), cfg.prefetch, cfg.topLevels, cfg.tier);
+  return new wasm!.Client(cfg.checkpoint, FROZEN_AT_MS, cfg.prefetch, cfg.topLevels, cfg.tier);
 }
 
 /// After an open: fetch `head/checkpoint` and its bootstrap and let the

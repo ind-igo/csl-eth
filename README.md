@@ -102,7 +102,7 @@ mise install && ./scripts/build-wasm.sh
 cd browser && bun install && bun run serve                     # http://127.0.0.1:8791/
 bun test light                                                 # the TypeScript client's tests
 
-# the demo on Google Cloud: put CSL_ETH_REGION and CSL_ETH_PROJECT_NUMBER in infra/.env
+# the demo on Google Cloud: put CSL_ETH_REGION in infra/.env
 cd infra && bun install && bun run plan && bun run deploy --yes
 deploy/gcp/apply.sh        # build the tracker on the VM, run it under systemd
 deploy/gcp/site.sh         # build the pages (gzipped), upload them into the bucket

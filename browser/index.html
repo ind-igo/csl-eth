@@ -164,7 +164,7 @@
       <header>
         <h1>Ethereum state, read from a bucket and proven</h1>
         <nav><a href="#faq">FAQ</a><a href="light.html">TypeScript version</a><a href="https://github.com/ind-igo/csl-eth">GitHub</a><span id="version"></span></nav>
-        <p class="sub" style="margin:0">All of mainnet's state as static files. This tab fetches a few 4 KB pages by byte range, with no RPC and no node, and checks every answer against the beacon chain's signatures. Pick an example or paste an address.</p>
+        <p class="sub" style="margin:0">All of mainnet's state as static files. This tab fetches a few 4 KB pages by byte range, with no RPC and no node, and checks every answer against the beacon chain's signatures. Pick an example or paste an address. Frozen at block 26,456,446 (20 November 2026, 12:56 UTC): the bucket no longer updates, so every read shows mainnet as of that block.</p>
       </header>
 
       <div class="bar">
@@ -250,11 +250,11 @@
       </details>
       <details>
         <summary>How up to date is it?</summary>
-        <p>By default, about 35 seconds behind the latest block. That block is signed but not yet final, so in rare cases it could still be replaced. Add <span class="mono">?tier=finalized</span> to the address to read only finalized blocks, about 13 minutes behind.</p>
+        <p>It is frozen at block 26,456,446 (20 November 2026, 12:56 UTC). Until then a small server kept it about 35 seconds behind the latest block; it was stopped to keep the demo cheap. The page checks the head against the time it was signed rather than today's date, so the frozen head stays readable; every signature and hash is still checked. Add <span class="mono">?tier=finalized</span> to the address to read the last finalized block instead.</p>
       </details>
       <details>
-        <summary>Who keeps the files current?</summary>
-        <p>A small server with no Ethereum node. For each new block, it asks mainnet peers for the parts of the state that changed and uploads them as a small update file. Running it and storing everything costs under $40 a month. In a real deployment, an Ethereum node would publish these updates as a side effect.</p>
+        <summary>Who kept the files current?</summary>
+        <p>A small server with no Ethereum node. For each new block, it asked mainnet peers for the parts of the state that changed and uploaded them as a small update file, for about $30 a month. It is stopped now; the files stay as they were at the frozen block. In a real deployment, an Ethereum node would publish these updates as a side effect.</p>
       </details>
       <details>
         <summary>What am I looking at?</summary>

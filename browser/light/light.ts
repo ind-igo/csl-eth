@@ -3,6 +3,11 @@ import { Reader, type CheckpointStore, type Outcome } from "./driver.ts";
 import { CHECKPOINT, hex, tamperSpot, unhex, type Want } from "./verify.ts";
 
 declare const __VERIFY_LINES__: number;
+// The demo is frozen (docs/decisions.md, 2026-11-20): the bucket stopped
+// updating at block 26,456,446. Its head is judged against the time it was
+// signed instead of the clock, so it stays readable; every signature and hash
+// is still checked.
+const FROZEN_AT_MS = 1795179515000;
 const SOURCE = "https://github.com/ind-igo/csl-eth/blob/main/browser/light/verify.ts";
 
 // From the bucket, the state under `full/` beside this page; anywhere else, the demo bucket.
@@ -140,7 +145,7 @@ form.onsubmit = async (ev) => {
     const s = slot.value.trim();
     const v = s === "" ? undefined : BigInt(s);
     if (v !== undefined && (v < 0n || v >= 2n ** 256n)) throw new Error("slot out of range");
-    q = { address: unhex(address.value.trim(), 20), slot: v, code: code.checked, now: Date.now() };
+    q = { address: unhex(address.value.trim(), 20), slot: v, code: code.checked, now: FROZEN_AT_MS };
   } catch {
     status.className = "bad";
     status.textContent = "Enter a 20-byte hex address and, optionally, a slot number (decimal or 0x hex).";
