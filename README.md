@@ -53,6 +53,7 @@ behind without running a node. For each new head it asks mainnet peers for
 the trie nodes that changed, checks each by hash, and publishes them as a
 layer. It costs about $30 a month. A full node could publish the same
 layers as a side effect (ie using Reth Exex, Nethermind plugin, etc), which is the natural next step.
+Frozen on 2026-11-20 at block 26,456,446: the tracker is stopped and the bucket no longer updates.
 
 **Copies are cheap.** One copy of the bucket costs about $3–15 a month to
 store and keep current, and any static host can serve one; see
